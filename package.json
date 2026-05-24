@@ -1,6 +1,6 @@
 {
   "name": "wikipedia-mcp-server",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Search Wikipedia articles, read summaries and full text, target sections, find nearby pages, and list language editions via MCP. STDIO or Streamable HTTP.",
   "mcpName": "io.github.cyanheads/wikipedia-mcp-server",
   "type": "module",
