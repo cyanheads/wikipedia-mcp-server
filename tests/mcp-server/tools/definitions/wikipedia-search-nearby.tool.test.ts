@@ -121,4 +121,16 @@ describe('wikipediaSearchNearby', () => {
     expect(text).toContain('47.6205');
     expect(text).toContain('-122.3493');
   });
+
+  it('throws invalid_language with data.reason when language code is malformed (issue #5)', async () => {
+    const ctx = createMockContext({ errors: wikipediaSearchNearby.errors });
+    const input = wikipediaSearchNearby.input.parse({
+      latitude: 47.6,
+      longitude: -122.3,
+      language: 'INVALID!!',
+    });
+    await expect(wikipediaSearchNearby.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'invalid_language' },
+    });
+  });
 });

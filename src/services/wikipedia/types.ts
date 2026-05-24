@@ -68,17 +68,18 @@ export type ActionSectionsRaw = {
   error?: { code?: string; info?: string };
 };
 
-/** Action API parse/wikitext response. */
+/** Action API parse/wikitext response (formatversion=2 shape). */
 export type ActionWikitextRaw = {
   parse?: {
     title?: string;
     pageid?: number;
-    wikitext?: { '*'?: string };
+    /** formatversion=2: plain string. formatversion=1 used `{ '*': string }` — no longer used. */
+    wikitext?: string;
   };
   error?: { code?: string; info?: string };
 };
 
-/** Action API langlinks response. */
+/** Action API langlinks response (formatversion=2 shape, llprop=url). */
 export type ActionLangLinksRaw = {
   query?: {
     pages?: Record<
@@ -89,8 +90,10 @@ export type ActionLangLinksRaw = {
         missing?: string;
         langlinks?: Array<{
           lang: string;
-          url: string;
-          '*': string;
+          /** formatversion=2: plain key. formatversion=1 used `'*'` — no longer used. */
+          title: string;
+          /** Present when llprop=url is passed. */
+          url?: string;
         }>;
       }
     >;

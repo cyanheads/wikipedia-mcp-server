@@ -63,6 +63,14 @@ export const wikipediaSearch = tool('wikipedia_search', {
     const limit = Math.min(input.limit, 50);
     const language = input.language || 'en';
 
+    if (!/^[a-z]{2,3}(-[a-z0-9]+)*$/i.test(language)) {
+      throw ctx.fail(
+        'invalid_language',
+        `Invalid language code "${language}". Use a BCP 47 language code such as "fr", "de", or "ja".`,
+        { language, ...ctx.recoveryFor('invalid_language') },
+      );
+    }
+
     ctx.log.info('Searching Wikipedia', { query: input.query, limit, language });
 
     const svc = getWikipediaService();

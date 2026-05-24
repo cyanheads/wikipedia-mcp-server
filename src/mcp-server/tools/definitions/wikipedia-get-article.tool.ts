@@ -68,6 +68,32 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
 
   async handler(input, ctx) {
     const language = input.language || 'en';
+
+    // Validate language code eagerly so the contract reason appears in data.reason.
+    if (!/^[a-z]{2,3}(-[a-z0-9]+)*$/i.test(language)) {
+      throw ctx.fail(
+        'invalid_language',
+        `Invalid language code "${language}". Use a BCP 47 language code such as "fr", "de", or "ja".`,
+        { language, ...ctx.recoveryFor('invalid_language') },
+      );
+    }
+
+    // Reject section_index 0 — wikipedia_get_sections returns indices starting at 1.
+    // Index 0 refers to the lead section which wikitext parsing returns as templates/infoboxes
+    // (no readable text). Full-article reads handle the lead via the extracts API.
+    if (input.section_index === 0) {
+      throw ctx.fail(
+        'invalid_section',
+        'section_index 0 is not valid. Section indices start at 1 (use wikipedia_get_sections to discover valid values). To read the lead section, omit section_index entirely.',
+        {
+          sectionIndex: 0,
+          recovery: {
+            hint: 'Use wikipedia_get_sections to get valid indices (starting at 1). Omit section_index to read the full article including its lead section.',
+          },
+        },
+      );
+    }
+
     const svc = getWikipediaService();
 
     if (input.section_index != null) {

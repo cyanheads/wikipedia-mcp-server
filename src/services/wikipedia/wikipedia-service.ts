@@ -4,7 +4,13 @@
  */
 
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
-import { notFound, serviceUnavailable, validationError } from '@cyanheads/mcp-ts-core/errors';
+import {
+  JsonRpcErrorCode,
+  McpError,
+  notFound,
+  serviceUnavailable,
+  validationError,
+} from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import type { RequestContextLike } from '@cyanheads/mcp-ts-core/utils';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
@@ -68,22 +74,292 @@ function stripWikitext(wikitext: string): string {
 // ---------------------------------------------------------------------------
 
 function stripSnippetHtml(html: string): string {
-  return html.replace(/<[^>]+>/g, '').trim();
+  const stripped = html.replace(/<[^>]+>/g, '');
+  // Decode the most common HTML entities that the Action API leaves in snippets.
+  return stripped
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#039;/g, "'")
+    .replace(/&apos;/g, "'")
+    .trim();
 }
 
 // ---------------------------------------------------------------------------
-// Language code validation (BCP 47 basic check)
+// Language code validation
 // ---------------------------------------------------------------------------
 
+/**
+ * Known Wikipedia language edition codes (subdomains that exist as wikipedia.org editions).
+ * Sourced from https://meta.wikimedia.org/wiki/List_of_Wikipedias — stable set of ~300 codes.
+ * A structurally valid BCP 47 code that is NOT in this set will time out after 4 retries (~60s)
+ * and leak the full API URL in the error message, so we validate eagerly.
+ */
+const KNOWN_WIKIPEDIA_EDITIONS = new Set([
+  'en',
+  'de',
+  'fr',
+  'ja',
+  'es',
+  'ru',
+  'zh',
+  'pt',
+  'ar',
+  'it',
+  'fa',
+  'pl',
+  'nl',
+  'uk',
+  'he',
+  'sv',
+  'ko',
+  'vi',
+  'ca',
+  'no',
+  'fi',
+  'cs',
+  'hu',
+  'ro',
+  'tr',
+  'id',
+  'th',
+  'sr',
+  'ms',
+  'eo',
+  'eu',
+  'da',
+  'bg',
+  'sk',
+  'min',
+  'hr',
+  'et',
+  'lt',
+  'simple',
+  'sl',
+  'az',
+  'la',
+  'ur',
+  'be',
+  'ce',
+  'nn',
+  'cy',
+  'hy',
+  'ka',
+  'el',
+  'uz',
+  'gl',
+  'lv',
+  'bn',
+  'ta',
+  'mk',
+  'sh',
+  'hi',
+  'af',
+  'bs',
+  'kk',
+  'war',
+  'mg',
+  'te',
+  'sq',
+  'oc',
+  'mr',
+  'tl',
+  'ml',
+  'ceb',
+  'br',
+  'ast',
+  'be-tarask',
+  'azb',
+  'pa',
+  'zh-yue',
+  'an',
+  'lb',
+  'is',
+  'ba',
+  'my',
+  'fy',
+  'wuu',
+  'cy',
+  'sw',
+  'yo',
+  'ga',
+  'new',
+  'tt',
+  'la',
+  'gu',
+  'kn',
+  'io',
+  'ia',
+  'or',
+  'su',
+  'ne',
+  'ckb',
+  'si',
+  'cv',
+  'ps',
+  'fo',
+  'scn',
+  'nds',
+  'bpy',
+  'qu',
+  'diq',
+  'li',
+  'bar',
+  'als',
+  'mn',
+  'hy',
+  'sa',
+  'jv',
+  'sco',
+  'roa-tara',
+  'as',
+  'mzn',
+  'nah',
+  'ace',
+  'pnb',
+  'am',
+  'wa',
+  'lmo',
+  'tg',
+  'pms',
+  'nds-nl',
+  'ku',
+  'ky',
+  'vec',
+  'sc',
+  'os',
+  'arz',
+  'vls',
+  'rue',
+  'frr',
+  'hif',
+  'zh-min-nan',
+  'crh',
+  'sd',
+  'bo',
+  'vep',
+  'hak',
+  'hat',
+  'se',
+  'bcl',
+  'km',
+  'tk',
+  'krc',
+  'gag',
+  'nso',
+  'ab',
+  'xmf',
+  'sah',
+  'map-bms',
+  'mi',
+  'hsb',
+  'szl',
+  'nrm',
+  'pcd',
+  'ksh',
+  'lij',
+  'mhr',
+  'ug',
+  'bxr',
+  'glk',
+  'zh-classical',
+  'roa-rup',
+  'stq',
+  'co',
+  'frp',
+  'kv',
+  'so',
+  'kw',
+  'mwl',
+  'to',
+  'csb',
+  'myv',
+  'lad',
+  'rm',
+  'ie',
+  'bjn',
+  'ln',
+  'fur',
+  'ang',
+  'wuu',
+  'ext',
+  'cbk-zam',
+  'mt',
+  'xh',
+  'eml',
+  'ilo',
+  'wo',
+  'sn',
+  'za',
+  'pfl',
+  'gd',
+  'nap',
+  'ig',
+  'tw',
+  'tet',
+  'fiu-vro',
+  'ay',
+  'got',
+  'bm',
+  'chy',
+  'kl',
+  'tpi',
+  'bh',
+  'aa',
+  'ki',
+  'ff',
+  'cu',
+  'sm',
+  'gn',
+  'ts',
+  'tn',
+  'cr',
+  'sg',
+  'ty',
+  'ss',
+  've',
+  'iu',
+  'ch',
+  'st',
+  'hz',
+  'rw',
+  'ee',
+  'lg',
+  'pi',
+  'ii',
+]);
+
+/**
+ * Validate that `language` is a structurally valid BCP 47 code AND a known Wikipedia edition.
+ * Returns the normalised base URL or throws a `validationError` with a descriptive message.
+ *
+ * This is a pure utility — it cannot call `ctx.fail`. Callers that want a typed error contract
+ * should validate using `ctx.fail('invalid_language', ...)` before calling service methods.
+ */
 function buildBaseUrl(language: string): string {
-  // Language codes are 2-3 chars (ISO 639-1/639-2) with optional subtags.
+  // Structure check — must look like a BCP 47 code.
   if (!/^[a-z]{2,3}(-[a-z0-9]+)*$/i.test(language)) {
     throw validationError(
       `Invalid language code "${language}". Use a BCP 47 language code such as "fr", "de", or "ja".`,
       { recovery: { hint: 'Use a valid BCP 47 language code such as "fr", "de", or "ja".' } },
     );
   }
-  return `https://${language.toLowerCase()}.wikipedia.org`;
+  const normalized = language.toLowerCase();
+  // Edition check — structurally valid codes may not correspond to an existing Wikipedia edition.
+  // Without this check a non-existent subdomain causes 4 retries × 15s timeout and URL leakage.
+  if (!KNOWN_WIKIPEDIA_EDITIONS.has(normalized)) {
+    throw validationError(
+      `Language edition "${language}" does not exist on Wikipedia. Use a valid Wikipedia language code such as "fr", "de", or "ja".`,
+      {
+        language,
+        recovery: {
+          hint: 'Use a Wikipedia language code that has an active edition, such as "fr", "de", or "ja".',
+        },
+      },
+    );
+  }
+  return `https://${normalized}.wikipedia.org`;
 }
 
 // ---------------------------------------------------------------------------
@@ -180,11 +456,9 @@ export class WikipediaService {
     try {
       raw = await this.restGet<RestSummaryRaw>(language, `/page/summary/${encodedTitle}`, ctx);
     } catch (err: unknown) {
-      // fetchWithTimeout maps 404 → NotFound McpError; re-throw with domain message.
-      if (
-        err instanceof Error &&
-        (err.message.includes('status code 404') || err.message.includes('NotFound'))
-      ) {
+      // fetchWithTimeout throws a McpError with code NotFound for 404 responses.
+      // Match by error code (reliable) rather than message text (fragile).
+      if (err instanceof McpError && err.code === JsonRpcErrorCode.NotFound) {
         throw notFound(
           `No Wikipedia article found for "${title}" in language "${language}". Use wikipedia_search to find the correct title.`,
           {
@@ -327,7 +601,8 @@ export class WikipediaService {
       throw serviceUnavailable(`Wikipedia API error: ${raw.error.info ?? errCode}`);
     }
 
-    const wikitext = raw.parse?.wikitext?.['*'] ?? '';
+    // formatversion=2: wikitext is a plain string, not { '*': string }.
+    const wikitext = raw.parse?.wikitext ?? '';
     const content = stripWikitext(wikitext);
 
     // Derive section title from the first heading in the wikitext.
@@ -424,6 +699,7 @@ export class WikipediaService {
         titles: title,
         prop: 'langlinks',
         lllimit: '500',
+        llprop: 'url',
       },
       ctx,
     );
@@ -442,8 +718,12 @@ export class WikipediaService {
     const languages =
       page.langlinks?.map((ll) => ({
         languageCode: ll.lang,
-        title: ll['*'],
-        url: ll.url,
+        // formatversion=2: title is a plain key, not '*'.
+        title: ll.title,
+        // url is populated because we pass llprop=url in the request.
+        url:
+          ll.url ??
+          `https://${ll.lang}.wikipedia.org/wiki/${encodeURIComponent(ll.title.replace(/ /g, '_'))}`,
       })) ?? [];
 
     return { languages };

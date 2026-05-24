@@ -68,4 +68,12 @@ describe('wikipediaGetSections', () => {
     expect(text).toContain('index: 2');
     expect(text).toContain('2 sections');
   });
+
+  it('throws invalid_language with data.reason when language code is malformed (issue #5)', async () => {
+    const ctx = createMockContext({ errors: wikipediaGetSections.errors });
+    const input = wikipediaGetSections.input.parse({ title: 'Python', language: 'INVALID!!' });
+    await expect(wikipediaGetSections.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'invalid_language' },
+    });
+  });
 });

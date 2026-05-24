@@ -98,4 +98,12 @@ describe('wikipediaSearch', () => {
     expect(text).toContain('4000');
     expect(text).toContain('A language.');
   });
+
+  it('throws invalid_language with data.reason when language code is malformed (issue #5)', async () => {
+    const ctx = createMockContext({ errors: wikipediaSearch.errors });
+    const input = wikipediaSearch.input.parse({ query: 'Python', language: 'INVALID!!' });
+    await expect(wikipediaSearch.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'invalid_language' },
+    });
+  });
 });

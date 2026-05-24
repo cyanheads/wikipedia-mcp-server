@@ -117,4 +117,12 @@ describe('wikipediaGetSummary', () => {
     expect(text).toContain('disambiguation');
     expect(text).toContain('Test may refer to many things.');
   });
+
+  it('throws invalid_language with data.reason when language code is malformed (issue #5)', async () => {
+    const ctx = createMockContext({ errors: wikipediaGetSummary.errors });
+    const input = wikipediaGetSummary.input.parse({ title: 'Python', language: 'INVALID!!' });
+    await expect(wikipediaGetSummary.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'invalid_language' },
+    });
+  });
 });

@@ -66,6 +66,15 @@ export const wikipediaGetSections = tool('wikipedia_get_sections', {
 
   async handler(input, ctx) {
     const language = input.language || 'en';
+
+    if (!/^[a-z]{2,3}(-[a-z0-9]+)*$/i.test(language)) {
+      throw ctx.fail(
+        'invalid_language',
+        `Invalid language code "${language}". Use a BCP 47 language code such as "fr", "de", or "ja".`,
+        { language, ...ctx.recoveryFor('invalid_language') },
+      );
+    }
+
     ctx.log.info('Fetching sections', { title: input.title, language });
 
     const svc = getWikipediaService();

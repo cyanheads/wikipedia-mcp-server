@@ -73,4 +73,12 @@ describe('wikipediaGetLanguages', () => {
     expect(text).toContain('https://fr.wikipedia.org');
     expect(text).toContain('1 languages');
   });
+
+  it('throws invalid_language with data.reason when language code is malformed (issue #5)', async () => {
+    const ctx = createMockContext({ errors: wikipediaGetLanguages.errors });
+    const input = wikipediaGetLanguages.input.parse({ title: 'Python', language: 'INVALID!!' });
+    await expect(wikipediaGetLanguages.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'invalid_language' },
+    });
+  });
 });

@@ -98,4 +98,20 @@ describe('wikipediaGetArticle', () => {
     expect(text).toContain('History');
     expect(text).toContain('section');
   });
+
+  it('throws invalid_language with data.reason when language code is malformed (issue #5)', async () => {
+    const ctx = createMockContext({ errors: wikipediaGetArticle.errors });
+    const input = wikipediaGetArticle.input.parse({ title: 'Python', language: 'INVALID!!' });
+    await expect(wikipediaGetArticle.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'invalid_language' },
+    });
+  });
+
+  it('throws invalid_section for section_index=0 (issue #7)', async () => {
+    const ctx = createMockContext({ errors: wikipediaGetArticle.errors });
+    const input = wikipediaGetArticle.input.parse({ title: 'Python', section_index: 0 });
+    await expect(wikipediaGetArticle.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'invalid_section' },
+    });
+  });
 });
