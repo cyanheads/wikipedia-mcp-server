@@ -2,8 +2,8 @@
   "manifest_version": "0.3",
   "name": "wikipedia-mcp-server",
   "version": "0.1.0",
-  "description": "",
-  "author": { "name": "" },
+  "description": "Search Wikipedia articles, read summaries and full text, target sections, find nearby pages, and list language editions via MCP. STDIO or Streamable HTTP.",
+  "author": { "name": "Casey Hand" },
   "server": {
     "type": "node",
     "entry_point": "dist/index.js",
