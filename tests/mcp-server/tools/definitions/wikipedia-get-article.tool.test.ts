@@ -54,7 +54,7 @@ describe('wikipediaGetArticle', () => {
     expect(result.content).toContain('Guido van Rossum');
   });
 
-  it('bubbles service errors (not_found) without wrapping', async () => {
+  it('re-throws service not_found as typed contract error with data.reason', async () => {
     const { notFound } = await import('@cyanheads/mcp-ts-core/errors');
     vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
       getArticleFull: vi
@@ -62,9 +62,11 @@ describe('wikipediaGetArticle', () => {
         .mockRejectedValue(notFound('No Wikipedia article found for "Missing" in language "en".')),
     } as unknown as svcModule.WikipediaService);
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaGetArticle.errors });
     const input = wikipediaGetArticle.input.parse({ title: 'Missing' });
-    await expect(wikipediaGetArticle.handler(input, ctx)).rejects.toThrow(/No Wikipedia article/);
+    await expect(wikipediaGetArticle.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'not_found' },
+    });
   });
 
   it('format renders content, title, and content_type', () => {
@@ -112,6 +114,31 @@ describe('wikipediaGetArticle', () => {
     const input = wikipediaGetArticle.input.parse({ title: 'Python', section_index: 0 });
     await expect(wikipediaGetArticle.handler(input, ctx)).rejects.toMatchObject({
       data: { reason: 'invalid_section' },
+    });
+  });
+
+  it('throws invalid_section for negative section_index (issue #9)', async () => {
+    const ctx = createMockContext({ errors: wikipediaGetArticle.errors });
+    const input = wikipediaGetArticle.input.parse({ title: 'Python', section_index: -1 });
+    await expect(wikipediaGetArticle.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'invalid_section' },
+    });
+  });
+
+  it('throws not_found with data.reason when article is missing (issue #12)', async () => {
+    const { notFound } = await import('@cyanheads/mcp-ts-core/errors');
+    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+      getArticleFull: vi
+        .fn()
+        .mockRejectedValue(
+          notFound('No Wikipedia article found for "ZZZMissing" in language "en".'),
+        ),
+    } as unknown as svcModule.WikipediaService);
+
+    const ctx = createMockContext({ errors: wikipediaGetArticle.errors });
+    const input = wikipediaGetArticle.input.parse({ title: 'ZZZMissing' });
+    await expect(wikipediaGetArticle.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'not_found' },
     });
   });
 });

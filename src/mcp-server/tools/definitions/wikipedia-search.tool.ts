@@ -10,17 +10,18 @@ import { getWikipediaService } from '@/services/wikipedia/wikipedia-service.js';
 export const wikipediaSearch = tool('wikipedia_search', {
   title: 'Search Wikipedia',
   description:
-    'Search Wikipedia articles by full-text query. Returns ranked results with plain-text titles, ' +
-    'snippets (HTML stripped), page IDs, and word counts. Use when the exact article ' +
-    'title is unknown or to discover multiple articles on a topic. Returned pageid values ' +
-    'identify articles for use in other tools. Supports all Wikipedia language editions.',
+    'Search Wikipedia articles by full-text query. Returns ranked results with plain-text titles, snippets (HTML stripped), page IDs, and word counts. Best when the exact article title is unknown or when multiple articles on a topic are needed. Returned pageid values can be passed to other tools. Supports all Wikipedia language editions.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
-    query: z.string().describe('Search query — use natural language or key terms.'),
+    query: z.string().describe('Search query (e.g. "Python programming language").'),
     limit: z
       .number()
+      .int()
+      .min(1)
       .default(10)
-      .describe('Maximum number of results to return (default 10, max 50).'),
+      .describe(
+        'Maximum number of results to return (default 10, max 50). Must be a positive integer.',
+      ),
     language: z
       .string()
       .default('en')
@@ -31,8 +32,8 @@ export const wikipediaSearch = tool('wikipedia_search', {
       .array(
         z
           .object({
-            title: z.string().describe('Article title.'),
-            pageid: z.number().describe('Wikipedia page ID.'),
+            title: z.string().describe('Article title (e.g. "Python (programming language)").'),
+            pageid: z.number().describe('Wikipedia page ID — use as input to other tools.'),
             snippet: z.string().describe('Plain-text search snippet with matched terms.'),
             wordcount: z.number().describe('Article word count.'),
           })
@@ -60,8 +61,8 @@ export const wikipediaSearch = tool('wikipedia_search', {
   ],
 
   async handler(input, ctx) {
+    const { language } = input;
     const limit = Math.min(input.limit, 50);
-    const language = input.language || 'en';
 
     if (!/^[a-z]{2,3}(-[a-z0-9]+)*$/i.test(language)) {
       throw ctx.fail(

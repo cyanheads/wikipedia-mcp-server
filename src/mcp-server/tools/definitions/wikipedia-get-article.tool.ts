@@ -4,19 +4,16 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getWikipediaService } from '@/services/wikipedia/wikipedia-service.js';
 
 export const wikipediaGetArticle = tool('wikipedia_get_article', {
   title: 'Get Wikipedia Article',
   description:
-    'Fetch article content as clean plain text. Without section_index: returns the full article ' +
-    '(40–100KB for major articles) with == Section == markers preserved for structure. ' +
-    'With section_index (from wikipedia_get_sections): returns just that section as plain text ' +
-    '(1–10KB). Use section targeting when only part of the article is needed.',
+    'Fetch article content as clean plain text. Without section_index: returns the full article with == Section == markers preserved for structure. With section_index (from wikipedia_get_sections): returns just that section as plain text. Section-targeted reads are faster and smaller when only part of the article is needed.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
-    title: z.string().describe('Article title.'),
+    title: z.string().describe('Article title (e.g. "Python (programming language)").'),
     section_index: z
       .number()
       .optional()
@@ -67,7 +64,7 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
   ],
 
   async handler(input, ctx) {
-    const language = input.language || 'en';
+    const { language } = input;
 
     // Validate language code eagerly so the contract reason appears in data.reason.
     if (!/^[a-z]{2,3}(-[a-z0-9]+)*$/i.test(language)) {
@@ -78,15 +75,16 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
       );
     }
 
-    // Reject section_index 0 — wikipedia_get_sections returns indices starting at 1.
-    // Index 0 refers to the lead section which wikitext parsing returns as templates/infoboxes
-    // (no readable text). Full-article reads handle the lead via the extracts API.
-    if (input.section_index === 0) {
+    // Reject section_index < 1 — indices start at 1 (wikipedia_get_sections output).
+    // Index 0 refers to the lead section (wikitext parsing returns templates/infoboxes, not
+    // readable text); negative values are nonsensical and leak a raw API error.
+    // Full-article reads handle the lead via the extracts API.
+    if (input.section_index != null && input.section_index < 1) {
       throw ctx.fail(
         'invalid_section',
-        'section_index 0 is not valid. Section indices start at 1 (use wikipedia_get_sections to discover valid values). To read the lead section, omit section_index entirely.',
+        `section_index ${input.section_index} is not valid. Section indices start at 1 (use wikipedia_get_sections to discover valid values). To read the lead section, omit section_index entirely.`,
         {
-          sectionIndex: 0,
+          sectionIndex: input.section_index,
           recovery: {
             hint: 'Use wikipedia_get_sections to get valid indices (starting at 1). Omit section_index to read the full article including its lead section.',
           },
@@ -103,7 +101,19 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
         sectionIndex: input.section_index,
         language,
       });
-      const result = await svc.getArticleSection(input.title, input.section_index, language, ctx);
+      let result: Awaited<ReturnType<typeof svc.getArticleSection>>;
+      try {
+        result = await svc.getArticleSection(input.title, input.section_index, language, ctx);
+      } catch (err) {
+        if (err instanceof McpError && err.code === JsonRpcErrorCode.NotFound) {
+          throw ctx.fail('not_found', err.message, {
+            title: input.title,
+            language,
+            recovery: { hint: 'Use wikipedia_search to find the correct article title.' },
+          });
+        }
+        throw err;
+      }
       ctx.log.info('Section fetched', {
         title: result.title,
         sectionTitle: result.sectionTitle,
@@ -121,7 +131,19 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
 
     // Full-article path
     ctx.log.info('Fetching full article', { title: input.title, language });
-    const result = await svc.getArticleFull(input.title, language, ctx);
+    let result: Awaited<ReturnType<typeof svc.getArticleFull>>;
+    try {
+      result = await svc.getArticleFull(input.title, language, ctx);
+    } catch (err) {
+      if (err instanceof McpError && err.code === JsonRpcErrorCode.NotFound) {
+        throw ctx.fail('not_found', err.message, {
+          title: input.title,
+          language,
+          recovery: { hint: 'Use wikipedia_search to find the correct article title.' },
+        });
+      }
+      throw err;
+    }
     ctx.log.info('Article fetched', {
       title: result.title,
       contentLength: result.content.length,

@@ -81,4 +81,21 @@ describe('wikipediaGetLanguages', () => {
       data: { reason: 'invalid_language' },
     });
   });
+
+  it('throws not_found with data.reason when article is missing (issue #12)', async () => {
+    const { notFound } = await import('@cyanheads/mcp-ts-core/errors');
+    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+      getLanguages: vi
+        .fn()
+        .mockRejectedValue(
+          notFound('No Wikipedia article found for "ZZZMissing" in language "en".'),
+        ),
+    } as unknown as svcModule.WikipediaService);
+
+    const ctx = createMockContext({ errors: wikipediaGetLanguages.errors });
+    const input = wikipediaGetLanguages.input.parse({ title: 'ZZZMissing' });
+    await expect(wikipediaGetLanguages.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'not_found' },
+    });
+  });
 });

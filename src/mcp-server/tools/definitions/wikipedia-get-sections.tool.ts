@@ -4,19 +4,16 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getWikipediaService } from '@/services/wikipedia/wikipedia-service.js';
 
 export const wikipediaGetSections = tool('wikipedia_get_sections', {
   title: 'Get Wikipedia Article Sections',
   description:
-    'Fetch the table of contents for a Wikipedia article. Returns section titles, heading levels, ' +
-    'section numbering (e.g. "2.1"), and section_index values. The section_index is the integer to ' +
-    'pass to wikipedia_get_article to retrieve just that section. Call this before wikipedia_get_article ' +
-    'when only a specific section is needed, or to enumerate article structure before reading.',
+    'Fetch the table of contents for a Wikipedia article. Returns section titles, heading levels, section numbering (e.g. "2.1"), and section_index values. Pass a section_index to wikipedia_get_article to retrieve just that section. Useful for enumerating article structure before doing a targeted section read.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
-    title: z.string().describe('Article title.'),
+    title: z.string().describe('Article title (e.g. "Python (programming language)").'),
     language: z
       .string()
       .default('en')
@@ -65,7 +62,7 @@ export const wikipediaGetSections = tool('wikipedia_get_sections', {
   ],
 
   async handler(input, ctx) {
-    const language = input.language || 'en';
+    const { language } = input;
 
     if (!/^[a-z]{2,3}(-[a-z0-9]+)*$/i.test(language)) {
       throw ctx.fail(
@@ -78,7 +75,19 @@ export const wikipediaGetSections = tool('wikipedia_get_sections', {
     ctx.log.info('Fetching sections', { title: input.title, language });
 
     const svc = getWikipediaService();
-    const result = await svc.getSections(input.title, language, ctx);
+    let result: Awaited<ReturnType<typeof svc.getSections>>;
+    try {
+      result = await svc.getSections(input.title, language, ctx);
+    } catch (err) {
+      if (err instanceof McpError && err.code === JsonRpcErrorCode.NotFound) {
+        throw ctx.fail('not_found', err.message, {
+          title: input.title,
+          language,
+          recovery: { hint: 'Use wikipedia_search to find the correct article title.' },
+        });
+      }
+      throw err;
+    }
 
     if (result.sections.length === 0) {
       throw ctx.fail(

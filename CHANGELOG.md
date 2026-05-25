@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.3](changelog/0.1.x/0.1.3.md) — 2026-05-24
+
+Field-test fixes: not_found propagation, invalid section_index guard, negative/float input validation, tool-description improvements, service simplification.
+
 ## [0.1.2](changelog/0.1.x/0.1.2.md) — 2026-05-24
 
 Fix npm package scope to @cyanheads/wikipedia-mcp-server.

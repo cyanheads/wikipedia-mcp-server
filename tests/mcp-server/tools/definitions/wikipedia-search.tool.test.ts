@@ -106,4 +106,16 @@ describe('wikipediaSearch', () => {
       data: { reason: 'invalid_language' },
     });
   });
+
+  it('rejects float limit at schema parse time (issue #14)', () => {
+    expect(() => wikipediaSearch.input.parse({ query: 'Python', limit: 5.7 })).toThrow();
+  });
+
+  it('rejects negative limit at schema parse time (issue #10)', () => {
+    expect(() => wikipediaSearch.input.parse({ query: 'Python', limit: -1 })).toThrow();
+  });
+
+  it('rejects zero limit at schema parse time (issue #10)', () => {
+    expect(() => wikipediaSearch.input.parse({ query: 'Python', limit: 0 })).toThrow();
+  });
 });

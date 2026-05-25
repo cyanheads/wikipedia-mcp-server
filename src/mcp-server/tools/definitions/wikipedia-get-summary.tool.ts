@@ -4,23 +4,18 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getWikipediaService } from '@/services/wikipedia/wikipedia-service.js';
 
 export const wikipediaGetSummary = tool('wikipedia_get_summary', {
   title: 'Get Wikipedia Summary',
   description:
-    'Fetch the lead-section summary for a Wikipedia article — the 2–4 paragraph intro that answers ' +
-    '"what is X?". Returns clean plain-text extract, Wikidata QID (wikibase_item) for cross-referencing ' +
-    'with wikidata-mcp-server, description, and thumbnail URL. Disambiguation pages return ' +
-    'page_type: "disambiguation" — not an error, but a signal to call wikipedia_search with a more ' +
-    'specific query. Redirect pages are followed automatically. This is the right tool for 90% of ' +
-    'encyclopedic lookups; use wikipedia_get_article when full-article depth is needed.',
+    'Fetch the lead-section summary for a Wikipedia article — the 2–4 paragraph intro that answers "what is X?". Returns plain-text extract, Wikidata QID (wikibase_item) for cross-referencing with wikidata-mcp-server, short description, and thumbnail URL. Redirect pages are followed automatically. When page_type is "disambiguation", the title matched a disambiguation page — call wikipedia_search with a more specific query to find the intended article. Prefer this over wikipedia_get_article unless full article depth is needed.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     title: z
       .string()
-      .describe('Article title (URL-decoded, e.g. "Python (programming language)").'),
+      .describe('Article title (URL-decoded), e.g. "Python (programming language)".'),
     language: z
       .string()
       .default('en')
@@ -31,9 +26,9 @@ export const wikipediaGetSummary = tool('wikipedia_get_summary', {
     page_type: z
       .string()
       .describe(
-        'Page type: "article", "disambiguation", or "redirect". When "disambiguation", call wikipedia_search with a more specific query.',
+        'Page type from the Wikipedia REST API. Common values: "standard" (regular article), "disambiguation" (disambiguation page), "no-extract" (article with no extract). When "disambiguation", call wikipedia_search with a more specific query.',
       ),
-    pageid: z.number().optional().describe('Wikipedia page ID.'),
+    pageid: z.number().optional().describe('Wikipedia page ID. Absent when the API omits it.'),
     wikibase_item: z
       .string()
       .optional()
@@ -65,7 +60,7 @@ export const wikipediaGetSummary = tool('wikipedia_get_summary', {
   ],
 
   async handler(input, ctx) {
-    const language = input.language || 'en';
+    const { language } = input;
 
     if (!/^[a-z]{2,3}(-[a-z0-9]+)*$/i.test(language)) {
       throw ctx.fail(
@@ -78,7 +73,19 @@ export const wikipediaGetSummary = tool('wikipedia_get_summary', {
     ctx.log.info('Fetching summary', { title: input.title, language });
 
     const svc = getWikipediaService();
-    const result = await svc.getSummary(input.title, language, ctx);
+    let result: Awaited<ReturnType<typeof svc.getSummary>>;
+    try {
+      result = await svc.getSummary(input.title, language, ctx);
+    } catch (err) {
+      if (err instanceof McpError && err.code === JsonRpcErrorCode.NotFound) {
+        throw ctx.fail('not_found', err.message, {
+          title: input.title,
+          language,
+          recovery: { hint: 'Use wikipedia_search to find the correct article title.' },
+        });
+      }
+      throw err;
+    }
 
     ctx.log.info('Summary fetched', {
       title: result.title,

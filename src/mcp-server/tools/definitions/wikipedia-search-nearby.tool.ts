@@ -10,22 +10,25 @@ import { getWikipediaService } from '@/services/wikipedia/wikipedia-service.js';
 export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
   title: 'Search Wikipedia Nearby',
   description:
-    'Find Wikipedia articles about places near a geographic coordinate. Returns articles sorted by ' +
-    'distance from the query point, with titles, page IDs, coordinates, and distance in meters. ' +
-    'Useful for "what is notable near X?" research workflows. Only articles with geographic coordinates ' +
-    'in their Wikidata record are returned — not all articles about locations are geotagged.',
+    'Find Wikipedia articles about places near a geographic coordinate. Returns articles sorted by distance from the query point, with titles, page IDs, coordinates, and distance in meters. Useful for "what is notable near X?" research workflows. Only articles with geographic coordinates in their Wikidata record are returned — not all articles about locations are geotagged.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     latitude: z.number().describe('WGS 84 latitude in decimal degrees (range: −90 to 90).'),
     longitude: z.number().describe('WGS 84 longitude in decimal degrees (range: −180 to 180).'),
     radius_meters: z
       .number()
+      .int()
+      .min(1)
       .default(1000)
-      .describe('Search radius in meters (default 1000, max 10000).'),
+      .describe('Search radius in meters (default 1000, max 10000). Must be a positive integer.'),
     limit: z
       .number()
+      .int()
+      .min(1)
       .default(10)
-      .describe('Maximum number of results to return (default 10, max 50).'),
+      .describe(
+        'Maximum number of results to return (default 10, max 50). Must be a positive integer.',
+      ),
     language: z
       .string()
       .default('en')
@@ -36,8 +39,8 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
       .array(
         z
           .object({
-            title: z.string().describe('Article title.'),
-            pageid: z.number().describe('Wikipedia page ID.'),
+            title: z.string().describe('Article title (e.g. "Eiffel Tower").'),
+            pageid: z.number().describe('Wikipedia page ID — use as input to other tools.'),
             latitude: z.number().describe('Article subject latitude in decimal degrees.'),
             longitude: z.number().describe('Article subject longitude in decimal degrees.'),
             distance_meters: z.number().describe('Distance from the query coordinate in meters.'),
@@ -95,7 +98,7 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
 
     const radiusMeters = Math.min(input.radius_meters, 10_000);
     const limit = Math.min(input.limit, 50);
-    const language = input.language || 'en';
+    const { language } = input;
 
     if (!/^[a-z]{2,3}(-[a-z0-9]+)*$/i.test(language)) {
       throw ctx.fail(

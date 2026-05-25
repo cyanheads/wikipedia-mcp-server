@@ -42,18 +42,12 @@ function stripWikitext(wikitext: string): string {
   // Preserve section headings — wtf strips them, but we want structure.
   // Re-inject from the raw wikitext using a simple regex pass.
   const headingPattern = /^(={2,6})\s*(.+?)\s*\1\s*$/gm;
-  const headings: Array<{ level: number; title: string; position: number }> = [];
-  for (const m of wikitext.matchAll(headingPattern)) {
-    const eqMarker = m[1];
-    const headingTitle = m[2];
-    if (eqMarker && headingTitle) {
-      headings.push({ level: eqMarker.length, title: headingTitle, position: m.index ?? 0 });
-    }
-  }
+  const headings = [...wikitext.matchAll(headingPattern)]
+    .filter((m) => m[1] && m[2])
+    .map((m) => ({ level: m[1]!.length, title: m[2]! }));
 
   // Prepend headings as == Heading == markers when present and not already in text.
-  const firstHeading = headings[0];
-  if (firstHeading && !text.startsWith(firstHeading.title)) {
+  if (headings[0] && !text.startsWith(headings[0].title)) {
     const headingMarkers = headings
       .map(({ level, title }) => `${'='.repeat(level)} ${title} ${'='.repeat(level)}`)
       .join('\n\n');
@@ -382,11 +376,11 @@ export class WikipediaService {
     const base = buildBaseUrl(language);
     const url = `${base}/api/rest_v1${path}`;
     const signal = (ctx as { signal?: AbortSignal }).signal;
-    return await withRetry(
+    return withRetry(
       async () => {
         const response = await fetchWithTimeout(url, 15_000, ctx, {
           headers: this.headers(),
-          ...(signal ? { signal } : {}),
+          ...(signal && { signal }),
         });
         const text = await response.text();
         if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
@@ -410,11 +404,11 @@ export class WikipediaService {
     const qs = new URLSearchParams({ format: 'json', formatversion: '2', ...params }).toString();
     const url = `${base}/w/api.php?${qs}`;
     const signal = (ctx as { signal?: AbortSignal }).signal;
-    return await withRetry(
+    return withRetry(
       async () => {
         const response = await fetchWithTimeout(url, 15_000, ctx, {
           headers: this.headers(),
-          ...(signal ? { signal } : {}),
+          ...(signal && { signal }),
         });
         const text = await response.text();
         if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
@@ -537,7 +531,14 @@ export class WikipediaService {
     );
 
     const pages = raw.query?.pages;
-    if (!pages) throw serviceUnavailable('Unexpected response shape from Wikipedia extracts API.');
+    // When `pages` is absent the API received an empty or invalid title rather than a valid
+    // (but missing) article. Map this to not_found — same user-visible outcome.
+    if (!pages) {
+      throw notFound(
+        `No Wikipedia article found for "${title}" in language "${language}". Use wikipedia_search to find the correct title.`,
+        { title, language },
+      );
+    }
 
     const page = Object.values(pages)[0];
     if (!page || page.missing !== undefined) {
@@ -645,26 +646,13 @@ export class WikipediaService {
     if (rawSections.length === 0) {
       const fullArticle = await this.getArticleFull(title, language, ctx);
       const headerPattern = /^(={2,6})\s*(.+?)\s*\1\s*$/gm;
-      const fallbackSections: Array<{
-        index: number;
-        number: string;
-        title: string;
-        level: number;
-      }> = [];
-      let idx = 1;
-      for (const m of fullArticle.content.matchAll(headerPattern)) {
-        const eqMarker = m[1];
-        const hdrTitle = m[2];
-        if (eqMarker && hdrTitle) {
-          const currentIdx = idx++;
-          fallbackSections.push({
-            index: currentIdx,
-            number: String(currentIdx),
-            title: hdrTitle,
-            level: eqMarker.length,
-          });
-        }
-      }
+      let idx = 0;
+      const fallbackSections = [...fullArticle.content.matchAll(headerPattern)]
+        .filter((m) => m[1] && m[2])
+        .map((m) => {
+          const i = ++idx;
+          return { index: i, number: String(i), title: m[2]!, level: m[1]!.length };
+        });
       return { pageid: fullArticle.pageid, sections: fallbackSections };
     }
 

@@ -4,16 +4,13 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getWikipediaService } from '@/services/wikipedia/wikipedia-service.js';
 
 export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
   title: 'Get Wikipedia Article Languages',
   description:
-    'List the language editions available for a Wikipedia article. Returns language codes, article ' +
-    'titles in each language, and full URLs. Use for cross-language research or to find a non-English ' +
-    'article title before switching language editions. The source article language parameter specifies ' +
-    'which edition to query from.',
+    'List the language editions available for a Wikipedia article. Returns language codes, article titles in each language, and full URLs. Useful for cross-language research and for discovering the correct article title in a target language before fetching it. The language parameter specifies which edition to query from.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     title: z.string().describe('Article title in the source language edition.'),
@@ -63,7 +60,7 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
   ],
 
   async handler(input, ctx) {
-    const language = input.language || 'en';
+    const { language } = input;
 
     if (!/^[a-z]{2,3}(-[a-z0-9]+)*$/i.test(language)) {
       throw ctx.fail(
@@ -76,7 +73,20 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
     ctx.log.info('Fetching language links', { title: input.title, language });
 
     const svc = getWikipediaService();
-    const { languages } = await svc.getLanguages(input.title, language, ctx);
+    let getLanguagesResult: Awaited<ReturnType<typeof svc.getLanguages>>;
+    try {
+      getLanguagesResult = await svc.getLanguages(input.title, language, ctx);
+    } catch (err) {
+      if (err instanceof McpError && err.code === JsonRpcErrorCode.NotFound) {
+        throw ctx.fail('not_found', err.message, {
+          title: input.title,
+          language,
+          recovery: { hint: 'Use wikipedia_search to find the correct article title.' },
+        });
+      }
+      throw err;
+    }
+    const { languages } = getLanguagesResult;
 
     if (languages.length === 0) {
       throw ctx.fail(

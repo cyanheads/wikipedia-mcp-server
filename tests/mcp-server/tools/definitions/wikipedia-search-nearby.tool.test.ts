@@ -133,4 +133,36 @@ describe('wikipediaSearchNearby', () => {
       data: { reason: 'invalid_language' },
     });
   });
+
+  it('rejects float limit at schema parse time (issue #14)', () => {
+    expect(() =>
+      wikipediaSearchNearby.input.parse({ latitude: 47.6, longitude: -122.3, limit: 5.7 }),
+    ).toThrow();
+  });
+
+  it('rejects negative limit at schema parse time (issue #10)', () => {
+    expect(() =>
+      wikipediaSearchNearby.input.parse({ latitude: 47.6, longitude: -122.3, limit: -1 }),
+    ).toThrow();
+  });
+
+  it('rejects negative radius_meters at schema parse time (issue #10)', () => {
+    expect(() =>
+      wikipediaSearchNearby.input.parse({
+        latitude: 47.6,
+        longitude: -122.3,
+        radius_meters: -1000,
+      }),
+    ).toThrow();
+  });
+
+  it('rejects float radius_meters at schema parse time (issue #14)', () => {
+    expect(() =>
+      wikipediaSearchNearby.input.parse({
+        latitude: 47.6,
+        longitude: -122.3,
+        radius_meters: 500.5,
+      }),
+    ).toThrow();
+  });
 });
