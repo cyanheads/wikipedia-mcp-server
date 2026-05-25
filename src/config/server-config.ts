@@ -13,7 +13,7 @@ const ServerConfigSchema = z.object({
     .describe('Base Wikipedia URL — language selection is per-call, not global'),
   userAgent: z
     .string()
-    .default('wikipedia-mcp-server/0.1.3 (https://github.com/cyanheads/wikipedia-mcp-server)')
+    .default('wikipedia-mcp-server/0.1.4 (https://github.com/cyanheads/wikipedia-mcp-server)')
     .describe('User-Agent header sent with every request per Wikimedia policy'),
 });
 
