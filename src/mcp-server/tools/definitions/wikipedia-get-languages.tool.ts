@@ -53,7 +53,7 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
     },
     {
       reason: 'invalid_language',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: 'The language code is not a valid BCP 47 code.',
       recovery: 'Use a valid BCP 47 language code such as "fr", "de", or "ja".',
     },

@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: wikipedia-mcp-server
+abstract: "Model Context Protocol (MCP) server for Wikipedia, providing article search, summaries, full text, section targeting, nearby pages, and language edition discovery."
+type: software
+authors:
+  - family-names: Hand
+    given-names: Casey
+    orcid: "https://orcid.org/0009-0009-3726-568X"
+repository-code: "https://github.com/cyanheads/wikipedia-mcp-server"
+license: Apache-2.0
+keywords:
+  - mcp
+  - model-context-protocol
+  - wikipedia
+  - encyclopedia
+  - mediawiki

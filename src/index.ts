@@ -19,6 +19,7 @@ await createApp({
 - Use wikipedia_get_sections then wikipedia_get_article with section_index for targeted section reads — much smaller than full articles.
 - All tools support a language parameter (default "en") for multi-language workflows.
 - wikipedia_get_summary returns page_type: "disambiguation" for disambiguation pages — follow up with wikipedia_search.`,
+  landing: { requireAuth: false },
   setup(core) {
     const serverConfig = getServerConfig();
     initWikipediaService(core.config, core.storage, serverConfig.userAgent);

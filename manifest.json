@@ -1,9 +1,17 @@
 {
   "manifest_version": "0.3",
   "name": "wikipedia-mcp-server",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Search Wikipedia articles, read summaries and full text, target sections, find nearby pages, and list language editions via MCP. STDIO or Streamable HTTP.",
-  "author": { "name": "cyanheads" },
+  "author": {
+    "name": "cyanheads"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cyanheads/wikipedia-mcp-server"
+  },
+  "homepage": "https://github.com/cyanheads/wikipedia-mcp-server#readme",
+  "license": "Apache-2.0",
   "server": {
     "type": "node",
     "entry_point": "dist/index.js",
@@ -18,7 +26,9 @@
     }
   },
   "compatibility": {
-    "runtimes": { "node": ">=24.0.0" }
+    "runtimes": {
+      "node": ">=24.0.0"
+    }
   },
   "tools_generated": true,
   "prompts_generated": true,

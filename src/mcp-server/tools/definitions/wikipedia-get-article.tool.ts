@@ -51,13 +51,13 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
     },
     {
       reason: 'invalid_section',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: 'The section_index is out of range for this article.',
       recovery: 'Call wikipedia_get_sections first to obtain valid section_index values.',
     },
     {
       reason: 'invalid_language',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: 'The language code is not a valid BCP 47 code.',
       recovery: 'Use a valid BCP 47 language code such as "fr", "de", or "ja".',
     },

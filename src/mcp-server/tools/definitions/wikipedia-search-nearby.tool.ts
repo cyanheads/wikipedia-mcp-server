@@ -64,13 +64,13 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
     },
     {
       reason: 'invalid_coordinates',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: 'Latitude or longitude is outside valid WGS 84 range.',
       recovery: 'Latitude must be between −90 and 90; longitude between −180 and 180.',
     },
     {
       reason: 'invalid_language',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: 'The language code is not a valid BCP 47 code.',
       recovery: 'Use a valid BCP 47 language code such as "fr", "de", or "ja".',
     },

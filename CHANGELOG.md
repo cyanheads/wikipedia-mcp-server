@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.5](changelog/0.1.x/0.1.5.md) — 2026-05-28
+
+mcp-ts-core ^0.9.9 → ^0.9.13: HTTP body cap, session-init gate, quieter auth-error logs, GET /mcp keywords; error code corrections; dep refresh
+
 ## [0.1.4](changelog/0.1.x/0.1.4.md) — 2026-05-24
 
 Drop tsx, align all scripts to bun-native execution; add funding block
