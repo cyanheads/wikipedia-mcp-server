@@ -142,4 +142,59 @@ describe('wikipediaGetSummary', () => {
       data: { reason: 'not_found' },
     });
   });
+
+  it('passes non-default language to service', async () => {
+    const getSummaryFn = vi.fn().mockResolvedValue({ ...mockSummary, title: 'Python (langage)' });
+    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+      getSummary: getSummaryFn,
+    } as unknown as svcModule.WikipediaService);
+
+    const ctx = createMockContext();
+    const input = wikipediaGetSummary.input.parse({ title: 'Python (langage)', language: 'fr' });
+    const result = await wikipediaGetSummary.handler(input, ctx);
+
+    expect(getSummaryFn).toHaveBeenCalledWith('Python (langage)', 'fr', ctx);
+    expect(result.language).toBe('fr');
+  });
+
+  it('format output does not expose secrets or env var names', () => {
+    const output = {
+      title: 'Test Article',
+      page_type: 'article',
+      pageid: 1,
+      extract: 'Some content.',
+      language: 'en',
+    };
+    const blocks = wikipediaGetSummary.format!(output);
+    const text = blocks.map((b) => (b.type === 'text' ? b.text : '')).join('');
+    expect(text).not.toMatch(/WIKIPEDIA_USER_AGENT|WIKIPEDIA_BASE_URL|process\.env/i);
+    expect(text).not.toMatch(/Bearer\s+\S+|Authorization:/i);
+  });
+
+  it('handles unicode article title without error', async () => {
+    const getSummaryFn = vi.fn().mockResolvedValue({
+      ...mockSummary,
+      title: 'Tōkyō Tawā',
+    });
+    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+      getSummary: getSummaryFn,
+    } as unknown as svcModule.WikipediaService);
+
+    const ctx = createMockContext();
+    const input = wikipediaGetSummary.input.parse({ title: 'Tōkyō Tawā' });
+    const result = await wikipediaGetSummary.handler(input, ctx);
+    expect(result.title).toBe('Tōkyō Tawā');
+  });
+
+  it('non-McpError from service propagates without wrapping', async () => {
+    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+      getSummary: vi.fn().mockRejectedValue(new TypeError('Unexpected upstream shape')),
+    } as unknown as svcModule.WikipediaService);
+
+    const ctx = createMockContext({ errors: wikipediaGetSummary.errors });
+    const input = wikipediaGetSummary.input.parse({ title: 'Python' });
+    await expect(wikipediaGetSummary.handler(input, ctx)).rejects.toThrow(
+      'Unexpected upstream shape',
+    );
+  });
 });

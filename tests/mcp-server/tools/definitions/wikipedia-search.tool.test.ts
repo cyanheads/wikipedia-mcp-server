@@ -124,4 +124,88 @@ describe('wikipediaSearch', () => {
   it('rejects zero limit at schema parse time (issue #10)', () => {
     expect(() => wikipediaSearch.input.parse({ query: 'Python', limit: 0 })).toThrow();
   });
+
+  it('passes non-default language to service', async () => {
+    const searchFn = vi.fn().mockResolvedValue({
+      results: [
+        { title: 'Python (langage)', pageid: 999, snippet: 'Langage de prog.', wordcount: 3000 },
+      ],
+      totalResults: 1,
+    });
+    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+      search: searchFn,
+    } as unknown as svcModule.WikipediaService);
+
+    const ctx = createMockContext();
+    const input = wikipediaSearch.input.parse({ query: 'Python', language: 'fr' });
+    const result = await wikipediaSearch.handler(input, ctx);
+
+    expect(searchFn).toHaveBeenCalledWith('Python', 10, 'fr', ctx);
+    expect(result.language).toBe('fr');
+  });
+
+  it('format renders zero results correctly', () => {
+    const output = { results: [], language: 'en' };
+    const blocks = wikipediaSearch.format!(output);
+    const text = blocks.map((b) => (b.type === 'text' ? b.text : '')).join('');
+    expect(text).toContain('0 results');
+    expect(text).toContain('en');
+  });
+
+  it('enrichment totalCount reflects upstream total, not result array length', async () => {
+    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+      search: vi.fn().mockResolvedValue({
+        results: [{ title: 'T', pageid: 1, snippet: 'S', wordcount: 10 }],
+        totalResults: 500,
+      }),
+    } as unknown as svcModule.WikipediaService);
+
+    const ctx = createMockContext();
+    const input = wikipediaSearch.input.parse({ query: 'test', limit: 1 });
+    await wikipediaSearch.handler(input, ctx);
+
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.totalCount).toBe(500);
+  });
+
+  it('handles unicode query without error', async () => {
+    const searchFn = vi.fn().mockResolvedValue({ results: [], totalResults: 0 });
+    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+      search: searchFn,
+    } as unknown as svcModule.WikipediaService);
+
+    const ctx = createMockContext({ errors: wikipediaSearch.errors });
+    const input = wikipediaSearch.input.parse({ query: '東京タワー' });
+    const result = await wikipediaSearch.handler(input, ctx);
+    expect(result.results).toHaveLength(0);
+    expect(searchFn).toHaveBeenCalledWith('東京タワー', 10, 'en', ctx);
+  });
+
+  it('format output does not contain env var names or secret patterns', () => {
+    const output = {
+      results: [
+        {
+          title: 'Test',
+          pageid: 1,
+          snippet: 'A snippet.',
+          wordcount: 100,
+        },
+      ],
+      language: 'en',
+    };
+    const blocks = wikipediaSearch.format!(output);
+    const text = blocks.map((b) => (b.type === 'text' ? b.text : '')).join('');
+    expect(text).not.toMatch(/WIKIPEDIA_USER_AGENT|WIKIPEDIA_BASE_URL|process\.env/i);
+    expect(text).not.toMatch(/Bearer\s+\S+|Authorization:/i);
+  });
+
+  it('service error propagates without swallowing', async () => {
+    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+      search: vi.fn().mockRejectedValue(new Error('Network error')),
+    } as unknown as svcModule.WikipediaService);
+
+    const ctx = createMockContext({ errors: wikipediaSearch.errors });
+    const input = wikipediaSearch.input.parse({ query: 'Python' });
+    await expect(wikipediaSearch.handler(input, ctx)).rejects.toThrow('Network error');
+  });
 });

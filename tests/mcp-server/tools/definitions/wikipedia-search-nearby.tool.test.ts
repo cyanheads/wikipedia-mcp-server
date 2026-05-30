@@ -174,4 +174,113 @@ describe('wikipediaSearchNearby', () => {
       }),
     ).toThrow();
   });
+
+  it('throws invalid_coordinates for -91 latitude (lower bound)', async () => {
+    const ctx = createMockContext({ errors: wikipediaSearchNearby.errors });
+    const input = wikipediaSearchNearby.input.parse({ latitude: -91, longitude: 0 });
+    await expect(wikipediaSearchNearby.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'invalid_coordinates' },
+    });
+  });
+
+  it('throws invalid_coordinates for -181 longitude (lower bound)', async () => {
+    const ctx = createMockContext({ errors: wikipediaSearchNearby.errors });
+    const input = wikipediaSearchNearby.input.parse({ latitude: 0, longitude: -181 });
+    await expect(wikipediaSearchNearby.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'invalid_coordinates' },
+    });
+  });
+
+  it('caps limit at 50 and passes it to service', async () => {
+    const nearbyFn = vi.fn().mockResolvedValue({ results: [] });
+    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+      searchNearby: nearbyFn,
+    } as unknown as svcModule.WikipediaService);
+
+    const ctx = createMockContext({ errors: wikipediaSearchNearby.errors });
+    const input = wikipediaSearchNearby.input.parse({
+      latitude: 0,
+      longitude: 0,
+      limit: 999,
+    });
+    await wikipediaSearchNearby.handler(input, ctx);
+
+    // arg index 3 is limit
+    expect(nearbyFn.mock.calls[0]?.[3]).toBe(50);
+  });
+
+  it('passes non-default language to service', async () => {
+    const nearbyFn = vi.fn().mockResolvedValue({
+      results: [
+        {
+          title: 'Tour Eiffel',
+          pageid: 111,
+          latitude: 48.858,
+          longitude: 2.294,
+          distance_meters: 50,
+        },
+      ],
+    });
+    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+      searchNearby: nearbyFn,
+    } as unknown as svcModule.WikipediaService);
+
+    const ctx = createMockContext();
+    const input = wikipediaSearchNearby.input.parse({
+      latitude: 48.858,
+      longitude: 2.294,
+      language: 'fr',
+    });
+    const result = await wikipediaSearchNearby.handler(input, ctx);
+
+    // arg index 4 is language
+    expect(nearbyFn.mock.calls[0]?.[4]).toBe('fr');
+    expect(result.language).toBe('fr');
+  });
+
+  it('format renders zero results correctly', () => {
+    const output = { results: [], language: 'en' };
+    const blocks = wikipediaSearchNearby.format!(output);
+    const text = blocks.map((b) => (b.type === 'text' ? b.text : '')).join('');
+    expect(text).toContain('0 articles');
+  });
+
+  it('format output does not expose secrets or env var names', () => {
+    const output = {
+      results: [{ title: 'T', pageid: 1, latitude: 0, longitude: 0, distance_meters: 100 }],
+      language: 'en',
+    };
+    const blocks = wikipediaSearchNearby.format!(output);
+    const text = blocks.map((b) => (b.type === 'text' ? b.text : '')).join('');
+    expect(text).not.toMatch(/WIKIPEDIA_USER_AGENT|WIKIPEDIA_BASE_URL|process\.env/i);
+    expect(text).not.toMatch(/Bearer\s+\S+|Authorization:/i);
+  });
+
+  it('service error propagates without swallowing', async () => {
+    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+      searchNearby: vi.fn().mockRejectedValue(new Error('Upstream failure')),
+    } as unknown as svcModule.WikipediaService);
+
+    const ctx = createMockContext({ errors: wikipediaSearchNearby.errors });
+    const input = wikipediaSearchNearby.input.parse({ latitude: 0, longitude: 0 });
+    await expect(wikipediaSearchNearby.handler(input, ctx)).rejects.toThrow('Upstream failure');
+  });
+
+  it('enrichment radiusMetersUsed reflects effective (capped) value', async () => {
+    const nearbyFn = vi.fn().mockResolvedValue({ results: [] });
+    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+      searchNearby: nearbyFn,
+    } as unknown as svcModule.WikipediaService);
+
+    const ctx = createMockContext({ errors: wikipediaSearchNearby.errors });
+    const input = wikipediaSearchNearby.input.parse({
+      latitude: 0,
+      longitude: 0,
+      radius_meters: 500,
+    });
+    await wikipediaSearchNearby.handler(input, ctx);
+
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.radiusMetersUsed).toBe(500);
+  });
 });

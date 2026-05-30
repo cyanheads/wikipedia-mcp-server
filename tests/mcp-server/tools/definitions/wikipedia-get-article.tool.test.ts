@@ -141,4 +141,88 @@ describe('wikipediaGetArticle', () => {
       data: { reason: 'not_found' },
     });
   });
+
+  it('re-throws service not_found for section path as typed contract error', async () => {
+    const { notFound } = await import('@cyanheads/mcp-ts-core/errors');
+    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+      getArticleSection: vi
+        .fn()
+        .mockRejectedValue(notFound('No Wikipedia article found for "Ghost" in language "en".')),
+    } as unknown as svcModule.WikipediaService);
+
+    const ctx = createMockContext({ errors: wikipediaGetArticle.errors });
+    const input = wikipediaGetArticle.input.parse({ title: 'Ghost', section_index: 2 });
+    await expect(wikipediaGetArticle.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'not_found' },
+    });
+  });
+
+  it('non-McpError from service propagates without wrapping (full path)', async () => {
+    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+      getArticleFull: vi.fn().mockRejectedValue(new Error('Upstream timeout')),
+    } as unknown as svcModule.WikipediaService);
+
+    const ctx = createMockContext({ errors: wikipediaGetArticle.errors });
+    const input = wikipediaGetArticle.input.parse({ title: 'Anything' });
+    await expect(wikipediaGetArticle.handler(input, ctx)).rejects.toThrow('Upstream timeout');
+  });
+
+  it('non-McpError from service propagates without wrapping (section path)', async () => {
+    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+      getArticleSection: vi.fn().mockRejectedValue(new Error('Upstream timeout')),
+    } as unknown as svcModule.WikipediaService);
+
+    const ctx = createMockContext({ errors: wikipediaGetArticle.errors });
+    const input = wikipediaGetArticle.input.parse({ title: 'Anything', section_index: 3 });
+    await expect(wikipediaGetArticle.handler(input, ctx)).rejects.toThrow('Upstream timeout');
+  });
+
+  it('passes language to service for full article', async () => {
+    const getArticleFullFn = vi.fn().mockResolvedValue({
+      title: 'Python (langage)',
+      pageid: 9999,
+      content: 'Contenu en français.',
+    });
+    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+      getArticleFull: getArticleFullFn,
+    } as unknown as svcModule.WikipediaService);
+
+    const ctx = createMockContext();
+    const input = wikipediaGetArticle.input.parse({ title: 'Python (langage)', language: 'fr' });
+    const result = await wikipediaGetArticle.handler(input, ctx);
+
+    expect(getArticleFullFn).toHaveBeenCalledWith('Python (langage)', 'fr', ctx);
+    expect(result.language).toBe('fr');
+  });
+
+  it('format output does not expose secrets or env var names', () => {
+    const output = {
+      title: 'Python',
+      pageid: 1,
+      content: 'Some article content.',
+      section_title: undefined,
+      content_type: 'full_article',
+      language: 'en',
+    };
+    const blocks = wikipediaGetArticle.format!(output);
+    const text = blocks.map((b) => (b.type === 'text' ? b.text : '')).join('');
+    expect(text).not.toMatch(/WIKIPEDIA_USER_AGENT|WIKIPEDIA_BASE_URL|process\.env/i);
+    expect(text).not.toMatch(/Bearer\s+\S+|Authorization:/i);
+  });
+
+  it('full article result has no section_title field', async () => {
+    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+      getArticleFull: vi.fn().mockResolvedValue({
+        title: 'Albert Einstein',
+        pageid: 736,
+        content: 'Physics content.',
+      }),
+    } as unknown as svcModule.WikipediaService);
+
+    const ctx = createMockContext();
+    const input = wikipediaGetArticle.input.parse({ title: 'Albert Einstein' });
+    const result = await wikipediaGetArticle.handler(input, ctx);
+    expect(result.section_title).toBeUndefined();
+    expect(result.content_type).toBe('full_article');
+  });
 });
