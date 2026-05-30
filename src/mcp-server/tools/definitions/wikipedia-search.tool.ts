@@ -40,18 +40,23 @@ export const wikipediaSearch = tool('wikipedia_search', {
           .describe('A single search result entry.'),
       )
       .describe('Ranked search results.'),
-    total_results: z.number().describe('Total number of matching results in Wikipedia.'),
-    query_used: z.string().describe('The query that was searched.'),
     language: z.string().describe('Language edition queried.'),
   }),
 
+  // Agent-facing context — query echo, total match count, and optional empty-result
+  // notice. Reaches structuredContent AND content[] automatically; disjoint from output.
+  enrichment: {
+    effectiveQuery: z.string().describe('The query sent to Wikipedia.'),
+    totalCount: z.number().describe('Total matching results in Wikipedia.'),
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Guidance when no results matched — e.g. try different keywords. Absent on successful result pages.',
+      ),
+  },
+
   errors: [
-    {
-      reason: 'no_results',
-      code: JsonRpcErrorCode.NotFound,
-      when: 'Search returned zero results for the query.',
-      recovery: 'Broaden the query or try different keywords and search again.',
-    },
     {
       reason: 'invalid_language',
       code: JsonRpcErrorCode.ValidationError,
@@ -77,32 +82,22 @@ export const wikipediaSearch = tool('wikipedia_search', {
     const svc = getWikipediaService();
     const { results, totalResults } = await svc.search(input.query, limit, language, ctx);
 
+    ctx.enrich.echo(input.query);
+    ctx.enrich.total(totalResults);
+
     if (results.length === 0) {
-      throw ctx.fail(
-        'no_results',
-        `No Wikipedia articles found for query "${input.query}" in language "${language}".`,
-        {
-          query: input.query,
-          language,
-          recovery: { hint: `Try different keywords or a broader query than "${input.query}".` },
-        },
+      ctx.enrich.notice(
+        `No Wikipedia articles found for "${input.query}" in language "${language}". Try different keywords or a broader query.`,
       );
     }
 
     ctx.log.info('Search complete', { count: results.length, totalResults, language });
 
-    return {
-      results,
-      total_results: totalResults,
-      query_used: input.query,
-      language,
-    };
+    return { results, language };
   },
 
   format: (result) => {
-    const lines: string[] = [
-      `**${result.results.length} of ${result.total_results} results** for "${result.query_used}" (${result.language})\n`,
-    ];
+    const lines: string[] = [`**${result.results.length} results** (${result.language})\n`];
     for (const item of result.results) {
       lines.push(`### ${item.title}`);
       lines.push(`**Page ID:** ${item.pageid} | **Words:** ${item.wordcount}`);

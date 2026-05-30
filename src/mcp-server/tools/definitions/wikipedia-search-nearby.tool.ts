@@ -48,20 +48,25 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
           .describe('A single geotagged article result.'),
       )
       .describe('Geotagged articles sorted ascending by distance_meters.'),
-    total_results: z.number().describe('Number of results returned.'),
-    query_latitude: z.number().describe('Latitude used for the search.'),
-    query_longitude: z.number().describe('Longitude used for the search.'),
-    radius_meters_used: z.number().describe('Radius in meters used for the search.'),
     language: z.string().describe('Language edition queried.'),
   }),
 
+  // Agent-facing context — echoes the search parameters and total match count, plus
+  // an optional notice when nothing matched. Reaches both structuredContent and content[].
+  enrichment: {
+    queryLatitude: z.number().describe('Latitude used for the search.'),
+    queryLongitude: z.number().describe('Longitude used for the search.'),
+    radiusMetersUsed: z.number().describe('Radius in meters used for the search.'),
+    totalResults: z.number().describe('Number of results returned.'),
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Guidance when no geotagged articles were found — e.g. increase radius. Absent when results are returned.',
+      ),
+  },
+
   errors: [
-    {
-      reason: 'no_results',
-      code: JsonRpcErrorCode.NotFound,
-      when: 'No geotagged articles found within the search radius.',
-      recovery: 'Increase radius_meters or verify the coordinates are correct and retry.',
-    },
     {
       reason: 'invalid_coordinates',
       code: JsonRpcErrorCode.ValidationError,
@@ -126,37 +131,26 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
       ctx,
     );
 
+    ctx.enrich({
+      queryLatitude: input.latitude,
+      queryLongitude: input.longitude,
+      radiusMetersUsed: radiusMeters,
+      totalResults: results.length,
+    });
+
     if (results.length === 0) {
-      throw ctx.fail(
-        'no_results',
-        `No geotagged Wikipedia articles found within ${radiusMeters}m of (${input.latitude}, ${input.longitude}).`,
-        {
-          latitude: input.latitude,
-          longitude: input.longitude,
-          radiusMeters,
-          recovery: {
-            hint: `Increase radius_meters beyond ${radiusMeters} or verify the coordinates are correct.`,
-          },
-        },
+      ctx.enrich.notice(
+        `No geotagged Wikipedia articles found within ${radiusMeters}m of (${input.latitude}, ${input.longitude}). Try increasing radius_meters or verify the coordinates are correct.`,
       );
     }
 
     ctx.log.info('Geo search complete', { count: results.length, language });
 
-    return {
-      results,
-      total_results: results.length,
-      query_latitude: input.latitude,
-      query_longitude: input.longitude,
-      radius_meters_used: radiusMeters,
-      language,
-    };
+    return { results, language };
   },
 
   format: (result) => {
-    const lines: string[] = [
-      `**${result.total_results} articles** near (${result.query_latitude}, ${result.query_longitude}) within ${result.radius_meters_used}m (${result.language})\n`,
-    ];
+    const lines: string[] = [`**${result.results.length} articles** (${result.language})\n`];
     for (const item of result.results) {
       lines.push(`### ${item.title}`);
       lines.push(

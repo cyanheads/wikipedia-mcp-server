@@ -3,7 +3,7 @@
  * @module tests/mcp-server/tools/definitions/wikipedia-search-nearby.tool.test
  */
 
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { wikipediaSearchNearby } from '@/mcp-server/tools/definitions/wikipedia-search-nearby.tool.js';
 import * as svcModule from '@/services/wikipedia/wikipedia-service.js';
@@ -45,7 +45,29 @@ describe('wikipediaSearchNearby', () => {
     expect(result.results).toHaveLength(2);
     expect(result.results[0]?.title).toBe('Space Needle');
     expect(result.results[0]?.distance_meters).toBe(150);
-    expect(result.total_results).toBe(2);
+
+    // Enrichment carries query echo and total
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.queryLatitude).toBe(47.6205);
+    expect(enrichment.queryLongitude).toBe(-122.3493);
+    expect(enrichment.totalResults).toBe(2);
+    expect(enrichment.notice).toBeUndefined();
+  });
+
+  it('returns empty results with a notice when no articles found', async () => {
+    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+      searchNearby: vi.fn().mockResolvedValue({ results: [] }),
+    } as unknown as svcModule.WikipediaService);
+
+    const ctx = createMockContext({ errors: wikipediaSearchNearby.errors });
+    const input = wikipediaSearchNearby.input.parse({ latitude: 0, longitude: 0 });
+    const result = await wikipediaSearchNearby.handler(input, ctx);
+
+    expect(result.results).toHaveLength(0);
+
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.totalResults).toBe(0);
+    expect(enrichment.notice).toContain('radius_meters');
   });
 
   it('throws invalid_coordinates for out-of-range latitude', async () => {
@@ -61,18 +83,6 @@ describe('wikipediaSearchNearby', () => {
     const input = wikipediaSearchNearby.input.parse({ latitude: 0, longitude: 181 });
     await expect(wikipediaSearchNearby.handler(input, ctx)).rejects.toMatchObject({
       data: { reason: 'invalid_coordinates' },
-    });
-  });
-
-  it('throws no_results when no articles found', async () => {
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
-      searchNearby: vi.fn().mockResolvedValue({ results: [] }),
-    } as unknown as svcModule.WikipediaService);
-
-    const ctx = createMockContext({ errors: wikipediaSearchNearby.errors });
-    const input = wikipediaSearchNearby.input.parse({ latitude: 0, longitude: 0 });
-    await expect(wikipediaSearchNearby.handler(input, ctx)).rejects.toMatchObject({
-      data: { reason: 'no_results' },
     });
   });
 
@@ -94,6 +104,9 @@ describe('wikipediaSearchNearby', () => {
 
     // First 3 args are lat, lon, radius
     expect(nearbyFn.mock.calls[0]?.[2]).toBe(10_000);
+
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.radiusMetersUsed).toBe(10_000);
   });
 
   it('format renders title, pageid, distance, and coordinates', () => {
@@ -107,10 +120,6 @@ describe('wikipediaSearchNearby', () => {
           distance_meters: 150,
         },
       ],
-      total_results: 1,
-      query_latitude: 47.6205,
-      query_longitude: -122.3493,
-      radius_meters_used: 1000,
       language: 'en',
     };
     const blocks = wikipediaSearchNearby.format!(output);

@@ -3,7 +3,7 @@
  * @module tests/mcp-server/tools/definitions/wikipedia-search.tool.test
  */
 
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { wikipediaSearch } from '@/mcp-server/tools/definitions/wikipedia-search.tool.js';
 import * as svcModule from '@/services/wikipedia/wikipedia-service.js';
@@ -35,21 +35,29 @@ describe('wikipediaSearch', () => {
 
     expect(result.results).toHaveLength(2);
     expect(result.results[0]?.title).toBe('Python (programming language)');
-    expect(result.total_results).toBe(2);
-    expect(result.query_used).toBe('Python');
     expect(result.language).toBe('en');
+
+    // Enrichment carries query echo and total
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.effectiveQuery).toBe('Python');
+    expect(enrichment.totalCount).toBe(2);
+    expect(enrichment.notice).toBeUndefined();
   });
 
-  it('throws no_results when search returns empty', async () => {
+  it('returns empty results with a notice when search returns nothing', async () => {
     vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
       search: vi.fn().mockResolvedValue({ results: [], totalResults: 0 }),
     } as unknown as svcModule.WikipediaService);
 
     const ctx = createMockContext({ errors: wikipediaSearch.errors });
     const input = wikipediaSearch.input.parse({ query: 'xyzzy_no_match_ever_12345' });
-    await expect(wikipediaSearch.handler(input, ctx)).rejects.toMatchObject({
-      data: { reason: 'no_results' },
-    });
+    const result = await wikipediaSearch.handler(input, ctx);
+
+    expect(result.results).toHaveLength(0);
+
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.totalCount).toBe(0);
+    expect(enrichment.notice).toContain('xyzzy_no_match_ever_12345');
   });
 
   it('defaults limit to 10 and language to en', async () => {
@@ -87,8 +95,6 @@ describe('wikipediaSearch', () => {
   it('format renders title, pageid, wordcount, and snippet', () => {
     const output = {
       results: [{ title: 'Python', pageid: 23862, snippet: 'A language.', wordcount: 4000 }],
-      total_results: 1,
-      query_used: 'Python',
       language: 'en',
     };
     const blocks = wikipediaSearch.format!(output);
