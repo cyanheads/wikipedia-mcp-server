@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.7](changelog/0.1.x/0.1.7.md) — 2026-06-02
+
+mcp-ts-core ^0.9.16 → ^0.9.21: per-request log context fix, fetchWithTimeout secret-stripping, withRetry fail-fast on non-retryable errors; skill sync (api-mirror, orchestrations, 8 updated); release:github script; README client-config key renamed to package name
+
 ## [0.1.6](changelog/0.1.x/0.1.6.md) — 2026-05-30
 
 enrichment on wikipedia_search and wikipedia_search_nearby: query/filter echoes, result totals, and empty-result guidance in a typed enrichment block reaching both structuredContent and content[]; mcp-ts-core ^0.9.13 → ^0.9.16
