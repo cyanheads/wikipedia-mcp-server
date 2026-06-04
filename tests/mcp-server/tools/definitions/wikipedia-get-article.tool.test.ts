@@ -142,6 +142,28 @@ describe('wikipediaGetArticle', () => {
     });
   });
 
+  it('throws invalid_section with data.reason when section_index is out of range (issue #15)', async () => {
+    const { validationError } = await import('@cyanheads/mcp-ts-core/errors');
+    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+      getArticleSection: vi
+        .fn()
+        .mockRejectedValue(
+          validationError(
+            'Section index 999 does not exist in "Python (programming language)". Call wikipedia_get_sections to get valid index values.',
+          ),
+        ),
+    } as unknown as svcModule.WikipediaService);
+
+    const ctx = createMockContext({ errors: wikipediaGetArticle.errors });
+    const input = wikipediaGetArticle.input.parse({
+      title: 'Python (programming language)',
+      section_index: 999,
+    });
+    await expect(wikipediaGetArticle.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'invalid_section' },
+    });
+  });
+
   it('re-throws service not_found for section path as typed contract error', async () => {
     const { notFound } = await import('@cyanheads/mcp-ts-core/errors');
     vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({

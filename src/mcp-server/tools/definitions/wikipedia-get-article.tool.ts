@@ -112,6 +112,13 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
             recovery: { hint: 'Use wikipedia_search to find the correct article title.' },
           });
         }
+        if (err instanceof McpError && err.code === JsonRpcErrorCode.ValidationError) {
+          throw ctx.fail('invalid_section', err.message, {
+            title: input.title,
+            sectionIndex: input.section_index,
+            recovery: { hint: 'Call wikipedia_get_sections to obtain valid section_index values.' },
+          });
+        }
         throw err;
       }
       ctx.log.info('Section fetched', {
