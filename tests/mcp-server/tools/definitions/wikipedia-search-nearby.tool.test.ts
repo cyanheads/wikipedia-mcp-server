@@ -46,11 +46,12 @@ describe('wikipediaSearchNearby', () => {
     expect(result.results[0]?.title).toBe('Space Needle');
     expect(result.results[0]?.distance_meters).toBe(150);
 
-    // Enrichment carries query echo and total
+    // Enrichment carries query echo and truncation disclosure
     const enrichment = getEnrichment(ctx);
     expect(enrichment.queryLatitude).toBe(47.6205);
     expect(enrichment.queryLongitude).toBe(-122.3493);
-    expect(enrichment.totalResults).toBe(2);
+    expect(enrichment.shown).toBe(2);
+    expect(enrichment.truncated).toBe(false);
     expect(enrichment.notice).toBeUndefined();
   });
 
@@ -66,7 +67,7 @@ describe('wikipediaSearchNearby', () => {
     expect(result.results).toHaveLength(0);
 
     const enrichment = getEnrichment(ctx);
-    expect(enrichment.totalResults).toBe(0);
+    expect(enrichment.shown).toBe(0);
     expect(enrichment.notice).toContain('radius_meters');
   });
 

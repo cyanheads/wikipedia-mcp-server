@@ -51,13 +51,15 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
     language: z.string().describe('Language edition queried.'),
   }),
 
-  // Agent-facing context — echoes the search parameters and total match count, plus
+  // Agent-facing context — echoes the search parameters, truncation disclosure, plus
   // an optional notice when nothing matched. Reaches both structuredContent and content[].
   enrichment: {
     queryLatitude: z.number().describe('Latitude used for the search.'),
     queryLongitude: z.number().describe('Longitude used for the search.'),
     radiusMetersUsed: z.number().describe('Radius in meters used for the search.'),
-    totalResults: z.number().describe('Number of results returned.'),
+    truncated: z.boolean().describe('True when results were capped at the limit.'),
+    shown: z.number().describe('Number of results returned.'),
+    cap: z.number().describe('The limit that was applied.'),
     notice: z
       .string()
       .optional()
@@ -135,8 +137,12 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
       queryLatitude: input.latitude,
       queryLongitude: input.longitude,
       radiusMetersUsed: radiusMeters,
-      totalResults: results.length,
     });
+    if (results.length >= limit) {
+      ctx.enrich.truncated({ shown: results.length, cap: limit });
+    } else {
+      ctx.enrich({ shown: results.length, cap: limit, truncated: false });
+    }
 
     if (results.length === 0) {
       ctx.enrich.notice(
