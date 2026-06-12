@@ -1,6 +1,6 @@
 {
   "name": "@cyanheads/wikipedia-mcp-server",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Search Wikipedia articles, read summaries and full text, target sections, find nearby pages, and list language editions via MCP. STDIO or Streamable HTTP.",
   "author": {
     "name": "cyanheads",
@@ -13,7 +13,7 @@
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "wikipedia", "mediawiki"],
   "mcpServers": "./.codex-plugin/mcp.json",
   "interface": {
-    "displayName": "@cyanheads/wikipedia-mcp-server",
+    "displayName": "wikipedia-mcp-server",
     "shortDescription": "Search Wikipedia, read summaries and full text, target sections, find nearby pages, list languages.",
     "longDescription": "MCP server providing encyclopedic context via the MediaWiki REST API and Action API. Supports full-text search, article summaries with Wikidata QIDs, section-targeted reads, geographic proximity search, and language edition discovery across all Wikipedia language editions.",
     "developerName": "cyanheads",
