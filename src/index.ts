@@ -10,6 +10,8 @@ import { allToolDefinitions } from './mcp-server/tools/definitions/index.js';
 import { initWikipediaService } from './services/wikipedia/wikipedia-service.js';
 
 await createApp({
+  name: 'wikipedia-mcp-server',
+  title: 'wikipedia-mcp-server',
   tools: allToolDefinitions,
   resources: [],
   prompts: [],
