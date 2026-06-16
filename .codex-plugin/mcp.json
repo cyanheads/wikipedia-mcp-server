@@ -1,5 +1,5 @@
 {
-  "@cyanheads/wikipedia-mcp-server": {
+  "wikipedia-mcp-server": {
     "command": "npx",
     "args": ["-y", "@cyanheads/wikipedia-mcp-server"],
     "env": {

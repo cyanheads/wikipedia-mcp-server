@@ -1,5 +1,5 @@
 {
-  "name": "@cyanheads/wikipedia-mcp-server",
+  "name": "wikipedia-mcp-server",
   "version": "0.1.9",
   "description": "Search Wikipedia articles, read summaries and full text, target sections, find nearby pages, and list language editions via MCP. STDIO or Streamable HTTP.",
   "author": {
