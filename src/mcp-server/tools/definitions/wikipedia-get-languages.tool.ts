@@ -5,7 +5,11 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { getWikipediaService, isUnknownEdition } from '@/services/wikipedia/wikipedia-service.js';
+import {
+  getWikipediaService,
+  isBlankTitle,
+  isUnknownEdition,
+} from '@/services/wikipedia/wikipedia-service.js';
 
 export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
   title: 'Get Wikipedia Article Languages',
@@ -86,6 +90,20 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
         'invalid_language',
         `Language edition "${language}" does not exist on Wikipedia. Use a valid Wikipedia language code such as "fr", "de", or "ja".`,
         { language, ...ctx.recoveryFor('invalid_language') },
+      );
+    }
+
+    // Reject a blank/whitespace-only title before any fetch — the langlinks query otherwise returns
+    // an empty response shape that leaks as a generic serviceUnavailable with no typed reason.
+    if (isBlankTitle(input.title)) {
+      throw ctx.fail(
+        'not_found',
+        'Article title must not be blank. Provide a title, or use wikipedia_search to find one.',
+        {
+          recovery: {
+            hint: 'Provide a non-empty article title, or use wikipedia_search to discover one.',
+          },
+        },
       );
     }
 

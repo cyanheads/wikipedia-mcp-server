@@ -559,6 +559,9 @@ export class WikipediaService {
         prop: 'extracts',
         explaintext: 'true',
         exsectionformat: 'wiki',
+        // Resolve redirects server-side so aliases (e.g. "NYC" → "New York City") return the
+        // target's content and pageid, matching getSummary's REST behavior.
+        redirects: 'true',
       },
       ctx,
     );
@@ -606,6 +609,9 @@ export class WikipediaService {
         page: title,
         prop: 'wikitext',
         section: String(sectionIndex),
+        // Resolve redirects so a section read on an alias (e.g. "NYC") targets the resolved
+        // article; without it the alias stub has no sections and the API returns nosuchsection.
+        redirects: 'true',
       },
       ctx,
     );
@@ -653,12 +659,15 @@ export class WikipediaService {
     language: string,
     ctx: RequestContextLike,
   ): Promise<{
+    title: string;
     pageid: number | undefined;
     sections: Array<{ index: number; number: string; title: string; level: number }>;
   }> {
     const raw = await this.actionGet<ActionSectionsRaw>(
       language,
-      { action: 'parse', page: title, prop: 'sections' },
+      // prop=tocdata replaces the deprecated prop=sections (same data, renamed/renested fields).
+      // redirects resolves aliases (e.g. "NYC" → "New York City") like the other read paths.
+      { action: 'parse', page: title, prop: 'tocdata', redirects: 'true' },
       ctx,
     );
 
@@ -673,21 +682,22 @@ export class WikipediaService {
       throw serviceUnavailable(`Wikipedia API error: ${raw.error.info ?? errCode}`);
     }
 
-    const rawSections = raw.parse?.sections ?? [];
+    const resolvedTitle = raw.parse?.title ?? title;
+    const rawSections = raw.parse?.tocdata?.sections ?? [];
 
-    // Fallback: if sections is empty, parse == headers from full-article text.
+    // Fallback: if tocdata has no sections, derive headers from full-article text.
     if (rawSections.length === 0) {
       const fullArticle = await this.getArticleFull(title, language, ctx);
       const headerPattern = /^(={2,6})\s*(.+?)\s*\1\s*$/gm;
       let idx = 0;
       const fallbackSections = [...fullArticle.content.matchAll(headerPattern)].flatMap((m) => {
         const level = m[1]?.length;
-        const title = m[2];
-        if (!level || !title) return [];
+        const headingTitle = m[2];
+        if (!level || !headingTitle) return [];
         const i = ++idx;
-        return [{ index: i, number: String(i), title, level }];
+        return [{ index: i, number: String(i), title: headingTitle, level }];
       });
-      return { pageid: fullArticle.pageid, sections: fallbackSections };
+      return { title: fullArticle.title, pageid: fullArticle.pageid, sections: fallbackSections };
     }
 
     const sections = rawSections
@@ -696,10 +706,11 @@ export class WikipediaService {
         index: parseInt(s.index ?? '0', 10),
         number: s.number ?? '',
         title: s.line ?? '',
-        level: parseInt(s.level ?? '2', 10),
+        // hLevel is a number under tocdata (prop=sections' level was a string).
+        level: s.hLevel ?? 2,
       }));
 
-    return { pageid: raw.parse?.pageid, sections };
+    return { title: resolvedTitle, pageid: raw.parse?.pageid, sections };
   }
 
   /** List language editions available for an article. */
@@ -829,4 +840,16 @@ export function getWikipediaService(): WikipediaService {
 export function isUnknownEdition(language: string): boolean {
   if (_service?.baseUrl) return false;
   return !KNOWN_WIKIPEDIA_EDITIONS.has(language.toLowerCase());
+}
+
+/**
+ * Report whether `title` is blank or whitespace-only — the signal a tool handler uses to reject it
+ * with the typed `not_found` contract before any network call. A blank title otherwise leaks an
+ * inconsistent generic upstream error that varies by endpoint (an absent `query` object, an
+ * `invalidtitle` API error, or a 403 whose raw message carries the fetch URL); the pre-fetch guard
+ * normalizes all of them to one typed result, mirroring how `isUnknownEdition` pre-validates
+ * language codes in-handler.
+ */
+export function isBlankTitle(title: string): boolean {
+  return !title.trim();
 }

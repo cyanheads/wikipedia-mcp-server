@@ -5,12 +5,16 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { getWikipediaService, isUnknownEdition } from '@/services/wikipedia/wikipedia-service.js';
+import {
+  getWikipediaService,
+  isBlankTitle,
+  isUnknownEdition,
+} from '@/services/wikipedia/wikipedia-service.js';
 
 export const wikipediaGetSections = tool('wikipedia_get_sections', {
   title: 'Get Wikipedia Article Sections',
   description:
-    'Fetch the table of contents for a Wikipedia article. Returns section titles, heading levels, section numbering (e.g. "2.1"), and section_index values. Pass a section_index to wikipedia_get_article to retrieve just that section. Useful for enumerating article structure before doing a targeted section read.',
+    'Fetch the table of contents for a Wikipedia article. Returns section titles, heading levels, section numbering (e.g. "2.1"), and section_index values. Pass a section_index to wikipedia_get_article to retrieve just that section. Useful for enumerating article structure before doing a targeted section read. Redirect pages are followed automatically.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     title: z.string().describe('Article title (e.g. "Python (programming language)").'),
@@ -82,6 +86,20 @@ export const wikipediaGetSections = tool('wikipedia_get_sections', {
       );
     }
 
+    // Reject a blank/whitespace-only title before any fetch — the parse API otherwise returns a
+    // generic "Bad title" error that bypasses this tool's typed contract.
+    if (isBlankTitle(input.title)) {
+      throw ctx.fail(
+        'not_found',
+        'Article title must not be blank. Provide a title, or use wikipedia_search to find one.',
+        {
+          recovery: {
+            hint: 'Provide a non-empty article title, or use wikipedia_search to discover one.',
+          },
+        },
+      );
+    }
+
     ctx.log.info('Fetching sections', { title: input.title, language });
 
     const svc = getWikipediaService();
@@ -115,7 +133,8 @@ export const wikipediaGetSections = tool('wikipedia_get_sections', {
     ctx.log.info('Sections fetched', { title: input.title, count: result.sections.length });
 
     return {
-      title: input.title,
+      // Resolved title from the service (redirects are followed), not the raw input alias.
+      title: result.title,
       pageid: result.pageid,
       sections: result.sections,
       total_sections: result.sections.length,

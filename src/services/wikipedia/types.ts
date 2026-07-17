@@ -49,21 +49,30 @@ export type ActionExtractsRaw = {
   };
 };
 
-/** Action API parse/sections response. */
+/**
+ * Action API parse response for the table of contents (`prop=tocdata`).
+ *
+ * Replaces the deprecated `prop=sections`, whose entries lived at `parse.sections[]`. `tocdata`
+ * nests them under `parse.tocdata.sections[]` and renames several fields: `toclevel`→`tocLevel`,
+ * `level`→`hLevel` (now a number, previously a string), `byteoffset`→`codepointOffset`,
+ * `fromtitle`→`fromTitle`. `line`, `number`, `index`, and `anchor` are unchanged.
+ */
 export type ActionSectionsRaw = {
   parse?: {
     title?: string;
     pageid?: number;
-    sections?: Array<{
-      toclevel?: number;
-      level?: string;
-      line?: string;
-      number?: string;
-      index?: string;
-      fromtitle?: string;
-      byteoffset?: number | null;
-      anchor?: string;
-    }>;
+    tocdata?: {
+      sections?: Array<{
+        tocLevel?: number;
+        hLevel?: number;
+        line?: string;
+        number?: string;
+        index?: string;
+        fromTitle?: string;
+        codepointOffset?: number | null;
+        anchor?: string;
+      }>;
+    };
   };
   error?: { code?: string; info?: string };
 };

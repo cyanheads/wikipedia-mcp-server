@@ -5,12 +5,16 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { getWikipediaService, isUnknownEdition } from '@/services/wikipedia/wikipedia-service.js';
+import {
+  getWikipediaService,
+  isBlankTitle,
+  isUnknownEdition,
+} from '@/services/wikipedia/wikipedia-service.js';
 
 export const wikipediaGetArticle = tool('wikipedia_get_article', {
   title: 'Get Wikipedia Article',
   description:
-    'Fetch article content as clean plain text. Without section_index: returns the full article with == Section == markers preserved for structure. With section_index (from wikipedia_get_sections): returns just that section as plain text. Section-targeted reads are faster and smaller when only part of the article is needed.',
+    'Fetch article content as clean plain text. Without section_index: returns the full article with == Section == markers preserved for structure. With section_index (from wikipedia_get_sections): returns just that section as plain text. Section-targeted reads are faster and smaller when only part of the article is needed. Redirect pages are followed automatically.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     title: z.string().describe('Article title (e.g. "Python (programming language)").'),
@@ -82,6 +86,20 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
         'invalid_language',
         `Language edition "${language}" does not exist on Wikipedia. Use a valid Wikipedia language code such as "fr", "de", or "ja".`,
         { language, ...ctx.recoveryFor('invalid_language') },
+      );
+    }
+
+    // Reject a blank/whitespace-only title before any fetch — once, ahead of the section/full
+    // branch, so both paths get a consistent typed error instead of a leaked upstream one.
+    if (isBlankTitle(input.title)) {
+      throw ctx.fail(
+        'not_found',
+        'Article title must not be blank. Provide a title, or use wikipedia_search to find one.',
+        {
+          recovery: {
+            hint: 'Provide a non-empty article title, or use wikipedia_search to discover one.',
+          },
+        },
       );
     }
 

@@ -207,6 +207,39 @@ describe('wikipediaGetArticle', () => {
     await expect(wikipediaGetArticle.handler(input, ctx)).rejects.toThrow('Upstream timeout');
   });
 
+  it('throws not_found with data.reason for a blank title (issue #20)', async () => {
+    const ctx = createMockContext({ errors: wikipediaGetArticle.errors });
+    const input = wikipediaGetArticle.input.parse({ title: '' });
+    await expect(wikipediaGetArticle.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'not_found' },
+    });
+  });
+
+  it('throws not_found for a whitespace-only title with a section_index (issue #20)', async () => {
+    const ctx = createMockContext({ errors: wikipediaGetArticle.errors });
+    const input = wikipediaGetArticle.input.parse({ title: '   ', section_index: 1 });
+    await expect(wikipediaGetArticle.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'not_found' },
+    });
+  });
+
+  it('surfaces the redirect-resolved title in output (issue #19)', async () => {
+    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+      getArticleFull: vi.fn().mockResolvedValue({
+        title: 'New York City',
+        pageid: 645042,
+        content: '== Etymology ==\n\nNew York City content.',
+      }),
+    } as unknown as svcModule.WikipediaService);
+
+    const ctx = createMockContext();
+    // Caller passes the alias "NYC"; output should carry the resolved article title.
+    const input = wikipediaGetArticle.input.parse({ title: 'NYC' });
+    const result = await wikipediaGetArticle.handler(input, ctx);
+    expect(result.title).toBe('New York City');
+    expect(result.content).toContain('Etymology');
+  });
+
   it('passes language to service for full article', async () => {
     const getArticleFullFn = vi.fn().mockResolvedValue({
       title: 'Python (langage)',

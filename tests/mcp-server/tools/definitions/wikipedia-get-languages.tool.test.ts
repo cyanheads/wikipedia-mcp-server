@@ -158,6 +158,22 @@ describe('wikipediaGetLanguages', () => {
     });
   });
 
+  it('throws not_found with data.reason for a blank title (issue #20)', async () => {
+    const ctx = createMockContext({ errors: wikipediaGetLanguages.errors });
+    const input = wikipediaGetLanguages.input.parse({ title: '' });
+    await expect(wikipediaGetLanguages.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'not_found' },
+    });
+  });
+
+  it('throws not_found with data.reason for a whitespace-only title (issue #20)', async () => {
+    const ctx = createMockContext({ errors: wikipediaGetLanguages.errors });
+    const input = wikipediaGetLanguages.input.parse({ title: '   ' });
+    await expect(wikipediaGetLanguages.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'not_found' },
+    });
+  });
+
   it('passes source language to service', async () => {
     const getLanguagesFn = vi.fn().mockResolvedValue({
       languages: [

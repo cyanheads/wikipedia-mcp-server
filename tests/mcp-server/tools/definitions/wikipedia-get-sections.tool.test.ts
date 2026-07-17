@@ -9,6 +9,7 @@ import { wikipediaGetSections } from '@/mcp-server/tools/definitions/wikipedia-g
 import * as svcModule from '@/services/wikipedia/wikipedia-service.js';
 
 const mockSections = {
+  title: 'Python (programming language)',
   pageid: 23862,
   sections: [
     { index: 1, number: '1', title: 'History', level: 2 },
@@ -39,7 +40,7 @@ describe('wikipediaGetSections', () => {
 
   it('throws no_sections when article has no sections', async () => {
     vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
-      getSections: vi.fn().mockResolvedValue({ pageid: 1, sections: [] }),
+      getSections: vi.fn().mockResolvedValue({ title: 'Stub Article', pageid: 1, sections: [] }),
     } as unknown as svcModule.WikipediaService);
 
     const ctx = createMockContext({ errors: wikipediaGetSections.errors });
@@ -102,8 +103,42 @@ describe('wikipediaGetSections', () => {
     });
   });
 
+  it('throws not_found with data.reason for a blank title (issue #20)', async () => {
+    const ctx = createMockContext({ errors: wikipediaGetSections.errors });
+    const input = wikipediaGetSections.input.parse({ title: '' });
+    await expect(wikipediaGetSections.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'not_found' },
+    });
+  });
+
+  it('throws not_found with data.reason for a whitespace-only title (issue #20)', async () => {
+    const ctx = createMockContext({ errors: wikipediaGetSections.errors });
+    const input = wikipediaGetSections.input.parse({ title: '   ' });
+    await expect(wikipediaGetSections.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'not_found' },
+    });
+  });
+
+  it('surfaces the redirect-resolved title in output (issue #19)', async () => {
+    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+      getSections: vi.fn().mockResolvedValue({
+        title: 'New York City',
+        pageid: 645042,
+        sections: [{ index: 1, number: '1', title: 'Etymology', level: 2 }],
+      }),
+    } as unknown as svcModule.WikipediaService);
+
+    const ctx = createMockContext();
+    // Caller passes the alias "NYC"; output should carry the resolved article title.
+    const input = wikipediaGetSections.input.parse({ title: 'NYC' });
+    const result = await wikipediaGetSections.handler(input, ctx);
+    expect(result.title).toBe('New York City');
+    expect(result.total_sections).toBe(1);
+  });
+
   it('passes non-default language to service', async () => {
     const getSectionsFn = vi.fn().mockResolvedValue({
+      title: 'Python (langage)',
       pageid: 9999,
       sections: [{ index: 1, number: '1', title: 'Histoire', level: 2 }],
     });

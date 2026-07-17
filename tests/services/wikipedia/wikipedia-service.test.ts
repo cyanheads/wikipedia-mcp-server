@@ -12,6 +12,7 @@ import {
   buildBaseUrl,
   getWikipediaService,
   initWikipediaService,
+  isBlankTitle,
   isUnknownEdition,
   WikipediaService,
 } from '@/services/wikipedia/wikipedia-service.js';
@@ -111,6 +112,95 @@ describe('isUnknownEdition — edition-check scoping (issues #16, #18)', () => {
     // A custom host may serve any editions, so nothing is treated as unknown.
     expect(isUnknownEdition('zz')).toBe(false);
     expect(isUnknownEdition('fr')).toBe(false);
+  });
+});
+
+describe('isBlankTitle — blank/whitespace title guard (issue #20)', () => {
+  it('flags empty and whitespace-only titles', () => {
+    expect(isBlankTitle('')).toBe(true);
+    expect(isBlankTitle('   ')).toBe(true);
+    expect(isBlankTitle('\t\n ')).toBe(true);
+  });
+
+  it('accepts a non-blank title (surrounding whitespace is not blank)', () => {
+    expect(isBlankTitle('Python')).toBe(false);
+    expect(isBlankTitle('  Python  ')).toBe(false);
+  });
+});
+
+describe('WikipediaService — redirect resolution (issue #19)', () => {
+  beforeEach(() => {
+    initWikipediaService(mockConfig, mockStorage, TEST_USER_AGENT);
+  });
+
+  it('getArticleFull requests redirect resolution and surfaces the resolved title/pageid', async () => {
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+
+    const spy = vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+      query: {
+        redirects: [{ from: 'NYC', to: 'New York City' }],
+        pages: {
+          '645042': {
+            pageid: 645042,
+            title: 'New York City',
+            extract: 'New York City is the most populous city in the United States.',
+          },
+        },
+      },
+    });
+
+    const result = await svc.getArticleFull('NYC', 'en', ctx);
+    // The alias resolves to the target article rather than an empty redirect stub.
+    expect(spy).toHaveBeenCalledWith('en', expect.objectContaining({ redirects: 'true' }), ctx);
+    expect(result.title).toBe('New York City');
+    expect(result.pageid).toBe(645042);
+    expect(result.content).toContain('New York City');
+  });
+
+  it('getArticleSection requests redirect resolution and surfaces the resolved title', async () => {
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+
+    const spy = vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+      parse: {
+        title: 'New York City',
+        pageid: 645042,
+        wikitext: '== Etymology ==\n\nIn 1664, New York was named after the Duke of York.',
+      },
+    });
+
+    const result = await svc.getArticleSection('NYC', 1, 'en', ctx);
+    expect(spy).toHaveBeenCalledWith('en', expect.objectContaining({ redirects: 'true' }), ctx);
+    expect(result.title).toBe('New York City');
+    expect(result.content).toContain('New York');
+  });
+
+  it('getSections requests redirect resolution via prop=tocdata and surfaces the resolved title', async () => {
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+
+    const spy = vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+      parse: {
+        title: 'New York City',
+        pageid: 645042,
+        tocdata: {
+          sections: [{ tocLevel: 1, hLevel: 2, line: 'Etymology', number: '1', index: '1' }],
+        },
+      },
+    });
+
+    const result = await svc.getSections('NYC', 'en', ctx);
+    // Migrated off deprecated prop=sections and resolving the alias in one call.
+    expect(spy).toHaveBeenCalledWith(
+      'en',
+      expect.objectContaining({ prop: 'tocdata', redirects: 'true' }),
+      ctx,
+    );
+    expect(result.title).toBe('New York City');
+    expect(result.pageid).toBe(645042);
+    expect(result.sections).toHaveLength(1);
+    expect(result.sections[0]).toEqual({ index: 1, number: '1', title: 'Etymology', level: 2 });
   });
 });
 
@@ -563,22 +653,27 @@ describe('WikipediaService.getSections — error codes and fallback', () => {
     });
   });
 
-  it('maps section fields from parse.sections correctly', async () => {
+  it('maps section fields from parse.tocdata.sections correctly (issue #25)', async () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
+    // prop=tocdata shape: sections nest under parse.tocdata and hLevel is a number (prop=sections
+    // put them at parse.sections with a string `level`). Output must be identical either way.
     vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
       parse: {
         title: 'Python (programming language)',
         pageid: 23862,
-        sections: [
-          { toclevel: 1, level: '2', line: 'History', number: '1', index: '1' },
-          { toclevel: 2, level: '3', line: 'Origins', number: '1.1', index: '2' },
-        ],
+        tocdata: {
+          sections: [
+            { tocLevel: 1, hLevel: 2, line: 'History', number: '1', index: '1' },
+            { tocLevel: 2, hLevel: 3, line: 'Origins', number: '1.1', index: '2' },
+          ],
+        },
       },
     });
 
     const result = await svc.getSections('Python (programming language)', 'en', ctx);
+    expect(result.title).toBe('Python (programming language)');
     expect(result.pageid).toBe(23862);
     expect(result.sections).toHaveLength(2);
     expect(result.sections[0]).toEqual({ index: 1, number: '1', title: 'History', level: 2 });

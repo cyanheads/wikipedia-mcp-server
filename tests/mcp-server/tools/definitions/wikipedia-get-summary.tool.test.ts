@@ -151,6 +151,22 @@ describe('wikipediaGetSummary', () => {
     });
   });
 
+  it('throws not_found with data.reason for a blank title (issue #20)', async () => {
+    const ctx = createMockContext({ errors: wikipediaGetSummary.errors });
+    const input = wikipediaGetSummary.input.parse({ title: '' });
+    await expect(wikipediaGetSummary.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'not_found' },
+    });
+  });
+
+  it('throws not_found with data.reason for a whitespace-only title (issue #20)', async () => {
+    const ctx = createMockContext({ errors: wikipediaGetSummary.errors });
+    const input = wikipediaGetSummary.input.parse({ title: '   ' });
+    await expect(wikipediaGetSummary.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'not_found' },
+    });
+  });
+
   it('passes non-default language to service', async () => {
     const getSummaryFn = vi.fn().mockResolvedValue({ ...mockSummary, title: 'Python (langage)' });
     vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({

@@ -5,7 +5,11 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { getWikipediaService, isUnknownEdition } from '@/services/wikipedia/wikipedia-service.js';
+import {
+  getWikipediaService,
+  isBlankTitle,
+  isUnknownEdition,
+} from '@/services/wikipedia/wikipedia-service.js';
 
 export const wikipediaGetSummary = tool('wikipedia_get_summary', {
   title: 'Get Wikipedia Summary',
@@ -77,6 +81,20 @@ export const wikipediaGetSummary = tool('wikipedia_get_summary', {
         'invalid_language',
         `Language edition "${language}" does not exist on Wikipedia. Use a valid Wikipedia language code such as "fr", "de", or "ja".`,
         { language, ...ctx.recoveryFor('invalid_language') },
+      );
+    }
+
+    // Reject a blank/whitespace-only title before any fetch — otherwise the REST endpoint returns a
+    // 403 whose raw error carries the fetch URL, bypassing this tool's typed contract.
+    if (isBlankTitle(input.title)) {
+      throw ctx.fail(
+        'not_found',
+        'Article title must not be blank. Provide a title, or use wikipedia_search to find one.',
+        {
+          recovery: {
+            hint: 'Provide a non-empty article title, or use wikipedia_search to discover one.',
+          },
+        },
       );
     }
 
