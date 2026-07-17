@@ -5,16 +5,19 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import { outlineOnOverflow } from '@cyanheads/mcp-ts-core/utils';
+import { getServerConfig } from '@/config/server-config.js';
 import {
   getWikipediaService,
   isBlankTitle,
   isUnknownEdition,
+  splitArticleIntoSections,
 } from '@/services/wikipedia/wikipedia-service.js';
 
 export const wikipediaGetArticle = tool('wikipedia_get_article', {
   title: 'Get Wikipedia Article',
   description:
-    'Fetch article content as clean plain text. Without section_index: returns the full article with == Section == markers preserved for structure. With section_index (from wikipedia_get_sections): returns just that section as plain text. Section-targeted reads are faster and smaller when only part of the article is needed. Redirect pages are followed automatically.',
+    'Fetch article content as clean plain text. Without section_index: returns the full article with == Section == markers preserved for structure — or, when the article exceeds the size budget, a compact section outline (truncated: true) that points to wikipedia_get_sections plus a section_index read instead of the full text. With section_index (from wikipedia_get_sections): returns just that section as plain text. Section-targeted reads are faster and smaller when only part of the article is needed. Redirect pages are followed automatically.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     title: z.string().describe('Article title (e.g. "Python (programming language)").'),
@@ -37,12 +40,31 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
       .describe('Wikipedia page ID. Absent on API parse responses that omit it.'),
     content: z
       .string()
-      .describe('Plain-text article content. Full articles include == Section == markers.'),
+      .describe(
+        'Plain-text article content. Full articles include == Section == markers. When truncated is true, this instead carries a section outline (heading names and byte sizes) plus a pointer to the targeted-read path.',
+      ),
     section_title: z
       .string()
       .optional()
       .describe('Section title when section_index was provided. Absent for full-article reads.'),
     content_type: z.string().describe('Content type: "full_article" or "section".'),
+    truncated: z
+      .boolean()
+      .describe(
+        'True when a full-article read exceeded the size budget and content is a section outline instead of the full text. Always false for section reads and for full articles within budget.',
+      ),
+    original_length: z
+      .number()
+      .optional()
+      .describe(
+        'Character length of the full article text before outlining. Present only when truncated is true.',
+      ),
+    sections_suggested: z
+      .boolean()
+      .optional()
+      .describe(
+        'True when content is an outline — call wikipedia_get_sections, then wikipedia_get_article with a section_index to read a specific section. Present only when truncated is true.',
+      ),
     language: z.string().describe('Language edition queried.'),
   }),
 
@@ -160,6 +182,7 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
         content: result.content,
         section_title: result.sectionTitle,
         content_type: 'section',
+        truncated: false,
         language,
       };
     }
@@ -179,15 +202,60 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
       }
       throw err;
     }
+
+    // Overflow handling: pre-shape the article into one key per section (so the primitive
+    // measures real sections, not one giant `content` blob), then let outlineOnOverflow decide
+    // full vs. outline against this server's domain-tuned byte budget. Section-targeted reads
+    // above never reach here, so they are unaffected.
+    const originalLength = result.content.length;
+    const sectionDoc: Record<string, string> = {};
+    const seen = new Map<string, number>();
+    for (const { heading, body } of splitArticleIntoSections(result.content)) {
+      const n = seen.get(heading) ?? 0;
+      seen.set(heading, n + 1);
+      // Disambiguate rare duplicate headings so no section is silently collapsed away.
+      sectionDoc[n > 0 ? `${heading} (${n + 1})` : heading] = body;
+    }
+
+    const reCallNotice =
+      'This article is large. Call wikipedia_get_sections to list its section indices, then wikipedia_get_article with a section_index to read a specific section.';
+    const overflow = outlineOnOverflow(sectionDoc, {
+      budget: getServerConfig().articleOverflowBytes,
+      notice: () => reCallNotice,
+    });
+
     ctx.log.info('Article fetched', {
       title: result.title,
-      contentLength: result.content.length,
+      contentLength: originalLength,
+      truncated: overflow.kind === 'outline',
     });
+
+    if (overflow.kind === 'outline') {
+      const content = [
+        `Full article outlined — ${originalLength} characters across ${overflow.sections.length} sections (largest first):`,
+        '',
+        ...overflow.sections.map((s) => `- ${s.name} — ${s.bytes} bytes`),
+        '',
+        overflow.notice,
+      ].join('\n');
+      return {
+        title: result.title,
+        pageid: result.pageid,
+        content,
+        content_type: 'full_article',
+        truncated: true,
+        original_length: originalLength,
+        sections_suggested: true,
+        language,
+      };
+    }
+
     return {
       title: result.title,
       pageid: result.pageid,
       content: result.content,
       content_type: 'full_article',
+      truncated: false,
       language,
     };
   },
@@ -200,6 +268,19 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
         (result.pageid != null ? ` | **Page ID:** ${result.pageid}` : ''),
     );
     if (result.section_title) lines.push(`**Section:** ${result.section_title}`);
+    // Overflow disclosure — render each field on its own presence, never as mutually-exclusive
+    // branches, so format-parity's all-fields-populated sample renders every field.
+    if (result.truncated) {
+      lines.push('**Truncated:** full article outlined (exceeds the size budget).');
+    }
+    if (result.original_length != null) {
+      lines.push(`**Original length:** ${result.original_length} characters.`);
+    }
+    if (result.sections_suggested) {
+      lines.push(
+        '**Sections suggested** — call wikipedia_get_sections, then wikipedia_get_article with a section_index.',
+      );
+    }
     lines.push('');
     lines.push(result.content);
     return [{ type: 'text', text: lines.join('\n') }];

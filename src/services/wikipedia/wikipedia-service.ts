@@ -30,6 +30,14 @@ import type {
 // ---------------------------------------------------------------------------
 
 /**
+ * Matches a section-heading line in wikitext or a plain-text extract (`== Title ==`,
+ * `=== Title ===`, up to level 6). Group 1 is the leading `=` run, group 2 the trimmed title.
+ * Global + multiline; only ever consumed via `String.prototype.matchAll`, which clones the regex
+ * internally, so sharing this single instance across call sites is safe (no `lastIndex` bleed).
+ */
+const HEADING_LINE = /^(={2,6})\s*(.+?)\s*\1\s*$/gm;
+
+/**
  * Strip MediaWiki markup from raw wikitext and return clean plain text.
  * Uses wtf_wikipedia for the heavy lifting, then applies heading-preservation
  * and blank-line normalization as a post-pass.
@@ -41,8 +49,7 @@ function stripWikitext(wikitext: string): string {
 
   // Preserve section headings — wtf strips them, but we want structure.
   // Re-inject from the raw wikitext using a simple regex pass.
-  const headingPattern = /^(={2,6})\s*(.+?)\s*\1\s*$/gm;
-  const headings = [...wikitext.matchAll(headingPattern)].flatMap((m) => {
+  const headings = [...wikitext.matchAll(HEADING_LINE)].flatMap((m) => {
     const level = m[1]?.length;
     const title = m[2];
     return level && title ? [{ level, title }] : [];
@@ -63,6 +70,34 @@ function stripWikitext(wikitext: string): string {
   text = text.replace(/\n{3,}/g, '\n\n');
 
   return text.trim();
+}
+
+/**
+ * Split a plain-text article extract into per-section parts on its preserved `== Heading ==`
+ * markers (via the shared {@link HEADING_LINE}). Text before the first heading becomes the
+ * `Introduction` lead; each subsequent heading opens a part whose body runs to the next heading.
+ * Empty parts are dropped. Pure and exported — the overflow-outline pre-shaping in
+ * `wikipedia_get_article` relies on it, and it is unit-tested directly.
+ */
+export function splitArticleIntoSections(
+  content: string,
+): Array<{ heading: string; body: string }> {
+  const matches = [...content.matchAll(HEADING_LINE)];
+  const parts: Array<{ heading: string; body: string }> = [];
+
+  const firstStart = matches[0]?.index ?? content.length;
+  const lead = content.slice(0, firstStart).trim();
+  if (lead) parts.push({ heading: 'Introduction', body: lead });
+
+  for (const [i, m] of matches.entries()) {
+    const heading = m[2] ?? `Section ${i + 1}`;
+    const bodyStart = (m.index ?? 0) + (m[0] ?? '').length;
+    const bodyEnd = matches[i + 1]?.index ?? content.length;
+    const body = content.slice(bodyStart, bodyEnd).trim();
+    parts.push({ heading, body });
+  }
+
+  return parts;
 }
 
 // ---------------------------------------------------------------------------
@@ -509,15 +544,24 @@ export class WikipediaService {
     };
   }
 
-  /** Full-text search across Wikipedia articles. */
+  /**
+   * Full-text search across Wikipedia articles.
+   *
+   * `offset` trails `ctx` with a default so existing four-argument callers keep working — the
+   * pagination change stays additive at the call level. It maps to the Action API `sroffset`
+   * (this server's own `Math.min(limit, 50)` page-size cap is orthogonal to it). `nextOffset`
+   * echoes the API's own `continue.sroffset`, present only while more results remain.
+   */
   async search(
     query: string,
     limit: number,
     language: string,
     ctx: RequestContextLike,
+    offset = 0,
   ): Promise<{
     results: Array<{ title: string; pageid: number; snippet: string; wordcount: number }>;
     totalResults: number;
+    nextOffset: number | undefined;
   }> {
     const raw = await this.actionGet<ActionSearchRaw>(
       language,
@@ -526,6 +570,7 @@ export class WikipediaService {
         list: 'search',
         srsearch: query,
         srlimit: String(Math.min(limit, 50)),
+        sroffset: String(offset),
         srprop: 'snippet|wordcount',
       },
       ctx,
@@ -542,6 +587,7 @@ export class WikipediaService {
     return {
       results,
       totalResults: raw.query?.searchinfo?.totalhits ?? results.length,
+      nextOffset: raw.continue?.sroffset,
     };
   }
 
@@ -688,9 +734,8 @@ export class WikipediaService {
     // Fallback: if tocdata has no sections, derive headers from full-article text.
     if (rawSections.length === 0) {
       const fullArticle = await this.getArticleFull(title, language, ctx);
-      const headerPattern = /^(={2,6})\s*(.+?)\s*\1\s*$/gm;
       let idx = 0;
-      const fallbackSections = [...fullArticle.content.matchAll(headerPattern)].flatMap((m) => {
+      const fallbackSections = [...fullArticle.content.matchAll(HEADING_LINE)].flatMap((m) => {
         const level = m[1]?.length;
         const headingTitle = m[2];
         if (!level || !headingTitle) return [];

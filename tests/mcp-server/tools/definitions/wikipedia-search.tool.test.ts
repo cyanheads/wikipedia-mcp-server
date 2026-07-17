@@ -73,7 +73,7 @@ describe('wikipediaSearch', () => {
     const input = wikipediaSearch.input.parse({ query: 'Test' });
     await wikipediaSearch.handler(input, ctx);
 
-    expect(searchFn).toHaveBeenCalledWith('Test', 10, 'en', ctx);
+    expect(searchFn).toHaveBeenCalledWith('Test', 10, 'en', ctx, 0);
   });
 
   it('caps limit at 50', async () => {
@@ -89,7 +89,7 @@ describe('wikipediaSearch', () => {
     const input = wikipediaSearch.input.parse({ query: 'Test', limit: 999 });
     await wikipediaSearch.handler(input, ctx);
 
-    expect(searchFn).toHaveBeenCalledWith('Test', 50, 'en', ctx);
+    expect(searchFn).toHaveBeenCalledWith('Test', 50, 'en', ctx, 0);
   });
 
   it('format renders title, pageid, wordcount, and snippet', () => {
@@ -148,7 +148,7 @@ describe('wikipediaSearch', () => {
     const input = wikipediaSearch.input.parse({ query: 'Python', language: 'fr' });
     const result = await wikipediaSearch.handler(input, ctx);
 
-    expect(searchFn).toHaveBeenCalledWith('Python', 10, 'fr', ctx);
+    expect(searchFn).toHaveBeenCalledWith('Python', 10, 'fr', ctx, 0);
     expect(result.language).toBe('fr');
   });
 
@@ -186,7 +186,7 @@ describe('wikipediaSearch', () => {
     const input = wikipediaSearch.input.parse({ query: '東京タワー' });
     const result = await wikipediaSearch.handler(input, ctx);
     expect(result.results).toHaveLength(0);
-    expect(searchFn).toHaveBeenCalledWith('東京タワー', 10, 'en', ctx);
+    expect(searchFn).toHaveBeenCalledWith('東京タワー', 10, 'en', ctx, 0);
   });
 
   it('format output does not contain env var names or secret patterns', () => {
@@ -215,5 +215,123 @@ describe('wikipediaSearch', () => {
     const ctx = createMockContext({ errors: wikipediaSearch.errors });
     const input = wikipediaSearch.input.parse({ query: 'Python' });
     await expect(wikipediaSearch.handler(input, ctx)).rejects.toThrow('Network error');
+  });
+
+  it('forwards offset to the service and echoes pagination enrichment (issue #22)', async () => {
+    const searchFn = vi.fn().mockResolvedValue({
+      results: [{ title: 'Result 6', pageid: 6, snippet: 'S', wordcount: 10 }],
+      totalResults: 42,
+      nextOffset: 10,
+    });
+    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+      search: searchFn,
+    } as unknown as svcModule.WikipediaService);
+
+    const ctx = createMockContext();
+    const input = wikipediaSearch.input.parse({ query: 'Python', limit: 5, offset: 5 });
+    await wikipediaSearch.handler(input, ctx);
+
+    expect(searchFn).toHaveBeenCalledWith('Python', 5, 'en', ctx, 5);
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.offset).toBe(5);
+    expect(enrichment.shown).toBe(1);
+    expect(enrichment.nextOffset).toBe(10);
+  });
+
+  it('pages through disjoint result sets via offset (issue #22)', async () => {
+    const page1 = [
+      { title: 'A', pageid: 1, snippet: 'S', wordcount: 10 },
+      { title: 'B', pageid: 2, snippet: 'S', wordcount: 10 },
+    ];
+    const page2 = [
+      { title: 'C', pageid: 3, snippet: 'S', wordcount: 10 },
+      { title: 'D', pageid: 4, snippet: 'S', wordcount: 10 },
+    ];
+    const searchFn = vi
+      .fn()
+      .mockImplementation((_q: string, _l: number, _lang: string, _ctx: unknown, offset: number) =>
+        offset === 0
+          ? Promise.resolve({ results: page1, totalResults: 4, nextOffset: 2 })
+          : Promise.resolve({ results: page2, totalResults: 4, nextOffset: undefined }),
+      );
+    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+      search: searchFn,
+    } as unknown as svcModule.WikipediaService);
+
+    const ctx1 = createMockContext();
+    const r1 = await wikipediaSearch.handler(
+      wikipediaSearch.input.parse({ query: 'Q', limit: 2, offset: 0 }),
+      ctx1,
+    );
+    expect(getEnrichment(ctx1).nextOffset).toBe(2);
+
+    const ctx2 = createMockContext();
+    const r2 = await wikipediaSearch.handler(
+      wikipediaSearch.input.parse({ query: 'Q', limit: 2, offset: 2 }),
+      ctx2,
+    );
+    expect(getEnrichment(ctx2).nextOffset).toBeUndefined();
+
+    const ids2 = r2.results.map((x) => x.pageid);
+    expect(r1.results.some((x) => ids2.includes(x.pageid))).toBe(false); // disjoint pages
+  });
+
+  it('omits nextOffset at the end of the result set (issue #22)', async () => {
+    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+      search: vi.fn().mockResolvedValue({
+        results: [{ title: 'Last', pageid: 9, snippet: 'S', wordcount: 10 }],
+        totalResults: 6,
+        nextOffset: undefined,
+      }),
+    } as unknown as svcModule.WikipediaService);
+
+    const ctx = createMockContext();
+    const input = wikipediaSearch.input.parse({ query: 'Python', offset: 5 });
+    await wikipediaSearch.handler(input, ctx);
+
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.offset).toBe(5);
+    expect(enrichment.nextOffset).toBeUndefined();
+  });
+
+  it('returns an empty array with an end-of-results notice when offset is past the end (issue #22)', async () => {
+    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+      search: vi.fn().mockResolvedValue({ results: [], totalResults: 12, nextOffset: undefined }),
+    } as unknown as svcModule.WikipediaService);
+
+    const ctx = createMockContext({ errors: wikipediaSearch.errors });
+    const input = wikipediaSearch.input.parse({ query: 'Python', offset: 9999 });
+    const result = await wikipediaSearch.handler(input, ctx);
+
+    expect(result.results).toHaveLength(0);
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.offset).toBe(9999);
+    expect(enrichment.notice).toContain('end of the result set');
+  });
+
+  it('defaults offset to 0 when omitted (issue #22 backward-compat)', async () => {
+    const searchFn = vi.fn().mockResolvedValue({
+      results: [{ title: 'T', pageid: 1, snippet: 'S', wordcount: 10 }],
+      totalResults: 1,
+      nextOffset: undefined,
+    });
+    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+      search: searchFn,
+    } as unknown as svcModule.WikipediaService);
+
+    const ctx = createMockContext();
+    const input = wikipediaSearch.input.parse({ query: 'Test' });
+    await wikipediaSearch.handler(input, ctx);
+
+    expect(searchFn).toHaveBeenCalledWith('Test', 10, 'en', ctx, 0);
+    expect(getEnrichment(ctx).offset).toBe(0);
+  });
+
+  it('rejects negative offset at schema parse time (issue #22)', () => {
+    expect(() => wikipediaSearch.input.parse({ query: 'Python', offset: -1 })).toThrow();
+  });
+
+  it('rejects float offset at schema parse time (issue #22)', () => {
+    expect(() => wikipediaSearch.input.parse({ query: 'Python', offset: 2.5 })).toThrow();
   });
 });

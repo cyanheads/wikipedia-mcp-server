@@ -14,6 +14,7 @@ import {
   initWikipediaService,
   isBlankTitle,
   isUnknownEdition,
+  splitArticleIntoSections,
   WikipediaService,
 } from '@/services/wikipedia/wikipedia-service.js';
 
@@ -837,5 +838,100 @@ describe('WikipediaService — output contains no secrets', () => {
 
     const { results } = await svc.search('test', 1, 'en', ctx);
     expect(results[0]?.snippet).not.toMatch(/Authorization|Bearer|api.key/i);
+  });
+});
+
+describe('WikipediaService.search — pagination (issue #22)', () => {
+  beforeEach(() => {
+    initWikipediaService(mockConfig, mockStorage, TEST_USER_AGENT);
+  });
+
+  it('passes sroffset and surfaces nextOffset from continue.sroffset', async () => {
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+
+    const spy = vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+      query: {
+        searchinfo: { totalhits: 100 },
+        search: [{ title: 'R', pageid: 1, snippet: 'S', wordcount: 10 }],
+      },
+      continue: { sroffset: 10 },
+    });
+
+    const { results, totalResults, nextOffset } = await svc.search('q', 5, 'en', ctx, 5);
+    expect(spy).toHaveBeenCalledWith('en', expect.objectContaining({ sroffset: '5' }), ctx);
+    expect(results).toHaveLength(1);
+    expect(totalResults).toBe(100);
+    expect(nextOffset).toBe(10);
+  });
+
+  it('leaves nextOffset undefined at the end of results (no continue block)', async () => {
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+
+    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+      query: {
+        searchinfo: { totalhits: 6 },
+        search: [{ title: 'Last', pageid: 9, snippet: 'S', wordcount: 10 }],
+      },
+    });
+
+    const { nextOffset } = await svc.search('q', 10, 'en', ctx, 5);
+    expect(nextOffset).toBeUndefined();
+  });
+
+  it('defaults sroffset to "0" when offset is omitted (backward-compat)', async () => {
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+
+    const spy = vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+      query: { searchinfo: { totalhits: 0 }, search: [] },
+    });
+
+    await svc.search('q', 10, 'en', ctx);
+    expect(spy).toHaveBeenCalledWith('en', expect.objectContaining({ sroffset: '0' }), ctx);
+  });
+
+  it('returns an empty result array for an offset past totalhits (no error)', async () => {
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+
+    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+      query: { searchinfo: { totalhits: 12 }, search: [] },
+    });
+
+    const { results, totalResults, nextOffset } = await svc.search('q', 10, 'en', ctx, 9999);
+    expect(results).toHaveLength(0);
+    expect(totalResults).toBe(12);
+    expect(nextOffset).toBeUndefined();
+  });
+});
+
+describe('splitArticleIntoSections — section splitting (issue #23)', () => {
+  it('splits on == Heading == markers with the lead captured as Introduction', () => {
+    const parts = splitArticleIntoSections(
+      'Lead text.\n\n== History ==\n\nHist body.\n\n== Syntax ==\n\nSyntax body.',
+    );
+    expect(parts).toEqual([
+      { heading: 'Introduction', body: 'Lead text.' },
+      { heading: 'History', body: 'Hist body.' },
+      { heading: 'Syntax', body: 'Syntax body.' },
+    ]);
+  });
+
+  it('handles subsection heading levels (=== ... ===)', () => {
+    const parts = splitArticleIntoSections('== A ==\n\nA body.\n\n=== A.1 ===\n\nSub body.');
+    expect(parts.map((p) => p.heading)).toEqual(['A', 'A.1']);
+    expect(parts[1]?.body).toBe('Sub body.');
+  });
+
+  it('returns a single Introduction part when there are no headings', () => {
+    expect(splitArticleIntoSections('Just a lead, no sections.')).toEqual([
+      { heading: 'Introduction', body: 'Just a lead, no sections.' },
+    ]);
+  });
+
+  it('returns an empty array for empty content', () => {
+    expect(splitArticleIntoSections('')).toEqual([]);
   });
 });

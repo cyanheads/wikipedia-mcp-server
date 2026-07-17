@@ -15,8 +15,16 @@ const ServerConfigSchema = z.object({
     ),
   userAgent: z
     .string()
-    .default('wikipedia-mcp-server/0.1.12 (https://github.com/cyanheads/wikipedia-mcp-server)')
+    .default('wikipedia-mcp-server/0.1.13 (https://github.com/cyanheads/wikipedia-mcp-server)')
     .describe('User-Agent header sent with every request per Wikimedia policy'),
+  articleOverflowBytes: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(80_000)
+    .describe(
+      'Byte budget above which a full-article read (wikipedia_get_article without section_index) returns a section outline instead of the full text. Tuned for this domain: ordinary articles run large (Dog ~51 KB, Python ~40 KB) and stay whole, while only genuine mega-articles (World War II ~86 KB, United States ~94 KB) outline. Section-targeted reads are never affected.',
+    ),
 });
 
 export type ServerConfig = z.infer<typeof ServerConfigSchema>;
@@ -27,6 +35,7 @@ export function getServerConfig(): ServerConfig {
   _config ??= parseEnvConfig(ServerConfigSchema, {
     baseUrl: 'WIKIPEDIA_BASE_URL',
     userAgent: 'WIKIPEDIA_USER_AGENT',
+    articleOverflowBytes: 'WIKIPEDIA_ARTICLE_OVERFLOW_BYTES',
   });
   return _config;
 }

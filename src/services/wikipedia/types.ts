@@ -32,6 +32,12 @@ export type ActionSearchRaw = {
     searchinfo?: { totalhits?: number };
     search?: ActionSearchResult[];
   };
+  /**
+   * Present exactly when more results remain past the current page; `sroffset` is the offset to
+   * request next. Absent at the end of the result set. The tool derives `nextOffset` from this
+   * upstream signal rather than computing `offset + limit`.
+   */
+  continue?: { sroffset?: number };
 };
 
 /** Action API extracts response (for full article text). */

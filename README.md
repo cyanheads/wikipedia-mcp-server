@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.12-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/wikipedia-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/wikipedia-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/wikipedia-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.1.13-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/wikipedia-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/wikipedia-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/wikipedia-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -40,6 +40,7 @@ Search Wikipedia articles by full-text query.
 
 - Returns ranked results with plain-text snippets (HTML stripped), page IDs, and word counts
 - Use when the exact article title is unknown or to discover multiple articles on a topic
+- Page beyond the first result page with `offset`; the enrichment `nextOffset` signals more results remain (pass it back as `offset`)
 - Supports all Wikipedia language editions via the `language` parameter
 
 ---
@@ -59,7 +60,7 @@ Fetch the lead-section summary for a Wikipedia article.
 
 Fetch article content as clean plain text.
 
-- Without `section_index`: returns the full article (40–100 KB for major articles) with `== Section ==` markers
+- Without `section_index`: returns the full article with `== Section ==` markers — unless it exceeds `WIKIPEDIA_ARTICLE_OVERFLOW_BYTES` (default 80 KB), in which case it returns a compact section outline (`truncated: true`) pointing to `wikipedia_get_sections` plus a `section_index` read
 - With `section_index` (from `wikipedia_get_sections`): returns just that section (1–10 KB)
 - Section path uses wikitext stripping via `wtf_wikipedia`
 - Redirect pages followed automatically
@@ -220,8 +221,9 @@ cp .env.example .env
 
 | Variable | Description | Default |
 |:---------|:------------|:--------|
-| `WIKIPEDIA_USER_AGENT` | User-Agent header sent with every Wikimedia API request. Customize for your deployment. | `wikipedia-mcp-server/0.1.12 (https://github.com/cyanheads/wikipedia-mcp-server)` |
+| `WIKIPEDIA_USER_AGENT` | User-Agent header sent with every Wikimedia API request. Customize for your deployment. | `wikipedia-mcp-server/0.1.13 (https://github.com/cyanheads/wikipedia-mcp-server)` |
 | `WIKIPEDIA_BASE_URL` | Optional single-instance override. Unset (default): compose per-language hosts, `language` selects the edition per call. Set to a full base URL (e.g. a private MediaWiki mirror): route every call at that one fixed host — `language` no longer varies it. | *(unset)* |
+| `WIKIPEDIA_ARTICLE_OVERFLOW_BYTES` | Byte budget above which a full-article read (`wikipedia_get_article` without `section_index`) returns a section outline instead of the full text. Tuned for this domain — ordinary articles stay whole; only genuine mega-articles (World War II ~86 KB, United States ~94 KB) outline. Section-targeted reads are never affected. | `80000` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_HTTP_PORT` | Port for HTTP server. | `3010` |
 | `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |

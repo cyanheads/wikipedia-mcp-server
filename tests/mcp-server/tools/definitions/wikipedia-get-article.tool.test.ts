@@ -288,4 +288,70 @@ describe('wikipediaGetArticle', () => {
     expect(result.section_title).toBeUndefined();
     expect(result.content_type).toBe('full_article');
   });
+
+  it('returns full content with truncated:false for an article within the byte budget (issue #23)', async () => {
+    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+      getArticleFull: vi.fn().mockResolvedValue({
+        title: 'Small Article',
+        pageid: 1,
+        content: '== Intro ==\n\nShort body.\n\n== More ==\n\nAlso short.',
+      }),
+    } as unknown as svcModule.WikipediaService);
+
+    const ctx = createMockContext();
+    const input = wikipediaGetArticle.input.parse({ title: 'Small Article' });
+    const result = await wikipediaGetArticle.handler(input, ctx);
+
+    expect(result.truncated).toBe(false);
+    expect(result.content).toContain('Short body.');
+    expect(result.original_length).toBeUndefined();
+    expect(result.sections_suggested).toBeUndefined();
+    expect(result.content_type).toBe('full_article');
+  });
+
+  it('returns a section outline with truncated:true for an over-threshold article (issue #23)', async () => {
+    const big = `Lead paragraph.\n\n${Array.from(
+      { length: 6 },
+      (_, i) => `== Section ${i + 1} ==\n\n${'lorem ipsum dolor sit amet. '.repeat(1000)}`,
+    ).join('\n\n')}`;
+    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+      getArticleFull: vi.fn().mockResolvedValue({
+        title: 'Big Article',
+        pageid: 42,
+        content: big,
+      }),
+    } as unknown as svcModule.WikipediaService);
+
+    const ctx = createMockContext();
+    const input = wikipediaGetArticle.input.parse({ title: 'Big Article' });
+    const result = await wikipediaGetArticle.handler(input, ctx);
+
+    expect(result.truncated).toBe(true);
+    expect(result.sections_suggested).toBe(true);
+    expect(result.original_length).toBe(big.length);
+    expect(result.content_type).toBe('full_article');
+    // Outline points at this server's targeted-read path, not the framework default wording.
+    expect(result.content).toContain('wikipedia_get_sections');
+    expect(result.content).toContain('section_index');
+    // The outline lists section names and sizes, not the raw section bodies.
+    expect(result.content).not.toContain('lorem ipsum');
+  });
+
+  it('format renders overflow disclosure fields when truncated (issue #23)', () => {
+    const output = {
+      title: 'World War II',
+      pageid: 32927,
+      content: 'Full article outlined — 90000 characters across 39 sections ...',
+      content_type: 'full_article',
+      truncated: true,
+      original_length: 90000,
+      sections_suggested: true,
+      language: 'en',
+    };
+    const blocks = wikipediaGetArticle.format!(output);
+    const text = blocks.map((b) => (b.type === 'text' ? b.text : '')).join('');
+    expect(text).toContain('90000');
+    expect(text).toContain('Truncated');
+    expect(text).toContain('wikipedia_get_sections');
+  });
 });

@@ -40,7 +40,11 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
         z
           .object({
             title: z.string().describe('Article title (e.g. "Eiffel Tower").'),
-            pageid: z.number().describe('Wikipedia page ID — use as input to other tools.'),
+            pageid: z
+              .number()
+              .describe(
+                'Stable numeric Wikipedia page ID — a durable reference for cross-referencing or de-duplication. Not a tool input; pass the title to follow-up tools.',
+              ),
             latitude: z.number().describe('Article subject latitude in decimal degrees.'),
             longitude: z.number().describe('Article subject longitude in decimal degrees.'),
             distance_meters: z.number().describe('Distance from the query coordinate in meters.'),
