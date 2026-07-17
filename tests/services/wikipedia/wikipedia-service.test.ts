@@ -9,8 +9,10 @@ import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  buildBaseUrl,
   getWikipediaService,
   initWikipediaService,
+  isUnknownEdition,
   WikipediaService,
 } from '@/services/wikipedia/wikipedia-service.js';
 
@@ -70,6 +72,45 @@ describe('WikipediaService language validation', () => {
       });
     }
     // If resolved, language validation passed — nothing more to assert.
+  });
+});
+
+describe('buildBaseUrl — compose vs single-instance override (issue #16)', () => {
+  it('composes a per-language host when no override is set', () => {
+    expect(buildBaseUrl('en')).toBe('https://en.wikipedia.org');
+    expect(buildBaseUrl('als')).toBe('https://als.wikipedia.org');
+  });
+
+  it('rejects a nonexistent edition in compose mode', () => {
+    expect(() => buildBaseUrl('zz')).toThrow('does not exist on Wikipedia');
+  });
+
+  it('uses the override verbatim and ignores language when set', () => {
+    expect(buildBaseUrl('en', 'https://wiki.example.com')).toBe('https://wiki.example.com');
+    // Language is not validated in override mode — any code maps to the one fixed host.
+    expect(buildBaseUrl('zz', 'https://wiki.example.com')).toBe('https://wiki.example.com');
+  });
+
+  it('strips a trailing slash from the override', () => {
+    expect(buildBaseUrl('en', 'https://wiki.example.com/')).toBe('https://wiki.example.com');
+  });
+});
+
+describe('isUnknownEdition — edition-check scoping (issues #16, #18)', () => {
+  it('flags a structurally-valid code that names no Wikipedia edition in compose mode', () => {
+    initWikipediaService(mockConfig, mockStorage, TEST_USER_AGENT);
+    expect(isUnknownEdition('zz')).toBe(true);
+    // 'gsw' is a real language code but not a Wikipedia edition (that content is under 'als').
+    expect(isUnknownEdition('gsw')).toBe(true);
+    expect(isUnknownEdition('fr')).toBe(false);
+    expect(isUnknownEdition('als')).toBe(false);
+  });
+
+  it('skips the edition check when a single-instance override is configured', () => {
+    initWikipediaService(mockConfig, mockStorage, TEST_USER_AGENT, 'https://wiki.example.com');
+    // A custom host may serve any editions, so nothing is treated as unknown.
+    expect(isUnknownEdition('zz')).toBe(false);
+    expect(isUnknownEdition('fr')).toBe(false);
   });
 });
 
@@ -160,6 +201,63 @@ describe('WikipediaService.getLanguages — formatversion=2 langlinks (issue #2)
     expect(languages[0]?.title).toBe('Python (langage)');
     expect(languages[0]?.url).toBe('https://fr.wikipedia.org/wiki/Python_%28langage%29');
     expect(languages[0]?.languageCode).toBe('fr');
+    expect(languages[0]?.editionCode).toBe('fr');
+  });
+});
+
+describe('WikipediaService.getLanguages — editionCode derivation (issue #17)', () => {
+  beforeEach(() => {
+    initWikipediaService(mockConfig, mockStorage, TEST_USER_AGENT);
+  });
+
+  it('derives editionCode from the URL host when code and subdomain diverge', async () => {
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+
+    // Alemannic: language code "gsw" but the edition lives on the "als" subdomain.
+    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+      query: {
+        pages: {
+          '23862': {
+            pageid: 23862,
+            title: 'Python (programming language)',
+            langlinks: [
+              {
+                lang: 'gsw',
+                title: 'Python (Programmiersprache)',
+                url: 'https://als.wikipedia.org/wiki/Python_(Programmiersprache)',
+              },
+            ],
+          },
+        },
+      },
+    });
+
+    const { languages } = await svc.getLanguages('Python (programming language)', 'en', ctx);
+    expect(languages[0]?.languageCode).toBe('gsw');
+    expect(languages[0]?.editionCode).toBe('als');
+  });
+
+  it('handles hyphenated edition subdomains as a single host label', async () => {
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+
+    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+      query: {
+        pages: {
+          '1': {
+            pageid: 1,
+            title: 'Test',
+            langlinks: [
+              { lang: 'nan', title: 'Test', url: 'https://zh-min-nan.wikipedia.org/wiki/Test' },
+            ],
+          },
+        },
+      },
+    });
+
+    const { languages } = await svc.getLanguages('Test', 'en', ctx);
+    expect(languages[0]?.editionCode).toBe('zh-min-nan');
   });
 });
 
@@ -545,6 +643,9 @@ describe('WikipediaService.getLanguages — missing page handling', () => {
     const { languages } = await svc.getLanguages('Test', 'en', ctx);
     expect(languages[0]?.url).toContain('de.wikipedia.org');
     expect(languages[0]?.url).toContain('Test');
+    // editionCode derives from the composed host, so it agrees with that URL rather than
+    // asserting a subdomain the URL does not point to.
+    expect(languages[0]?.editionCode).toBe('de');
   });
 });
 

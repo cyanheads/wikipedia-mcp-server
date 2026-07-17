@@ -113,6 +113,14 @@ describe('wikipediaSearch', () => {
     });
   });
 
+  it('throws invalid_language with data.reason for a nonexistent edition (issue #18)', async () => {
+    const ctx = createMockContext({ errors: wikipediaSearch.errors });
+    const input = wikipediaSearch.input.parse({ query: 'Python', language: 'zz' });
+    await expect(wikipediaSearch.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'invalid_language' },
+    });
+  });
+
   it('rejects float limit at schema parse time (issue #14)', () => {
     expect(() => wikipediaSearch.input.parse({ query: 'Python', limit: 5.7 })).toThrow();
   });

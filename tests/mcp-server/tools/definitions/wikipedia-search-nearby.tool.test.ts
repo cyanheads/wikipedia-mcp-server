@@ -144,6 +144,18 @@ describe('wikipediaSearchNearby', () => {
     });
   });
 
+  it('throws invalid_language with data.reason for a nonexistent edition (issue #18)', async () => {
+    const ctx = createMockContext({ errors: wikipediaSearchNearby.errors });
+    const input = wikipediaSearchNearby.input.parse({
+      latitude: 47.6,
+      longitude: -122.3,
+      language: 'zz',
+    });
+    await expect(wikipediaSearchNearby.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'invalid_language' },
+    });
+  });
+
   it('rejects float limit at schema parse time (issue #14)', () => {
     expect(() =>
       wikipediaSearchNearby.input.parse({ latitude: 47.6, longitude: -122.3, limit: 5.7 }),

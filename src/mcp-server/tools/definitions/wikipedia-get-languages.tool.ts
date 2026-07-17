@@ -5,7 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { getWikipediaService } from '@/services/wikipedia/wikipedia-service.js';
+import { getWikipediaService, isUnknownEdition } from '@/services/wikipedia/wikipedia-service.js';
 
 export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
   title: 'Get Wikipedia Article Languages',
@@ -28,7 +28,16 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
       .array(
         z
           .object({
-            language_code: z.string().describe('BCP 47 language code (e.g. "fr", "de").'),
+            language_code: z
+              .string()
+              .describe(
+                'MediaWiki language code from langlinks (e.g. "gsw"). May differ from the Wikipedia subdomain — use edition_code as the `language` input to other tools.',
+              ),
+            edition_code: z
+              .string()
+              .describe(
+                'Wikipedia edition subdomain that serves this article (e.g. "als"). Pass THIS value as the `language` parameter to other wikipedia-mcp-server tools; language_code is not always a valid edition.',
+              ),
             title: z.string().describe('Article title in this language edition.'),
             url: z.string().describe('Full URL to the article in this language edition.'),
           })
@@ -54,7 +63,7 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
     {
       reason: 'invalid_language',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The language code is not a valid BCP 47 code.',
+      when: 'The language is not a valid BCP 47 code, or names a Wikipedia edition that does not exist.',
       recovery: 'Use a valid BCP 47 language code such as "fr", "de", or "ja".',
     },
   ],
@@ -66,6 +75,16 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
       throw ctx.fail(
         'invalid_language',
         `Invalid language code "${language}". Use a BCP 47 language code such as "fr", "de", or "ja".`,
+        { language, ...ctx.recoveryFor('invalid_language') },
+      );
+    }
+
+    // Reject a structurally-valid code that names no Wikipedia edition (skipped when a
+    // single-instance base-URL override is set — that host may serve any editions).
+    if (isUnknownEdition(language)) {
+      throw ctx.fail(
+        'invalid_language',
+        `Language edition "${language}" does not exist on Wikipedia. Use a valid Wikipedia language code such as "fr", "de", or "ja".`,
         { language, ...ctx.recoveryFor('invalid_language') },
       );
     }
@@ -107,6 +126,7 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
       source_language: language,
       languages: languages.map((l) => ({
         language_code: l.languageCode,
+        edition_code: l.editionCode,
         title: l.title,
         url: l.url,
       })),
@@ -120,7 +140,9 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
       `**${result.total_languages} languages available**\n`,
     ];
     for (const lang of result.languages) {
-      lines.push(`- **${lang.language_code}**: [${lang.title}](${lang.url})`);
+      lines.push(
+        `- **${lang.title}** — pass \`language: "${lang.edition_code}"\` (code \`${lang.language_code}\`): [article](${lang.url})`,
+      );
     }
     return [{ type: 'text', text: lines.join('\n') }];
   },

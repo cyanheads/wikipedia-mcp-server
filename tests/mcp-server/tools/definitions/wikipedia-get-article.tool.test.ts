@@ -109,6 +109,14 @@ describe('wikipediaGetArticle', () => {
     });
   });
 
+  it('throws invalid_language with data.reason for a nonexistent edition (issue #18)', async () => {
+    const ctx = createMockContext({ errors: wikipediaGetArticle.errors });
+    const input = wikipediaGetArticle.input.parse({ title: 'Python', language: 'zz' });
+    await expect(wikipediaGetArticle.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'invalid_language' },
+    });
+  });
+
   it('throws invalid_section for section_index=0 (issue #7)', async () => {
     const ctx = createMockContext({ errors: wikipediaGetArticle.errors });
     const input = wikipediaGetArticle.input.parse({ title: 'Python', section_index: 0 });

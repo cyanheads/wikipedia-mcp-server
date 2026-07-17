@@ -5,7 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { getWikipediaService } from '@/services/wikipedia/wikipedia-service.js';
+import { getWikipediaService, isUnknownEdition } from '@/services/wikipedia/wikipedia-service.js';
 
 export const wikipediaGetArticle = tool('wikipedia_get_article', {
   title: 'Get Wikipedia Article',
@@ -58,7 +58,7 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
     {
       reason: 'invalid_language',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The language code is not a valid BCP 47 code.',
+      when: 'The language is not a valid BCP 47 code, or names a Wikipedia edition that does not exist.',
       recovery: 'Use a valid BCP 47 language code such as "fr", "de", or "ja".',
     },
   ],
@@ -71,6 +71,16 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
       throw ctx.fail(
         'invalid_language',
         `Invalid language code "${language}". Use a BCP 47 language code such as "fr", "de", or "ja".`,
+        { language, ...ctx.recoveryFor('invalid_language') },
+      );
+    }
+
+    // Reject a structurally-valid code that names no Wikipedia edition (skipped when a
+    // single-instance base-URL override is set — that host may serve any editions).
+    if (isUnknownEdition(language)) {
+      throw ctx.fail(
+        'invalid_language',
+        `Language edition "${language}" does not exist on Wikipedia. Use a valid Wikipedia language code such as "fr", "de", or "ja".`,
         { language, ...ctx.recoveryFor('invalid_language') },
       );
     }

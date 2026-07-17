@@ -42,9 +42,11 @@ function stripWikitext(wikitext: string): string {
   // Preserve section headings — wtf strips them, but we want structure.
   // Re-inject from the raw wikitext using a simple regex pass.
   const headingPattern = /^(={2,6})\s*(.+?)\s*\1\s*$/gm;
-  const headings = [...wikitext.matchAll(headingPattern)]
-    .filter((m) => m[1] && m[2])
-    .map((m) => ({ level: m[1]!.length, title: m[2]! }));
+  const headings = [...wikitext.matchAll(headingPattern)].flatMap((m) => {
+    const level = m[1]?.length;
+    const title = m[2];
+    return level && title ? [{ level, title }] : [];
+  });
 
   // Prepend headings as == Heading == markers when present and not already in text.
   if (headings[0] && !text.startsWith(headings[0].title)) {
@@ -321,13 +323,26 @@ const KNOWN_WIKIPEDIA_EDITIONS = new Set([
 ]);
 
 /**
- * Validate that `language` is a structurally valid BCP 47 code AND a known Wikipedia edition.
- * Returns the normalised base URL or throws a `validationError` with a descriptive message.
+ * Resolve the base URL for MediaWiki API calls.
  *
- * This is a pure utility — it cannot call `ctx.fail`. Callers that want a typed error contract
- * should validate using `ctx.fail('invalid_language', ...)` before calling service methods.
+ * With a single-instance override configured (`WIKIPEDIA_BASE_URL`), every call routes at that
+ * fixed host and the per-call `language` no longer varies it — the mode for a private mirror or an
+ * alternate MediaWiki instance, which may host any editions, so no Wikipedia-specific checks run.
+ *
+ * Without an override (the default), the host is composed per language as
+ * `https://<language>.wikipedia.org` after validating the code's BCP 47 structure and that it names
+ * an existing Wikipedia edition.
+ *
+ * Exported for unit testing. A pure utility — it cannot call `ctx.fail`, so tool handlers
+ * pre-validate (structural check, plus `isUnknownEdition` in compose mode) via
+ * `ctx.fail('invalid_language', ...)` to satisfy the typed contract; the throws here are the
+ * defence-in-depth fallback for direct service callers.
  */
-function buildBaseUrl(language: string): string {
+export function buildBaseUrl(language: string, baseUrlOverride?: string): string {
+  // Single-instance override: fixed host, language is not used to construct it.
+  if (baseUrlOverride) {
+    return baseUrlOverride.replace(/\/+$/, '');
+  }
   // Structure check — must look like a BCP 47 code.
   if (!/^[a-z]{2,3}(-[a-z0-9]+)*$/i.test(language)) {
     throw validationError(
@@ -352,6 +367,19 @@ function buildBaseUrl(language: string): string {
   return `https://${normalized}.wikipedia.org`;
 }
 
+/**
+ * Extract the Wikipedia edition subdomain (the first host label) from an article URL — the value a
+ * caller passes as `language` to other tools. Degrades to the language code if the URL cannot be
+ * parsed, so a single malformed langlink never fails the whole call.
+ */
+function editionCodeFromUrl(url: string, fallbackLang: string): string {
+  try {
+    return new URL(url).hostname.split('.')[0] || fallbackLang;
+  } catch {
+    return fallbackLang;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // WikipediaService
 // ---------------------------------------------------------------------------
@@ -361,6 +389,11 @@ export class WikipediaService {
     _config: AppConfig,
     _storage: StorageService,
     private readonly userAgent: string,
+    /**
+     * Optional single-instance base-URL override (`WIKIPEDIA_BASE_URL`). When set, every request
+     * routes at this fixed host and the per-call `language` no longer varies it.
+     */
+    readonly baseUrl?: string,
   ) {}
 
   /** Shared fetch headers for all requests. */
@@ -373,10 +406,10 @@ export class WikipediaService {
 
   /** GET from the REST API (`/api/rest_v1/`). */
   async restGet<T>(language: string, path: string, ctx: RequestContextLike): Promise<T> {
-    const base = buildBaseUrl(language);
+    const base = buildBaseUrl(language, this.baseUrl);
     const url = `${base}/api/rest_v1${path}`;
     const signal = (ctx as { signal?: AbortSignal }).signal;
-    return withRetry(
+    return await withRetry(
       async () => {
         const response = await fetchWithTimeout(url, 15_000, ctx, {
           headers: this.headers(),
@@ -400,11 +433,11 @@ export class WikipediaService {
     params: Record<string, string>,
     ctx: RequestContextLike,
   ): Promise<T> {
-    const base = buildBaseUrl(language);
+    const base = buildBaseUrl(language, this.baseUrl);
     const qs = new URLSearchParams({ format: 'json', formatversion: '2', ...params }).toString();
     const url = `${base}/w/api.php?${qs}`;
     const signal = (ctx as { signal?: AbortSignal }).signal;
-    return withRetry(
+    return await withRetry(
       async () => {
         const response = await fetchWithTimeout(url, 15_000, ctx, {
           headers: this.headers(),
@@ -647,12 +680,13 @@ export class WikipediaService {
       const fullArticle = await this.getArticleFull(title, language, ctx);
       const headerPattern = /^(={2,6})\s*(.+?)\s*\1\s*$/gm;
       let idx = 0;
-      const fallbackSections = [...fullArticle.content.matchAll(headerPattern)]
-        .filter((m) => m[1] && m[2])
-        .map((m) => {
-          const i = ++idx;
-          return { index: i, number: String(i), title: m[2]!, level: m[1]!.length };
-        });
+      const fallbackSections = [...fullArticle.content.matchAll(headerPattern)].flatMap((m) => {
+        const level = m[1]?.length;
+        const title = m[2];
+        if (!level || !title) return [];
+        const i = ++idx;
+        return [{ index: i, number: String(i), title, level }];
+      });
       return { pageid: fullArticle.pageid, sections: fallbackSections };
     }
 
@@ -674,7 +708,7 @@ export class WikipediaService {
     sourceLanguage: string,
     ctx: RequestContextLike,
   ): Promise<{
-    languages: Array<{ languageCode: string; title: string; url: string }>;
+    languages: Array<{ languageCode: string; editionCode: string; title: string; url: string }>;
   }> {
     const raw = await this.actionGet<ActionLangLinksRaw>(
       sourceLanguage,
@@ -700,15 +734,22 @@ export class WikipediaService {
     }
 
     const languages =
-      page.langlinks?.map((ll) => ({
-        languageCode: ll.lang,
-        // formatversion=2: title is a plain key, not '*'.
-        title: ll.title,
-        // url is populated because we pass llprop=url in the request.
-        url:
+      page.langlinks?.map((ll) => {
+        // url is populated because we pass llprop=url; compose a host only if the API omits it.
+        const url =
           ll.url ??
-          `https://${ll.lang}.wikipedia.org/wiki/${encodeURIComponent(ll.title.replace(/ /g, '_'))}`,
-      })) ?? [];
+          `https://${ll.lang}.wikipedia.org/wiki/${encodeURIComponent(ll.title.replace(/ /g, '_'))}`;
+        return {
+          languageCode: ll.lang,
+          // The subdomain that actually serves the edition — the value usable as `language` on
+          // other tools. Derived from the real host so it stays correct when the MediaWiki code and
+          // the Wikipedia subdomain diverge (e.g. code "gsw" lives on subdomain "als").
+          editionCode: editionCodeFromUrl(url, ll.lang),
+          // formatversion=2: title is a plain key, not '*'.
+          title: ll.title,
+          url,
+        };
+      }) ?? [];
 
     return { languages };
   }
@@ -765,8 +806,9 @@ export function initWikipediaService(
   config: AppConfig,
   storage: StorageService,
   userAgent: string,
+  baseUrl?: string,
 ): void {
-  _service = new WikipediaService(config, storage, userAgent);
+  _service = new WikipediaService(config, storage, userAgent, baseUrl);
 }
 
 export function getWikipediaService(): WikipediaService {
@@ -774,4 +816,17 @@ export function getWikipediaService(): WikipediaService {
     throw new Error('WikipediaService not initialized — call initWikipediaService() in setup()');
   }
   return _service;
+}
+
+/**
+ * Report whether `language` is a structurally-valid code that names no existing Wikipedia edition —
+ * the signal a tool handler uses to reject it with the typed `invalid_language` contract before any
+ * network call, mirroring how the structural BCP 47 check is already pre-validated in-handler.
+ *
+ * Returns `false` whenever a single-instance base-URL override is configured: that mode fixes the
+ * host and may serve any editions, so the Wikipedia-specific edition list must not gate it.
+ */
+export function isUnknownEdition(language: string): boolean {
+  if (_service?.baseUrl) return false;
+  return !KNOWN_WIKIPEDIA_EDITIONS.has(language.toLowerCase());
 }

@@ -11,7 +11,7 @@
 | `wikipedia_get_article` | Fetch article content as clean plain text. Full-article path uses `action=query&prop=extracts&explaintext=true` (40–100KB for major articles). Section-targeted path uses `action=parse&prop=wikitext&section={index}` with wikitext stripping applied — use `section_index` (from `wikipedia_get_sections`) to retrieve a single section. Prefer section targeting when only part of the article is needed. | `title`, `section_index`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `invalid_section` (InvalidParams), `invalid_language` (InvalidParams) |
 | `wikipedia_get_sections` | Fetch the table of contents for an article — section titles, numbers, levels, and `section_index` values. Call this before `wikipedia_get_article` when only a specific section is needed. The returned `section_index` values are the identifiers for targeted section reads. | `title`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `no_sections` (NotFound), `invalid_language` (InvalidParams) |
 | `wikipedia_search_nearby` | Find Wikipedia articles about places near a geographic coordinate. Returns articles within a radius, sorted by distance. Useful for "what's notable near X?" research. | `latitude`, `longitude`, `radius_meters`, `limit`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `no_results` (NotFound), `invalid_coordinates` (InvalidParams), `invalid_language` (InvalidParams) |
-| `wikipedia_get_languages` | List the language editions available for an article. Returns language codes, article titles in each language, and URLs. Use for cross-language research or to find a non-English article title for a known concept. | `title`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `no_other_languages` (NotFound), `invalid_language` (InvalidParams) |
+| `wikipedia_get_languages` | List the language editions available for an article. Returns each edition's language code, tool-usable subdomain code, article title, and URL. Use for cross-language research or to find a non-English article title for a known concept. | `title`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `no_other_languages` (NotFound), `invalid_language` (InvalidParams) |
 
 ### Resources
 
@@ -36,7 +36,7 @@ Complements `wikidata-mcp-server` (structured triples, SPARQL, entity properties
 - Default language: `en` (English Wikipedia). Language is a per-call parameter — no session state
 - Read-only surface throughout — no writes
 - Disambiguation pages are not errors: surface `type: "disambiguation"` so the agent can detect and pivot to search
-- Multi-wiki support (Wikiquote, Wiktionary, etc.) deferred — configure via base URL env var for future use
+- Single-instance base-URL override (`WIKIPEDIA_BASE_URL`): unset, the host is composed per call from `language`; set, every call routes at one fixed host — a private mirror or an alternate MediaWiki instance. Selecting a WMF sibling project (Wikiquote, Wiktionary) per call remains out of scope
 
 ## Services
 
@@ -50,10 +50,10 @@ Single service — both APIs share the same base host and User-Agent; one client
 
 | Env Var | Required | Description |
 |:--------|:---------|:------------|
-| `WIKIPEDIA_BASE_URL` | No | Override base URL (default: `https://en.wikipedia.org`). Language selection is a per-call parameter, not a global config. |
+| `WIKIPEDIA_BASE_URL` | No | Optional single-instance override. Unset (default): compose per-language hosts and let per-call `language` select the edition. Set to a full base URL (e.g. a private MediaWiki mirror) to route every call at that one fixed host — `language` no longer varies the host. |
 | `WIKIPEDIA_USER_AGENT` | No | Override the User-Agent string. Defaults to a reasonable `wikipedia-mcp-server/VERSION (https://github.com/cyanheads/wikipedia-mcp-server)` value. |
 
-No API key needed. Language is a per-call parameter on every tool (defaults to `en`), so the base URL stays language-agnostic for most users while still supporting cross-language calls.
+No API key needed. By default, language is a per-call parameter on every tool (defaults to `en`), so one instance serves every edition; setting `WIKIPEDIA_BASE_URL` pins all calls to a single host for mirror or alternate-instance deployments.
 
 ## Implementation Order
 
@@ -131,7 +131,7 @@ The REST API summary endpoint returns `"type": "disambiguation"` for disambiguat
 
 ### Language as a per-call parameter
 
-Multi-language support is one parameter (`language`, default `"en"`) on every tool. This constructs the correct base URL for each call (e.g., `https://fr.wikipedia.org/...`). The alternative — a single global base URL config — forces users to run separate server instances per language, which is worse UX. Per-call language also enables cross-language workflows in a single session.
+Multi-language support is one parameter (`language`, default `"en"`) on every tool. By default this constructs the correct base URL for each call (e.g., `https://fr.wikipedia.org/...`), so one instance serves every edition and cross-language workflows run in a single session. A single global base URL is available as an opt-in (`WIKIPEDIA_BASE_URL`) for deployments that must pin all traffic to one host — a private mirror or an alternate MediaWiki instance — at the cost of per-call language selection; it is deliberately not the default.
 
 ### Relationship to wikidata-mcp-server
 
@@ -307,7 +307,7 @@ No enforced rate limits, but:
 - `title: string` — article title
 - `language?: string` — language edition to query from (default `"en"`)
 
-**Output:** Array of language entries: `{ language_code, title, url }`. The source language is not included — only other editions. Includes `total_languages` count.
+**Output:** Array of language entries: `{ language_code, edition_code, title, url }`. `edition_code` is the Wikipedia subdomain (derived from the article URL host) to pass as `language` to other tools — it can differ from `language_code` for some editions (e.g. `gsw` → `als`). The source language is not included — only other editions. Includes `total_languages` count.
 
 **Errors:**
 - `not_found` (NotFound) — no article exists for the title in the specified language. Recovery: use `wikipedia_search` to find the correct title.

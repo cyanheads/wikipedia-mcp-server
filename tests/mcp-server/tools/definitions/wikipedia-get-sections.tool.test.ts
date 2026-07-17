@@ -77,6 +77,14 @@ describe('wikipediaGetSections', () => {
     });
   });
 
+  it('throws invalid_language with data.reason for a nonexistent edition (issue #18)', async () => {
+    const ctx = createMockContext({ errors: wikipediaGetSections.errors });
+    const input = wikipediaGetSections.input.parse({ title: 'Python', language: 'zz' });
+    await expect(wikipediaGetSections.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'invalid_language' },
+    });
+  });
+
   it('throws not_found with data.reason when article is missing (issue #12)', async () => {
     const { notFound } = await import('@cyanheads/mcp-ts-core/errors');
     vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({

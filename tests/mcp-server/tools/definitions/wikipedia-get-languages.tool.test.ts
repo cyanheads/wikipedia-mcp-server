@@ -53,24 +53,26 @@ describe('wikipediaGetLanguages', () => {
     });
   });
 
-  it('format renders language codes, titles, and URLs', () => {
+  it('format renders language codes, edition codes, titles, and URLs', () => {
     const output = {
       source_title: 'Python (programming language)',
       source_language: 'en',
       languages: [
         {
-          language_code: 'fr',
-          title: 'Python (langage)',
-          url: 'https://fr.wikipedia.org/wiki/Python_(langage)',
+          language_code: 'gsw',
+          edition_code: 'als',
+          title: 'Python (Programmiersprache)',
+          url: 'https://als.wikipedia.org/wiki/Python_(Programmiersprache)',
         },
       ],
       total_languages: 1,
     };
     const blocks = wikipediaGetLanguages.format!(output);
     const text = blocks.map((b) => (b.type === 'text' ? b.text : '')).join('');
-    expect(text).toContain('fr');
-    expect(text).toContain('Python (langage)');
-    expect(text).toContain('https://fr.wikipedia.org');
+    expect(text).toContain('gsw');
+    expect(text).toContain('als');
+    expect(text).toContain('Python (Programmiersprache)');
+    expect(text).toContain('https://als.wikipedia.org');
     expect(text).toContain('1 languages');
   });
 
@@ -105,6 +107,7 @@ describe('wikipediaGetLanguages', () => {
         languages: [
           {
             languageCode: 'ja',
+            editionCode: 'ja',
             title: 'パイソン (プログラミング言語)',
             url: 'https://ja.wikipedia.org/wiki/%E3%83%91%E3%82%A4%E3%82%BD%E3%83%B3',
           },
@@ -118,8 +121,40 @@ describe('wikipediaGetLanguages', () => {
 
     expect(result.languages[0]).toEqual({
       language_code: 'ja',
+      edition_code: 'ja',
       title: 'パイソン (プログラミング言語)',
       url: 'https://ja.wikipedia.org/wiki/%E3%83%91%E3%82%A4%E3%82%BD%E3%83%B3',
+    });
+  });
+
+  it('surfaces edition_code distinct from language_code (issue #17)', async () => {
+    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+      getLanguages: vi.fn().mockResolvedValue({
+        languages: [
+          {
+            languageCode: 'gsw',
+            editionCode: 'als',
+            title: 'Python (Programmiersprache)',
+            url: 'https://als.wikipedia.org/wiki/Python_(Programmiersprache)',
+          },
+        ],
+      }),
+    } as unknown as svcModule.WikipediaService);
+
+    const ctx = createMockContext();
+    const input = wikipediaGetLanguages.input.parse({ title: 'Python (programming language)' });
+    const result = await wikipediaGetLanguages.handler(input, ctx);
+
+    // The subdomain ("als"), not the language code ("gsw"), is the value usable as `language`.
+    expect(result.languages[0]?.language_code).toBe('gsw');
+    expect(result.languages[0]?.edition_code).toBe('als');
+  });
+
+  it('throws invalid_language with data.reason for a nonexistent edition (issue #18)', async () => {
+    const ctx = createMockContext({ errors: wikipediaGetLanguages.errors });
+    const input = wikipediaGetLanguages.input.parse({ title: 'Python', language: 'zz' });
+    await expect(wikipediaGetLanguages.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'invalid_language' },
     });
   });
 
@@ -168,6 +203,7 @@ describe('wikipediaGetLanguages', () => {
       languages: [
         {
           language_code: 'fr',
+          edition_code: 'fr',
           title: 'Python (langage)',
           url: 'https://fr.wikipedia.org/wiki/Python',
         },

@@ -24,6 +24,6 @@ await createApp({
   landing: { requireAuth: false },
   setup(core) {
     const serverConfig = getServerConfig();
-    initWikipediaService(core.config, core.storage, serverConfig.userAgent);
+    initWikipediaService(core.config, core.storage, serverConfig.userAgent, serverConfig.baseUrl);
   },
 });
