@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.11](changelog/0.1.x/0.1.11.md) — 2026-07-16
+
+Wire WIKIPEDIA_BASE_URL as an optional single-instance override; add edition_code to wikipedia_get_languages; populate invalid_language data.reason for nonexistent editions; adopt mcp-ts-core ^0.10.14
+
 ## [0.1.10](changelog/0.1.x/0.1.10.md) — 2026-06-20
 
 Adopt mcp-ts-core ^0.10.9; sync framework devcheck scripts and vendored skills — plugin-manifest packaging lint and a floating-dependency-specifier guard
