@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.13](changelog/0.1.x/0.1.13.md) — 2026-07-16
+
+Add wikipedia_search offset pagination and wikipedia_get_article overflow-outline (WIKIPEDIA_ARTICLE_OVERFLOW_BYTES); fix pageid field wording that implied page IDs are tool inputs
+
 ## [0.1.12](changelog/0.1.x/0.1.12.md) — 2026-07-16
 
 Resolve redirects in get_article/get_sections like get_summary; migrate get_sections to prop=tocdata; reject blank titles with typed not_found across four tools
