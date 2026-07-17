@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.12](changelog/0.1.x/0.1.12.md) — 2026-07-16
+
+Resolve redirects in get_article/get_sections like get_summary; migrate get_sections to prop=tocdata; reject blank titles with typed not_found across four tools
+
 ## [0.1.11](changelog/0.1.x/0.1.11.md) — 2026-07-16
 
 Wire WIKIPEDIA_BASE_URL as an optional single-instance override; add edition_code to wikipedia_get_languages; populate invalid_language data.reason for nonexistent editions; adopt mcp-ts-core ^0.10.14
