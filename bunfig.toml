@@ -8,3 +8,8 @@
 minimumReleaseAge = 259200 # seconds (3 days)
 # Framework releases are first-party — adopt them same-day.
 minimumReleaseAgeExcludes = ["@cyanheads/mcp-ts-core"]
+
+[install.security]
+# Socket scans every package before install (malware, typosquats, CVEs).
+# Note: configuring a scanner disables Bun's auto-install.
+scanner = "@socketsecurity/bun-security-scanner"
