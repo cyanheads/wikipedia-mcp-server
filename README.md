@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.14-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/wikipedia-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/wikipedia-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/wikipedia-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.1.15-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/wikipedia-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/wikipedia-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/wikipedia-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -61,8 +61,8 @@ Fetch the lead-section summary for a Wikipedia article.
 Fetch article content as clean plain text.
 
 - Without `section_index`: returns the full article with `== Section ==` markers — unless it exceeds `WIKIPEDIA_ARTICLE_OVERFLOW_BYTES` (default 80 KB), in which case it returns a compact section outline (`truncated: true`) pointing to `wikipedia_get_sections` plus a `section_index` read
-- With `section_index` (from `wikipedia_get_sections`): returns just that section (1–10 KB)
-- Section path uses wikitext stripping via `wtf_wikipedia`
+- With `section_index` (from `wikipedia_get_sections`): returns that section together with every subsection nested under it, each heading above its own body
+- Data tables and figures are omitted from both paths, so a section whose body is entirely a data table returns its heading and little else. Tables used only for layout — multi-column lists, succession boxes — keep their content
 - Redirect pages followed automatically
 
 ---
@@ -111,7 +111,7 @@ Wikipedia-specific:
 
 - Dual API integration — MediaWiki REST API (`/api/rest_v1/`) for summaries, Action API (`/w/api.php`) for search, full text, sections, geo search, and language links
 - Retry and backoff on all requests; `User-Agent` header per Wikimedia API policy
-- Wikitext stripping pipeline via `wtf_wikipedia` — handles links, templates, refs, bold/italic; re-injects section headings for structure
+- Both read paths render to the same plain-text shape — `== Heading ==` markers, one list item per line — the full article from Action API extracts, a section from the parser's own HTML for that section. A section read additionally keeps code-sample indentation and the lists inside layout tables, neither of which the extract carries
 - Per-call `language` parameter on every tool — all Wikipedia language editions accessible in a single session
 - Language validation against a live edition registry built from the MediaWiki `action=sitematrix` endpoint (cached 24h) — catches structurally valid but nonexistent editions before they cause timeouts
 
@@ -221,7 +221,7 @@ cp .env.example .env
 
 | Variable | Description | Default |
 |:---------|:------------|:--------|
-| `WIKIPEDIA_USER_AGENT` | User-Agent header sent with every Wikimedia API request. Customize for your deployment. | `wikipedia-mcp-server/0.1.14 (https://github.com/cyanheads/wikipedia-mcp-server)` |
+| `WIKIPEDIA_USER_AGENT` | User-Agent header sent with every Wikimedia API request. Customize for your deployment. | `wikipedia-mcp-server/0.1.15 (https://github.com/cyanheads/wikipedia-mcp-server)` |
 | `WIKIPEDIA_BASE_URL` | Optional single-instance override. Unset (default): compose per-language hosts, `language` selects the edition per call. Set to a full base URL (e.g. a private MediaWiki mirror): route every call at that one fixed host — `language` no longer varies it. | *(unset)* |
 | `WIKIPEDIA_ARTICLE_OVERFLOW_BYTES` | Byte budget above which a full-article read (`wikipedia_get_article` without `section_index`) returns a section outline instead of the full text. Tuned for this domain — ordinary articles stay whole; only genuine mega-articles (World War II ~86 KB, United States ~94 KB) outline. Section-targeted reads are never affected. | `80000` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |

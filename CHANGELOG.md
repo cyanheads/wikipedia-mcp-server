@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.15](changelog/0.1.x/0.1.15.md) — 2026-07-29
+
+Section-targeted reads now render the parser's HTML instead of wikitext, fixing hoisted headings, dropped inline templates, emptied layout-table sections, and duplicated math formulas; drops the wtf_wikipedia dependency
+
 ## [0.1.14](changelog/0.1.x/0.1.14.md) — 2026-07-29
 
 Replace the hardcoded 227-code edition allowlist with a live sitematrix registry, fixing wrong-host langlinks, unresolved redirects in get_languages, and simple.wikipedia.org rejection; raise search_nearby limits to upstream bounds
