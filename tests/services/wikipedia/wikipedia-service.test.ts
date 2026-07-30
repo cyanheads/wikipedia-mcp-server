@@ -1712,6 +1712,161 @@ const CALCULATOR_GADGET_HTML = `<div class="mw-heading mw-heading3"><h3 id="Opti
 <p>The bubble sort algorithm can be optimized by observing that the n-th pass finds the n-th largest element.
 </p>`;
 
+/**
+ * Fixture shaped like `Barack Obama`'s `External links` section: `{{Library resources box}}` and
+ * `{{Sister project links}}` — both `<div class="side-box metadata …">`, which the `<table>` rule
+ * never reached — then `{{Spoken Wikipedia}}`, which carries neither `metadata` nor `side-box`. The
+ * section's own content is the `Official` subsection below all three.
+ */
+const SIDE_BOX_SECTION_HTML = `<div class="mw-content-ltr mw-parser-output" lang="en" dir="ltr">
+<div class="mw-heading mw-heading2"><h2 id="External_links">External links</h2></div>
+<div class="side-box metadata side-box-right"><style data-mw-deduplicate="TemplateStyles:r1126788409">.mw-parser-output .plainlist ol{list-style:none}</style>
+<div class="side-box-abovebelow">
+<a href="/wiki/Wikipedia:The_Wikipedia_Library" title="Wikipedia:The Wikipedia Library">Library resources</a> about <br /> <b>Barack Obama</b> <hr /></div>
+<div class="side-box-flex">
+<div class="side-box-text plainlist"><ul><li><a class="external text" href="https://ftl.toolforge.org/x?st=viaf">Online books</a></li>
+<li><a class="external text" href="https://ftl.toolforge.org/y?st=viaf">Resources in your library</a></li></ul></div></div>
+<div class="side-box-abovebelow"><b>By Barack Obama</b>
+<div class="plainlist"><ul><li><a class="external text" href="https://ftl.toolforge.org/z?at=viaf">Online books</a></li></ul></div></div>
+</div>
+<div role="navigation" aria-labelledby="sister-projects" class="side-box metadata side-box-right sister-box sistersitebox plainlinks">
+<div class="side-box-abovebelow">
+<b>Barack Obama</b>  at Wikipedia's <a href="/wiki/Wikipedia:Wikimedia_sister_projects" title="Wikipedia:Wikimedia sister projects"><span id="sister-projects">sister projects</span></a></div>
+<div class="side-box-flex">
+<div class="side-box-text plainlist"><ul><li><span class="sister-link"><a href="https://commons.wikimedia.org/wiki/Barack_Obama" class="extiw" title="c:Barack Obama">Media</a> from Commons</span></li><li><span class="sister-link"><a href="https://www.wikidata.org/wiki/Q76" class="extiw" title="d:Q76">Data</a> from Wikidata</span></li></ul></div></div>
+</div>
+<div class="spoken-wikipedia noprint haudio"><div class="spoken-wikipedia-header"><span class="spoken-wikipedia-listen-to">Listen to this article</span><br />(3&#160;parts, <span class="duration"><span class="h">2</span> hours and <span class="min">11</span> minutes</span>)</div><div class="spoken-wikipedia-files">
+<ol><li><span typeof="mw:File"><span><audio id="mwe_player_2" controls="" preload="none" class="mw-file-element"><source src="//upload.wikimedia.org/wikipedia/commons/2/22/En-Barack_Obama_1of3-article.ogg" type="audio/ogg" /></audio></span></span></li></ol>
+</div><div class="spoken-wikipedia-disclaimer">These audio files were created from a revision of this article dated 3&#160;July&#160;2026<span style="display: none;">&#160;(<span class="bday dtstart published updated itvstart">2026-07-03</span>)</span>, and do not reflect subsequent edits.</div><div class="spoken-wikipedia-footer">(<a href="/wiki/Wikipedia:Media_help" class="mw-redirect" title="Wikipedia:Media help">Audio help</a>&#160;· <a href="/wiki/Wikipedia:Spoken_articles" title="Wikipedia:Spoken articles">More spoken articles</a>)</div></div>
+<div class="mw-heading mw-heading3"><h3 id="Official">Official</h3></div>
+<ul><li><span class="official-website"><span class="url"><a rel="nofollow" class="external text" href="https://www.obama.org/">Official website</a> of The Obama Foundation</span></span></li></ul></div>`;
+
+describe('htmlSectionToPlainText — side boxes and furniture bars (issue #34)', () => {
+  const text = htmlSectionToPlainText(SIDE_BOX_SECTION_HTML);
+
+  it('leaves the section with its heading and its own content only', () => {
+    expect(text).toBe(
+      '== External links ==\n\n=== Official ===\n\nOfficial website of The Obama Foundation',
+    );
+  });
+
+  it('drops the library-resources side box, labels and all', () => {
+    for (const label of [
+      'Library resources',
+      'Online books',
+      'Resources in your library',
+      'By Barack Obama',
+    ]) {
+      expect(text).not.toContain(label);
+    }
+  });
+
+  it('drops the sister-projects side box', () => {
+    for (const label of [
+      "at Wikipedia's sister projects",
+      'Media from Commons',
+      'Data from Wikidata',
+    ]) {
+      expect(text).not.toContain(label);
+    }
+  });
+
+  it('drops the spoken-article box, which asserts a recording plain text cannot reach', () => {
+    for (const label of [
+      'Listen to this article',
+      'hours and',
+      'do not reflect subsequent edits',
+      'More spoken articles',
+    ]) {
+      expect(text).not.toContain(label);
+    }
+  });
+
+  it('drops a portal bar and a sister bar, which carry the marker with role="navigation"', () => {
+    const bars = `<p>Body.</p><div class="portal-bar noprint metadata noviewer portal-bar-bordered" role="navigation" aria-label="Portals"><span class="portal-bar-header"><a href="/wiki/Wikipedia:Contents/Portals" title="Wikipedia:Contents/Portals">Portals</a>:</span><ul class="portal-bar-content"><li class="portal-bar-item"><a href="/wiki/Portal:Cities" title="Portal:Cities">Cities</a></li></ul></div><div class="noprint metadata sister-bar" role="navigation" aria-label="sister-projects"><div class="sister-bar-header"><b>Mathematics</b> at Wikipedia's sister projects:</div><ul class="sister-bar-content"><li class="sister-bar-item"><span class="sister-bar-link"><a href="https://en.wiktionary.org/wiki/x" class="extiw" title="wikt:x"><b>Definitions</b></a> from Wiktionary</span></li></ul></div>`;
+    expect(htmlSectionToPlainText(bars)).toBe('Body.');
+  });
+
+  it('drops a maintenance banner emitted as a div, not only the table form', () => {
+    // English Wikipedia's ambox family is a `role="presentation"` table the table rule already
+    // dropped; several other editions emit the same banner as a `<div>`.
+    const divAmbox = `<p>Lead.</p><div class="mbox-Нет_источников plainlinks metadata ambox ambox-content"><div class="mbox-text"><div class="mbox-text-div">В статье <b>не хватает ссылок на источники</b>.</div><div class="mbox-textsmall-div hide-when-compact"><span class="hide-when-compact"> Информация должна быть проверяема.</span> <span class="mbox-date"><i>(<span class="date">17 декабря 2024</span>)</i></span></div></div></div><p>Trailing.</p>`;
+    expect(htmlSectionToPlainText(divAmbox)).toBe('Lead.\n\nTrailing.');
+  });
+
+  it('keeps a hatnote that carries the marker, which names an article to read next', () => {
+    // French Wikipedia's `{{Article détaillé}}` — the counterpart of English Wikipedia's `{{Main}}` —
+    // is a `bandeau-container` carrying `metadata`, so dropping every element with the marker would
+    // delete the pointer. `fr:Paris` alone has 46 of them.
+    const detail = `<div class="bandeau-container bandeau-section metadata bandeau-niveau-information"><div class="bandeau-cell bandeau-icone-css loupe">Article détaillé&#160;: <a href="/wiki/Plans_de_Paris" title="Plans de Paris">Plans de Paris</a>.</div></div>
+<p>Au milieu du Bassin parisien, deux îles sur la Seine constituent le cœur historique de Paris.</p>`;
+    expect(htmlSectionToPlainText(detail)).toBe(
+      'Article détaillé : Plans de Paris.\n\nAu milieu du Bassin parisien, deux îles sur la Seine constituent le cœur historique de Paris.',
+    );
+  });
+
+  it('keeps a side box without the marker, whose captions are the article describing a recording', () => {
+    // `{{Listen}}` is `class="side-box side-box-right listen noprint"` with no `metadata`, and its
+    // captions are prose about the audio, so the marker is what separates the two side-box uses.
+    const listen = `<div class="side-box side-box-right listen noprint">
+<div class="side-box-flex">
+<div class="side-box-text plainlist"><div class="haudio">
+<div class="listen-file-header"><a href="/wiki/File:Taylor_Swift_-_Our_Song.ogg" title="File:Taylor Swift - Our Song.ogg">"Our Song" (2006)</a></div>
+<div class="description">Swift sings with a <a href="/wiki/Southern_American_English" title="Southern American English">Southern</a> accent in "Our Song".</div></div></div></div>
+</div>`;
+    const rendered = htmlSectionToPlainText(listen);
+    expect(rendered).toContain('"Our Song" (2006)');
+    expect(rendered).toContain('Swift sings with a Southern accent in "Our Song".');
+  });
+
+  it('keeps content beside a side box nested inside a layout table', () => {
+    // A dropped element inside a kept one: the walk enters the layout table, then removes only the
+    // side box's own subtree.
+    const nested = `<table role="presentation"><tbody><tr><td><ul><li>keep me</li></ul><div class="side-box metadata side-box-right"><div class="side-box-abovebelow">Library resources</div><div class="side-box-text"><ul><li>Online books</li></ul></div></div><p>keep me too</p></td></tr></tbody></table>`;
+    const rendered = htmlSectionToPlainText(nested);
+    expect(rendered).toBe('keep me\n\nkeep me too');
+    expect(rendered).not.toContain('Library resources');
+    expect(rendered).not.toContain('Online books');
+  });
+
+  it('drops a layout table nested inside a side box along with its parent', () => {
+    // The reverse nesting: a kept-by-its-own-rule element inside a dropped one goes with the box,
+    // because the box's whole body is furniture.
+    const nested = `<p>Lead.</p><div class="side-box metadata side-box-right"><div class="side-box-text"><table role="presentation"><tbody><tr><td><ul><li>Online books</li></ul></td></tr></tbody></table></div></div><p>After.</p>`;
+    const rendered = htmlSectionToPlainText(nested);
+    expect(rendered).toBe('Lead.\n\nAfter.');
+    expect(rendered).not.toContain('Online books');
+  });
+
+  it('consumes the whole side box, not up to the first nested close tag', () => {
+    // Every real side box wraps its body in `side-box-abovebelow`/`side-box-flex` divs. A non-greedy
+    // match would end the box at the first inner `</div>` and spill the rest into the prose.
+    const sameTag = `<p>Before.</p><div class="side-box metadata side-box-right"><div>inner one</div><div>inner two</div>trailing box text</div><p>After.</p>`;
+    expect(htmlSectionToPlainText(sameTag)).toBe('Before.\n\nAfter.');
+  });
+
+  it('drops an unclosed side box through to the end of the payload', () => {
+    // Same contract the table rule already has: an unclosed element runs to the end rather than
+    // leaving the walk to guess where it stopped.
+    expect(
+      htmlSectionToPlainText('<p>Before.</p><div class="side-box metadata"><p>Library resources'),
+    ).toBe('Before.');
+  });
+
+  it('does not treat a void element carrying the marker as a container', () => {
+    // A nesting walk started from a void tag would find no close and delete the rest of the payload.
+    expect(
+      htmlSectionToPlainText('<p>Before.</p><img class="side-box metadata" src="x"><p>After.</p>'),
+    ).toBe('Before.\n\nAfter.');
+  });
+
+  it('still keeps a layout table that carries neither the marker nor a box class', () => {
+    expect(htmlSectionToPlainText(LAYOUT_TABLE_HTML)).toBe(
+      '== Discography ==\n\nMain article: D\n\nStudio albums\n\nOne (2006)\nTwo (2008)\n\nRe-recorded albums\n\nThree (2021)',
+    );
+  });
+});
+
 describe('htmlSectionToPlainText — elements the page hides (issue #33)', () => {
   it('renders each formula exactly once, as the TeX the fallback image carries', () => {
     const text = htmlSectionToPlainText(DISPLAY_MATH_HTML);

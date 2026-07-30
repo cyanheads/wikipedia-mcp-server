@@ -56,12 +56,52 @@ const PRESENTATION_ROLE = /\brole\s*=\s*"presentation"/i;
  * (`{{Update}}` and the rest of the ambox family) are `role="presentation"` tables carrying it, so
  * the marker is what separates a layout table wrapping real prose from one wrapping an editor
  * notice about the article.
+ *
+ * On its own it does not establish that an element is furniture — see {@link isFurniture}.
  */
 const NOT_CONTENT = /\bclass\s*=\s*"[^"]*\bmetadata\b/i;
 
 /** Whether a table lays out article content, and so must survive rather than be dropped. */
 function isLayoutTable(openTag: string): boolean {
   return PRESENTATION_ROLE.test(openTag) && !NOT_CONTENT.test(openTag);
+}
+
+/** The parser's marker for an element that points elsewhere rather than carrying prose. */
+const NAVIGATION_ROLE = /\brole\s*=\s*"navigation"/i;
+
+/**
+ * Container families whose entire body is furniture, on whatever tag they are emitted.
+ *
+ * `side-box` is the `{{Side box}}` family — `{{Library resources box}}`, `{{Sister project links}}`,
+ * `{{Portal}}` — a `<div>` the `<table>` rule never reaches. `ambox` is the maintenance-banner
+ * family, which several editions emit as a `<div>` where English Wikipedia emits a
+ * `role="presentation"` table the existing rule already drops.
+ *
+ * Both are read only together with {@link NOT_CONTENT}, which is what keeps `{{Listen}}` — a side box
+ * without the marker — whose captions describe the recording in the article's own voice and are
+ * prose, not chrome.
+ */
+const FURNITURE_BOX = /\bclass\s*=\s*"[^"]*\b(?:side-box|ambox)\b/i;
+
+/**
+ * Whether an element is page furniture, judged from its open tag whatever its tag name.
+ *
+ * {@link NOT_CONTENT} alone does not decide this. French Wikipedia's `{{Article détaillé}}` — the
+ * pointer to the fuller article on a subtopic, the counterpart of English Wikipedia's `{{Main}}` — is
+ * `<div class="bandeau-container bandeau-section metadata bandeau-niveau-information">`, so the marker
+ * also sits on links a reader is meant to follow. `fr:Paris` carries 46 of those against 7
+ * maintenance banners of the same `bandeau-container … metadata` shape, so dropping every element
+ * carrying the marker deletes several times more content there than furniture.
+ *
+ * What the furniture has in common is that the marker sits on a self-contained box or bar rather than
+ * on an inline pointer: one of the {@link FURNITURE_BOX} families, or an element the page marks
+ * `role="navigation"` (`{{Portal bar}}`, `{{Sister bar}}`, the sister-project boxes). A hatnote is
+ * `role="note"` and keeps its text either way.
+ */
+function isFurniture(openTag: string): boolean {
+  return (
+    NOT_CONTENT.test(openTag) && (FURNITURE_BOX.test(openTag) || NAVIGATION_ROLE.test(openTag))
+  );
 }
 
 /** An element MediaWiki hides from the rendered page with an inline style. */
@@ -73,18 +113,24 @@ const HIDDEN_BY_STYLE = /\bstyle\s*=\s*"[^"]*display\s*:\s*none/i;
  *
  * `figure` goes because the plain-text conventions of the full-article extract path drop it too.
  * `table` goes unless {@link isLayoutTable} — a layout table wraps ordinary lists and paragraphs,
- * so dropping it takes real prose with it. The rest are artifacts of asking the parser for one
- * section in isolation: for a section that cites something, `sup.reference` is the `[1]` footnote
- * marker whose target is not in the payload, `ol.references` is the reference list the parser
- * appends after the content, and `span.mw-ext-cite-error` is its complaint that the article's
- * `<references/>` tag lives in a section this payload does not contain. A section citing nothing
- * carries none of the three.
+ * so dropping it takes real prose with it. `div.spoken-wikipedia` is `{{Spoken Wikipedia}}`, whose
+ * body is a duration, the revision date the recording was read from, and a disclaimer that later
+ * edits are not reflected — claims about the article rather than any of its content, and the audio
+ * itself is not reachable from plain text. It carries neither the `metadata` marker nor `side-box`,
+ * so {@link isFurniture} does not reach it.
+ *
+ * The rest are artifacts of asking the parser for one section in isolation: for a section that cites
+ * something, `sup.reference` is the `[1]` footnote marker whose target is not in the payload,
+ * `ol.references` is the reference list the parser appends after the content, and
+ * `span.mw-ext-cite-error` is its complaint that the article's `<references/>` tag lives in a section
+ * this payload does not contain. A section citing nothing carries none of the three.
  */
 const DROP_RULES: Readonly<Record<string, (openTag: string) => boolean>> = {
   style: () => true,
   script: () => true,
   figure: () => true,
   table: (openTag) => !isLayoutTable(openTag),
+  div: hasClass('spoken-wikipedia'),
   sup: hasClass('reference'),
   ol: hasClass('references'),
   span: hasClass('mw-ext-cite-error'),
@@ -165,10 +211,15 @@ function elementEnd(html: string, tagName: string, from: number): number {
  * The hidden-element test comes first and is tag-agnostic: MediaWiki hides screen-reader MathML and
  * unrendered gadget chrome behind an inline `display:none` on whatever element wraps them, so an
  * enumeration of gadget class names would keep needing new entries. Whatever the page does not
- * render is not content.
+ * render is not content. {@link isFurniture} is tag-agnostic for the same reason — the box families
+ * it names are emitted as a `<div>` on one edition and a `<table>` on another.
  */
 function isDropped(openTag: string, tagName: string): boolean {
-  return HIDDEN_BY_STYLE.test(openTag) || (DROP_RULES[tagName]?.(openTag) ?? false);
+  return (
+    HIDDEN_BY_STYLE.test(openTag) ||
+    isFurniture(openTag) ||
+    (DROP_RULES[tagName]?.(openTag) ?? false)
+  );
 }
 
 /**
