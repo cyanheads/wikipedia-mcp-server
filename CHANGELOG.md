@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.14](changelog/0.1.x/0.1.14.md) — 2026-07-29
+
+Replace the hardcoded 227-code edition allowlist with a live sitematrix registry, fixing wrong-host langlinks, unresolved redirects in get_languages, and simple.wikipedia.org rejection; raise search_nearby limits to upstream bounds
+
 ## [0.1.13](changelog/0.1.x/0.1.13.md) — 2026-07-16
 
 Add wikipedia_search offset pagination and wikipedia_get_article overflow-outline (WIKIPEDIA_ARTICLE_OVERFLOW_BYTES); fix pageid field wording that implied page IDs are tool inputs
