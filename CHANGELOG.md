@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.16](changelog/0.1.x/0.1.16.md) — 2026-07-29
+
+Section-targeted reads no longer render sister-project, library-resource, portal-bar, and spoken-article boxes as prose
+
 ## [0.1.15](changelog/0.1.x/0.1.15.md) — 2026-07-29
 
 Section-targeted reads now render the parser's HTML instead of wikitext, fixing hoisted headings, dropped inline templates, emptied layout-table sections, and duplicated math formulas; drops the wtf_wikipedia dependency
