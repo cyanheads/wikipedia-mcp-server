@@ -5,7 +5,20 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { getWikipediaService, isUnknownEdition } from '@/services/wikipedia/wikipedia-service.js';
+import {
+  GEOSEARCH_MAX_LIMIT,
+  GEOSEARCH_MAX_RADIUS_METERS,
+  GEOSEARCH_MIN_RADIUS_METERS,
+  getWikipediaService,
+  isMalformedLanguage,
+} from '@/services/wikipedia/wikipedia-service.js';
+
+/**
+ * Truncation guidance for a list with no pagination behind it. MediaWiki's geosearch module has no
+ * `offset` or `continue`, and this tool has no filter parameters, so the only routes to the omitted
+ * articles are a higher `limit` or several narrower searches.
+ */
+const TRUNCATION_GUIDANCE = `Results were capped. Raise limit (max ${GEOSEARCH_MAX_LIMIT}) to retrieve more, or reduce radius_meters and sweep adjacent sub-areas for exhaustive coverage — geosearch offers no pagination past the limit.`;
 
 export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
   title: 'Search Wikipedia Nearby',
@@ -18,16 +31,19 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
     radius_meters: z
       .number()
       .int()
-      .min(1)
+      .min(GEOSEARCH_MIN_RADIUS_METERS)
       .default(1000)
-      .describe('Search radius in meters (default 1000, max 10000). Must be a positive integer.'),
+      .describe(
+        `Search radius in meters (default 1000, min ${GEOSEARCH_MIN_RADIUS_METERS}, max ${GEOSEARCH_MAX_RADIUS_METERS} — the MediaWiki geosearch bounds). Must be an integer; a value above the maximum is clamped to it.`,
+      ),
     limit: z
       .number()
       .int()
       .min(1)
+      .max(GEOSEARCH_MAX_LIMIT)
       .default(10)
       .describe(
-        'Maximum number of results to return (default 10, max 50). Must be a positive integer.',
+        `Maximum number of results to return (default 10, max ${GEOSEARCH_MAX_LIMIT} — the MediaWiki geosearch ceiling). Must be a positive integer. Geosearch has no pagination, so articles past this limit are only reachable by raising it or searching narrower radii.`,
       ),
     language: z
       .string()
@@ -61,14 +77,18 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
     queryLatitude: z.number().describe('Latitude used for the search.'),
     queryLongitude: z.number().describe('Longitude used for the search.'),
     radiusMetersUsed: z.number().describe('Radius in meters used for the search.'),
-    truncated: z.boolean().describe('True when results were capped at the limit.'),
+    truncated: z
+      .boolean()
+      .describe(
+        'True when more articles matched than the limit allowed. Established by probing one result past the limit, so a match count landing exactly on the limit reports false.',
+      ),
     shown: z.number().describe('Number of results returned.'),
     cap: z.number().describe('The limit that was applied.'),
     notice: z
       .string()
       .optional()
       .describe(
-        'Guidance when no geotagged articles were found — e.g. increase radius. Absent when results are returned.',
+        'Guidance when results were capped (raise limit or sweep narrower radii) or when no geotagged articles were found (increase radius). Absent when neither applies.',
       ),
   },
 
@@ -88,6 +108,8 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
   ],
 
   async handler(input, ctx) {
+    const svc = getWikipediaService();
+
     // Validate coordinate ranges
     if (input.latitude < -90 || input.latitude > 90) {
       throw ctx.fail(
@@ -107,11 +129,10 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
       );
     }
 
-    const radiusMeters = Math.min(input.radius_meters, 10_000);
-    const limit = Math.min(input.limit, 50);
-    const { language } = input;
+    const radiusMeters = Math.min(input.radius_meters, GEOSEARCH_MAX_RADIUS_METERS);
+    const { limit, language } = input;
 
-    if (!/^[a-z]{2,3}(-[a-z0-9]+)*$/i.test(language)) {
+    if (isMalformedLanguage(language)) {
       throw ctx.fail(
         'invalid_language',
         `Invalid language code "${language}". Use a BCP 47 language code such as "fr", "de", or "ja".`,
@@ -119,9 +140,9 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
       );
     }
 
-    // Reject a structurally-valid code that names no Wikipedia edition (skipped when a
-    // single-instance base-URL override is set — that host may serve any editions).
-    if (isUnknownEdition(language)) {
+    // Reject a code that names no Wikipedia edition, checked against the live sitematrix registry
+    // (skipped when a single-instance base-URL override is set — that host may serve any editions).
+    if (await svc.isUnknownEdition(language, ctx)) {
       throw ctx.fail(
         'invalid_language',
         `Language edition "${language}" does not exist on Wikipedia. Use a valid Wikipedia language code such as "fr", "de", or "ja".`,
@@ -137,8 +158,7 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
       language,
     });
 
-    const svc = getWikipediaService();
-    const { results } = await svc.searchNearby(
+    const { results, truncated } = await svc.searchNearby(
       input.latitude,
       input.longitude,
       radiusMeters,
@@ -152,8 +172,8 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
       queryLongitude: input.longitude,
       radiusMetersUsed: radiusMeters,
     });
-    if (results.length >= limit) {
-      ctx.enrich.truncated({ shown: results.length, cap: limit });
+    if (truncated) {
+      ctx.enrich.truncated({ shown: results.length, cap: limit, guidance: TRUNCATION_GUIDANCE });
     } else {
       ctx.enrich({ shown: results.length, cap: limit, truncated: false });
     }

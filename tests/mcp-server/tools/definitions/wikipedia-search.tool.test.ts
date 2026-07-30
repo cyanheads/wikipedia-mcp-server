@@ -6,15 +6,18 @@
 import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { wikipediaSearch } from '@/mcp-server/tools/definitions/wikipedia-search.tool.js';
-import * as svcModule from '@/services/wikipedia/wikipedia-service.js';
+import { mockWikipediaService } from '../../../helpers/wikipedia-service-mock.js';
 
 describe('wikipediaSearch', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    // Baseline stub so the pre-fetch edition guard resolves offline; tests that need
+    // domain methods call mockWikipediaService again with their own.
+    mockWikipediaService();
   });
 
   it('returns ranked results for a valid query', async () => {
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       search: vi.fn().mockResolvedValue({
         results: [
           {
@@ -27,7 +30,7 @@ describe('wikipediaSearch', () => {
         ],
         totalResults: 2,
       }),
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext();
     const input = wikipediaSearch.input.parse({ query: 'Python', limit: 10, language: 'en' });
@@ -45,9 +48,9 @@ describe('wikipediaSearch', () => {
   });
 
   it('returns empty results with a notice when search returns nothing', async () => {
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       search: vi.fn().mockResolvedValue({ results: [], totalResults: 0 }),
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext({ errors: wikipediaSearch.errors });
     const input = wikipediaSearch.input.parse({ query: 'xyzzy_no_match_ever_12345' });
@@ -65,9 +68,9 @@ describe('wikipediaSearch', () => {
       results: [{ title: 'Test', pageid: 1, snippet: 'A test.', wordcount: 100 }],
       totalResults: 1,
     });
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       search: searchFn,
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext();
     const input = wikipediaSearch.input.parse({ query: 'Test' });
@@ -81,9 +84,9 @@ describe('wikipediaSearch', () => {
       results: [{ title: 'T', pageid: 1, snippet: 'S', wordcount: 10 }],
       totalResults: 1,
     });
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       search: searchFn,
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext();
     const input = wikipediaSearch.input.parse({ query: 'Test', limit: 999 });
@@ -140,9 +143,9 @@ describe('wikipediaSearch', () => {
       ],
       totalResults: 1,
     });
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       search: searchFn,
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext();
     const input = wikipediaSearch.input.parse({ query: 'Python', language: 'fr' });
@@ -161,12 +164,12 @@ describe('wikipediaSearch', () => {
   });
 
   it('enrichment totalCount reflects upstream total, not result array length', async () => {
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       search: vi.fn().mockResolvedValue({
         results: [{ title: 'T', pageid: 1, snippet: 'S', wordcount: 10 }],
         totalResults: 500,
       }),
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext();
     const input = wikipediaSearch.input.parse({ query: 'test', limit: 1 });
@@ -178,9 +181,9 @@ describe('wikipediaSearch', () => {
 
   it('handles unicode query without error', async () => {
     const searchFn = vi.fn().mockResolvedValue({ results: [], totalResults: 0 });
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       search: searchFn,
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext({ errors: wikipediaSearch.errors });
     const input = wikipediaSearch.input.parse({ query: '東京タワー' });
@@ -208,9 +211,9 @@ describe('wikipediaSearch', () => {
   });
 
   it('service error propagates without swallowing', async () => {
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       search: vi.fn().mockRejectedValue(new Error('Network error')),
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext({ errors: wikipediaSearch.errors });
     const input = wikipediaSearch.input.parse({ query: 'Python' });
@@ -223,9 +226,9 @@ describe('wikipediaSearch', () => {
       totalResults: 42,
       nextOffset: 10,
     });
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       search: searchFn,
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext();
     const input = wikipediaSearch.input.parse({ query: 'Python', limit: 5, offset: 5 });
@@ -254,9 +257,9 @@ describe('wikipediaSearch', () => {
           ? Promise.resolve({ results: page1, totalResults: 4, nextOffset: 2 })
           : Promise.resolve({ results: page2, totalResults: 4, nextOffset: undefined }),
       );
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       search: searchFn,
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx1 = createMockContext();
     const r1 = await wikipediaSearch.handler(
@@ -277,13 +280,13 @@ describe('wikipediaSearch', () => {
   });
 
   it('omits nextOffset at the end of the result set (issue #22)', async () => {
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       search: vi.fn().mockResolvedValue({
         results: [{ title: 'Last', pageid: 9, snippet: 'S', wordcount: 10 }],
         totalResults: 6,
         nextOffset: undefined,
       }),
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext();
     const input = wikipediaSearch.input.parse({ query: 'Python', offset: 5 });
@@ -295,9 +298,9 @@ describe('wikipediaSearch', () => {
   });
 
   it('returns an empty array with an end-of-results notice when offset is past the end (issue #22)', async () => {
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       search: vi.fn().mockResolvedValue({ results: [], totalResults: 12, nextOffset: undefined }),
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext({ errors: wikipediaSearch.errors });
     const input = wikipediaSearch.input.parse({ query: 'Python', offset: 9999 });
@@ -315,9 +318,9 @@ describe('wikipediaSearch', () => {
       totalResults: 1,
       nextOffset: undefined,
     });
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       search: searchFn,
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext();
     const input = wikipediaSearch.input.parse({ query: 'Test' });

@@ -13,7 +13,7 @@ import {
 } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import type { RequestContextLike } from '@cyanheads/mcp-ts-core/utils';
-import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
+import { fetchWithTimeout, logger, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import wtf from 'wtf_wikipedia';
 import type {
   ActionExtractsRaw,
@@ -23,6 +23,8 @@ import type {
   ActionSectionsRaw,
   ActionWikitextRaw,
   RestSummaryRaw,
+  SiteMatrixLanguage,
+  SiteMatrixRaw,
 } from './types.js';
 
 // ---------------------------------------------------------------------------
@@ -122,12 +124,36 @@ function stripSnippetHtml(html: string): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Known Wikipedia language edition codes (subdomains that exist as wikipedia.org editions).
- * Sourced from https://meta.wikimedia.org/wiki/List_of_Wikipedias — stable set of ~300 codes.
- * A structurally valid BCP 47 code that is NOT in this set will time out after 4 retries (~60s)
- * and leak the full API URL in the error message, so we validate eagerly.
+ * Shape a `language` input must have before any edition lookup is attempted. The first subtag spans
+ * BCP 47's full 2–8 character range for a language subtag, which is also what `simple`
+ * (simple.wikipedia.org) needs — a real edition a 2–3 character bound rejects outright.
  */
-const KNOWN_WIKIPEDIA_EDITIONS = new Set([
+const STRUCTURAL_LANGUAGE_RE = /^[a-z]{2,8}(-[a-z0-9]+)*$/i;
+
+/**
+ * Report whether `language` cannot name any edition on shape alone — the cheap check a tool handler
+ * runs before {@link WikipediaService.isUnknownEdition} so a malformed code is rejected with the
+ * typed `invalid_language` contract and a "not a valid code" message, distinct from the
+ * "edition does not exist" message a well-formed but unknown code gets.
+ */
+export function isMalformedLanguage(language: string): boolean {
+  return !STRUCTURAL_LANGUAGE_RE.test(language);
+}
+
+/**
+ * Offline fallback edition subdomains — the hand-maintained allowlist this server shipped
+ * before the sitematrix registry replaced it, used only while the live registry is unavailable.
+ *
+ * It is materially incomplete (Wikipedia runs ~360 editions), which is why it is no longer the
+ * primary check. What it still buys on the degraded path is the guard's original purpose: a
+ * structurally valid but nonexistent subdomain is rejected up front instead of burning four
+ * retries and leaking the fetch URL in the error message.
+ *
+ * Entries are subdomains only. Editions whose MediaWiki language code differs from their
+ * subdomain (`gsw` → `als.wikipedia.org`) appear on the subdomain side alone, so the language-code
+ * spelling resolves only while the live registry is available.
+ */
+const FALLBACK_EDITION_SUBDOMAINS = [
   'en',
   'de',
   'fr',
@@ -268,7 +294,6 @@ const KNOWN_WIKIPEDIA_EDITIONS = new Set([
   'bo',
   'vep',
   'hak',
-  'hat',
   'se',
   'bcl',
   'km',
@@ -355,21 +380,127 @@ const KNOWN_WIKIPEDIA_EDITIONS = new Set([
   'lg',
   'pi',
   'ii',
-]);
+] as const;
+
+/** Fallback subdomain → canonical origin, for the degraded resolution path. */
+const FALLBACK_EDITION_HOSTS: ReadonlyMap<string, string> = new Map(
+  FALLBACK_EDITION_SUBDOMAINS.map((code) => [code, `https://${code}.wikipedia.org`]),
+);
 
 /**
- * Resolve the base URL for MediaWiki API calls.
+ * Every Wikipedia edition indexed by each code a caller may legitimately pass: the edition's
+ * subdomain, and its MediaWiki language code when the two differ. Both spellings map to the same
+ * canonical origin, so `als` and `gsw` alike resolve to `https://als.wikipedia.org` — which is
+ * what lets the langlinks host fallback compose a real host from a language code.
+ */
+export type EditionIndex = {
+  /** Lowercased edition code → `https://<subdomain>.wikipedia.org`. */
+  hosts: Record<string, string>;
+  /** ISO timestamp the index was built from a sitematrix response. */
+  fetchedAt: string;
+};
+
+/** How long a fetched edition index is trusted, in seconds. Editions are created rarely. */
+const EDITION_INDEX_TTL_SECONDS = 86_400;
+
+/**
+ * How long a failed index build suppresses further attempts, in milliseconds. Without it a
+ * Wikipedia outage would re-attempt the sitematrix fetch on every single call, so the guard meant
+ * to make bad input fail fast would itself become the slow path.
+ */
+const EDITION_INDEX_RETRY_AFTER_FAILURE_MS = 60_000;
+
+/** Storage key for the cached index. The framework key validator rejects `:` separators. */
+const EDITION_INDEX_STORAGE_KEY = 'wikipedia/edition-index';
+
+/** Host the sitematrix is always read from — the endpoint is replicated across every edition. */
+const SITEMATRIX_HOST = 'https://en.wikipedia.org';
+
+/**
+ * Upstream ceiling for `list=geosearch`'s `gslimit`, per `action=paraminfo`. The module's
+ * `highmax` of 5000 requires the `apihighlimits` right, which an anonymous caller never has, so
+ * 500 is the real bound.
+ */
+export const GEOSEARCH_MAX_LIMIT = 500;
+
+/**
+ * Bounds `action=paraminfo` reports for `list=geosearch`'s `gsradius`. Below the floor upstream
+ * answers `outofrange` rather than an empty result, so the floor is enforced at the tool's schema;
+ * above the ceiling the radius is clamped, which keeps a working over-wide call working.
+ */
+export const GEOSEARCH_MIN_RADIUS_METERS = 10;
+export const GEOSEARCH_MAX_RADIUS_METERS = 10_000;
+
+function assertStructuralLanguage(language: string): void {
+  if (isMalformedLanguage(language)) {
+    throw validationError(
+      `Invalid language code "${language}". Use a BCP 47 language code such as "fr", "de", or "ja".`,
+      { recovery: { hint: 'Use a valid BCP 47 language code such as "fr", "de", or "ja".' } },
+    );
+  }
+}
+
+function unknownEditionError(language: string): McpError {
+  return validationError(
+    `Language edition "${language}" does not exist on Wikipedia. Use a valid Wikipedia language code such as "fr", "de", or "ja".`,
+    {
+      language,
+      recovery: {
+        hint: 'Use a Wikipedia language code that has an active edition, such as "fr", "de", or "ja".',
+      },
+    },
+  );
+}
+
+/**
+ * Build an {@link EditionIndex} from an `action=sitematrix` response.
+ *
+ * Pure and exported for unit testing. Closed editions are kept: a closed wiki is read-only, not
+ * gone — `aa.wikipedia.org` still answers, and dropping them would newly reject codes that work.
+ * Subdomains are indexed first so a language code can never displace a real subdomain's host.
+ */
+export function parseSiteMatrix(raw: SiteMatrixRaw): EditionIndex {
+  const editions: Array<{ subdomain: string; code: string | undefined; origin: string }> = [];
+
+  for (const [key, value] of Object.entries(raw.sitematrix ?? {})) {
+    // Languages live under numeric-string keys; `count` (a number) is a sibling of them.
+    if (!/^\d+$/.test(key) || typeof value !== 'object' || value === null) continue;
+    const language = value as SiteMatrixLanguage;
+    const wiki = language.site?.find((site) => site.code === 'wiki');
+    if (!wiki?.url) continue;
+    try {
+      const { origin, hostname } = new URL(wiki.url);
+      const subdomain = hostname.split('.')[0];
+      if (subdomain) editions.push({ subdomain, code: language.code, origin });
+    } catch {
+      // A malformed url for one language must not discard the rest of the matrix.
+    }
+  }
+
+  const hosts: Record<string, string> = {};
+  for (const { subdomain, origin } of editions) hosts[subdomain.toLowerCase()] = origin;
+  for (const { code, origin } of editions) if (code) hosts[code.toLowerCase()] ??= origin;
+
+  if (Object.keys(hosts).length === 0) {
+    throw serviceUnavailable('Wikipedia sitematrix response listed no language editions.');
+  }
+  return { hosts, fetchedAt: new Date().toISOString() };
+}
+
+/**
+ * Resolve the base URL for MediaWiki API calls from the offline fallback set.
  *
  * With a single-instance override configured (`WIKIPEDIA_BASE_URL`), every call routes at that
  * fixed host and the per-call `language` no longer varies it — the mode for a private mirror or an
  * alternate MediaWiki instance, which may host any editions, so no Wikipedia-specific checks run.
  *
- * Without an override (the default), the host is composed per language as
- * `https://<language>.wikipedia.org` after validating the code's BCP 47 structure and that it names
- * an existing Wikipedia edition.
+ * Without an override this composes `https://<language>.wikipedia.org` after checking the code's
+ * BCP 47 structure and its membership in {@link FALLBACK_EDITION_SUBDOMAINS}. It is the degraded
+ * path only — {@link WikipediaService.resolveBaseUrl} consults the live sitematrix index first and
+ * falls back here when that index cannot be built.
  *
  * Exported for unit testing. A pure utility — it cannot call `ctx.fail`, so tool handlers
- * pre-validate (structural check, plus `isUnknownEdition` in compose mode) via
+ * pre-validate (structural check, plus `WikipediaService.isUnknownEdition` in compose mode) via
  * `ctx.fail('invalid_language', ...)` to satisfy the typed contract; the throws here are the
  * defence-in-depth fallback for direct service callers.
  */
@@ -378,40 +509,23 @@ export function buildBaseUrl(language: string, baseUrlOverride?: string): string
   if (baseUrlOverride) {
     return baseUrlOverride.replace(/\/+$/, '');
   }
-  // Structure check — must look like a BCP 47 code.
-  if (!/^[a-z]{2,3}(-[a-z0-9]+)*$/i.test(language)) {
-    throw validationError(
-      `Invalid language code "${language}". Use a BCP 47 language code such as "fr", "de", or "ja".`,
-      { recovery: { hint: 'Use a valid BCP 47 language code such as "fr", "de", or "ja".' } },
-    );
-  }
-  const normalized = language.toLowerCase();
-  // Edition check — structurally valid codes may not correspond to an existing Wikipedia edition.
-  // Without this check a non-existent subdomain causes 4 retries × 15s timeout and URL leakage.
-  if (!KNOWN_WIKIPEDIA_EDITIONS.has(normalized)) {
-    throw validationError(
-      `Language edition "${language}" does not exist on Wikipedia. Use a valid Wikipedia language code such as "fr", "de", or "ja".`,
-      {
-        language,
-        recovery: {
-          hint: 'Use a Wikipedia language code that has an active edition, such as "fr", "de", or "ja".',
-        },
-      },
-    );
-  }
-  return `https://${normalized}.wikipedia.org`;
+  assertStructuralLanguage(language);
+  const host = FALLBACK_EDITION_HOSTS.get(language.toLowerCase());
+  // Without this check a nonexistent subdomain causes 4 retries × 15s timeout and URL leakage.
+  if (!host) throw unknownEditionError(language);
+  return host;
 }
 
 /**
  * Extract the Wikipedia edition subdomain (the first host label) from an article URL — the value a
- * caller passes as `language` to other tools. Degrades to the language code if the URL cannot be
- * parsed, so a single malformed langlink never fails the whole call.
+ * caller passes as `language` to other tools. Returns `undefined` for a URL that cannot be parsed,
+ * so a single malformed langlink degrades to an omitted field rather than a guessed code.
  */
-function editionCodeFromUrl(url: string, fallbackLang: string): string {
+function editionCodeFromUrl(url: string): string | undefined {
   try {
-    return new URL(url).hostname.split('.')[0] || fallbackLang;
+    return new URL(url).hostname.split('.')[0] || undefined;
   } catch {
-    return fallbackLang;
+    return;
   }
 }
 
@@ -420,9 +534,18 @@ function editionCodeFromUrl(url: string, fallbackLang: string): string {
 // ---------------------------------------------------------------------------
 
 export class WikipediaService {
+  /** Process-local index cache, so a warm process never re-reads storage per call. */
+  private indexMemo?: { index: EditionIndex; expiresAt: number };
+
+  /** Shared in-flight build, so concurrent calls issue one sitematrix fetch between them. */
+  private indexInFlight: Promise<EditionIndex | undefined> | undefined;
+
+  /** Epoch ms until which a failed build suppresses further attempts. */
+  private indexRetryAfter = 0;
+
   constructor(
     _config: AppConfig,
-    _storage: StorageService,
+    private readonly storage: StorageService,
     private readonly userAgent: string,
     /**
      * Optional single-instance base-URL override (`WIKIPEDIA_BASE_URL`). When set, every request
@@ -439,26 +562,64 @@ export class WikipediaService {
     };
   }
 
-  /** GET from the REST API (`/api/rest_v1/`). */
-  async restGet<T>(language: string, path: string, ctx: RequestContextLike): Promise<T> {
-    const base = buildBaseUrl(language, this.baseUrl);
-    const url = `${base}/api/rest_v1${path}`;
+  /**
+   * Fetch, JSON-parse, and retry one MediaWiki endpoint.
+   *
+   * MediaWiki serves an HTML error page under rate limiting and maintenance, so a leading
+   * doctype is remapped to a retryable `serviceUnavailable` rather than a JSON parse failure.
+   */
+  private async apiGet<T>(
+    url: string,
+    operation: string,
+    apiLabel: string,
+    ctx: RequestContextLike,
+    options: { expectedStatuses?: number[]; timeoutMs?: number; maxRetries?: number } = {},
+  ): Promise<T> {
     const signal = (ctx as { signal?: AbortSignal }).signal;
     return await withRetry(
       async () => {
-        const response = await fetchWithTimeout(url, 15_000, ctx, {
+        const response = await fetchWithTimeout(url, options.timeoutMs ?? 15_000, ctx, {
           headers: this.headers(),
+          ...(options.expectedStatuses && { expectedStatuses: options.expectedStatuses }),
           ...(signal && { signal }),
         });
         const text = await response.text();
         if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
           throw serviceUnavailable(
-            'Wikipedia REST API returned HTML instead of JSON — likely rate-limited or under maintenance.',
+            `Wikipedia ${apiLabel} returned HTML instead of JSON — likely rate-limited or under maintenance.`,
           );
         }
         return JSON.parse(text) as T;
       },
-      { operation: 'WikipediaService.restGet', context: ctx, baseDelayMs: 1000 },
+      {
+        operation,
+        context: ctx,
+        baseDelayMs: 1000,
+        ...(options.maxRetries !== undefined && { maxRetries: options.maxRetries }),
+      },
+    );
+  }
+
+  /**
+   * GET from the REST API (`/api/rest_v1/`).
+   *
+   * `expectedStatuses` lists statuses the caller treats as an outcome rather than a failure — a
+   * listed status logs at `debug` instead of `error` while the thrown, status-mapped `McpError`
+   * is unchanged. `getSummary` passes `[404]` because it remaps a miss to a friendly `notFound`.
+   */
+  async restGet<T>(
+    language: string,
+    path: string,
+    ctx: RequestContextLike,
+    options: { expectedStatuses?: number[] } = {},
+  ): Promise<T> {
+    const base = await this.resolveBaseUrl(language, ctx);
+    return await this.apiGet<T>(
+      `${base}/api/rest_v1${path}`,
+      'WikipediaService.restGet',
+      'REST API',
+      ctx,
+      options,
     );
   }
 
@@ -468,26 +629,154 @@ export class WikipediaService {
     params: Record<string, string>,
     ctx: RequestContextLike,
   ): Promise<T> {
-    const base = buildBaseUrl(language, this.baseUrl);
+    const base = await this.resolveBaseUrl(language, ctx);
     const qs = new URLSearchParams({ format: 'json', formatversion: '2', ...params }).toString();
-    const url = `${base}/w/api.php?${qs}`;
-    const signal = (ctx as { signal?: AbortSignal }).signal;
-    return await withRetry(
-      async () => {
-        const response = await fetchWithTimeout(url, 15_000, ctx, {
-          headers: this.headers(),
-          ...(signal && { signal }),
-        });
-        const text = await response.text();
-        if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
-          throw serviceUnavailable(
-            'Wikipedia Action API returned HTML instead of JSON — likely rate-limited or under maintenance.',
-          );
-        }
-        return JSON.parse(text) as T;
-      },
-      { operation: 'WikipediaService.actionGet', context: ctx, baseDelayMs: 1000 },
+    return await this.apiGet<T>(
+      `${base}/w/api.php?${qs}`,
+      'WikipediaService.actionGet',
+      'Action API',
+      ctx,
     );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Edition registry
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Read the authoritative edition set from `action=sitematrix`.
+   *
+   * The network seam of the registry, kept public so tests can stub it without stubbing
+   * `actionGet` (which routes through the registry itself). Always reads `en.wikipedia.org`: the
+   * endpoint returns the whole matrix from any edition, and going through per-language resolution
+   * would recurse. Retries once rather than the default three — a caller is waiting on a guard
+   * whose value is failing fast, and the fallback set covers the miss.
+   */
+  async fetchEditionIndex(ctx: RequestContextLike): Promise<EditionIndex> {
+    const qs = new URLSearchParams({
+      action: 'sitematrix',
+      format: 'json',
+      formatversion: '2',
+      smtype: 'language',
+      smsiteprop: 'url|code',
+      smlangprop: 'code|site',
+    }).toString();
+    const raw = await this.apiGet<SiteMatrixRaw>(
+      `${SITEMATRIX_HOST}/w/api.php?${qs}`,
+      'WikipediaService.fetchEditionIndex',
+      'sitematrix API',
+      ctx,
+      { timeoutMs: 10_000, maxRetries: 1 },
+    );
+    return parseSiteMatrix(raw);
+  }
+
+  /**
+   * The live edition index, or `undefined` when it cannot be built.
+   *
+   * Reads the process memo, then the injected `StorageService`, then the sitematrix endpoint,
+   * caching each success under {@link EDITION_INDEX_TTL_SECONDS}. An `undefined` return is the
+   * signal to degrade to {@link FALLBACK_EDITION_SUBDOMAINS} — never to open the gate, and never
+   * to fail a call that would otherwise have succeeded. Returns `undefined` immediately in
+   * single-instance override mode: that host may serve any editions, so no Wikipedia edition set
+   * describes it and no sitematrix fetch is warranted.
+   */
+  private async editionIndex(ctx: RequestContextLike): Promise<EditionIndex | undefined> {
+    if (this.baseUrl) return;
+
+    const now = Date.now();
+    if (this.indexMemo && this.indexMemo.expiresAt > now) return this.indexMemo.index;
+    if (now < this.indexRetryAfter) return;
+    this.indexInFlight ??= this.buildEditionIndex(ctx).finally(() => {
+      this.indexInFlight = undefined;
+    });
+    return await this.indexInFlight;
+  }
+
+  private async buildEditionIndex(ctx: RequestContextLike): Promise<EditionIndex | undefined> {
+    try {
+      const cached = await this.storage.get<EditionIndex>(EDITION_INDEX_STORAGE_KEY, ctx);
+      if (cached?.hosts && Object.keys(cached.hosts).length > 0) {
+        this.memoize(cached);
+        return cached;
+      }
+    } catch (err) {
+      logger.warning('Wikipedia edition index unreadable from storage; refetching.', {
+        ...ctx,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    try {
+      const index = await this.fetchEditionIndex(ctx);
+      this.memoize(index);
+      await this.storage
+        .set(EDITION_INDEX_STORAGE_KEY, index, ctx, { ttl: EDITION_INDEX_TTL_SECONDS })
+        .catch((err: unknown) => {
+          logger.warning('Wikipedia edition index could not be persisted; memo only.', {
+            ...ctx,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      return index;
+    } catch (err) {
+      this.indexRetryAfter = Date.now() + EDITION_INDEX_RETRY_AFTER_FAILURE_MS;
+      logger.warning(
+        'Wikipedia sitematrix unavailable; falling back to the offline edition set, which rejects some real editions.',
+        { ...ctx, error: err instanceof Error ? err.message : String(err) },
+      );
+      return;
+    }
+  }
+
+  private memoize(index: EditionIndex): void {
+    this.indexMemo = { index, expiresAt: Date.now() + EDITION_INDEX_TTL_SECONDS * 1000 };
+    this.indexRetryAfter = 0;
+  }
+
+  /**
+   * Report whether `language` names no existing Wikipedia edition — the signal a tool handler uses
+   * to reject it with the typed `invalid_language` contract before any network call, mirroring how
+   * the structural BCP 47 check is already pre-validated in-handler.
+   *
+   * An edition answers to either spelling the registry indexes: the subdomain a caller reads off
+   * `wikipedia_get_languages`' `edition_code`, or its MediaWiki language code.
+   *
+   * Always `false` in single-instance override mode: that host may serve any editions, so the
+   * Wikipedia-specific edition set must not gate it.
+   */
+  async isUnknownEdition(language: string, ctx: RequestContextLike): Promise<boolean> {
+    if (this.baseUrl) return false;
+    if (isMalformedLanguage(language)) return true;
+    const normalized = language.toLowerCase();
+    const index = await this.editionIndex(ctx);
+    return index ? !(normalized in index.hosts) : !FALLBACK_EDITION_HOSTS.has(normalized);
+  }
+
+  /**
+   * The canonical origin serving `code`, or `undefined` when no edition is known for it — the
+   * lookup that lets a langlinks entry missing its `url` resolve a real host from its language
+   * code instead of interpolating one that may not exist.
+   */
+  async editionHost(code: string, ctx: RequestContextLike): Promise<string | undefined> {
+    const index = await this.editionIndex(ctx);
+    return index?.hosts[code.toLowerCase()];
+  }
+
+  /**
+   * The base URL every request for `language` routes at: the override when configured, otherwise
+   * the origin the live registry maps the code to, falling back to {@link buildBaseUrl}'s offline
+   * set when the registry is unavailable. Throws `invalid_language`-shaped validation errors,
+   * which tool handlers pre-empt with their own typed `ctx.fail`.
+   */
+  private async resolveBaseUrl(language: string, ctx: RequestContextLike): Promise<string> {
+    if (this.baseUrl) return this.baseUrl.replace(/\/+$/, '');
+    assertStructuralLanguage(language);
+    const index = await this.editionIndex(ctx);
+    if (!index) return buildBaseUrl(language);
+    const host = index.hosts[language.toLowerCase()];
+    if (!host) throw unknownEditionError(language);
+    return host;
   }
 
   // ---------------------------------------------------------------------------
@@ -512,7 +801,11 @@ export class WikipediaService {
 
     let raw: RestSummaryRaw;
     try {
-      raw = await this.restGet<RestSummaryRaw>(language, `/page/summary/${encodedTitle}`, ctx);
+      // A 404 is an outcome here, not a failure — remapped below to a friendly notFound. Listing
+      // it drops the framework's error-level log line for every article miss to debug.
+      raw = await this.restGet<RestSummaryRaw>(language, `/page/summary/${encodedTitle}`, ctx, {
+        expectedStatuses: [404],
+      });
     } catch (err: unknown) {
       // fetchWithTimeout throws a McpError with code NotFound for 404 responses.
       // Match by error code (reliable) rather than message text (fragile).
@@ -758,13 +1051,30 @@ export class WikipediaService {
     return { title: resolvedTitle, pageid: raw.parse?.pageid, sections };
   }
 
-  /** List language editions available for an article. */
+  /**
+   * List language editions available for an article.
+   *
+   * `redirects` resolves aliases like the other read paths, so an alias returns the target's
+   * interwiki links instead of a redirect stub's empty set, and `title` reports the article the
+   * links actually belong to.
+   *
+   * `url` and `editionCode` are omitted for an entry whose host cannot be established — the API
+   * left `url` out and the edition registry knows no host for that language code. The subdomain
+   * genuinely is not recoverable from the language code for mismatch editions (`gsw` lives on
+   * `als`), so an interpolated `https://<code>.wikipedia.org` would be a fabricated host.
+   */
   async getLanguages(
     title: string,
     sourceLanguage: string,
     ctx: RequestContextLike,
   ): Promise<{
-    languages: Array<{ languageCode: string; editionCode: string; title: string; url: string }>;
+    title: string;
+    languages: Array<{
+      languageCode: string;
+      editionCode?: string;
+      title: string;
+      url?: string;
+    }>;
   }> {
     const raw = await this.actionGet<ActionLangLinksRaw>(
       sourceLanguage,
@@ -774,6 +1084,7 @@ export class WikipediaService {
         prop: 'langlinks',
         lllimit: '500',
         llprop: 'url',
+        redirects: 'true',
       },
       ctx,
     );
@@ -789,28 +1100,44 @@ export class WikipediaService {
       );
     }
 
-    const languages =
-      page.langlinks?.map((ll) => {
-        // url is populated because we pass llprop=url; compose a host only if the API omits it.
-        const url =
-          ll.url ??
-          `https://${ll.lang}.wikipedia.org/wiki/${encodeURIComponent(ll.title.replace(/ /g, '_'))}`;
-        return {
-          languageCode: ll.lang,
-          // The subdomain that actually serves the edition — the value usable as `language` on
-          // other tools. Derived from the real host so it stays correct when the MediaWiki code and
-          // the Wikipedia subdomain diverge (e.g. code "gsw" lives on subdomain "als").
-          editionCode: editionCodeFromUrl(url, ll.lang),
-          // formatversion=2: title is a plain key, not '*'.
-          title: ll.title,
-          url,
-        };
-      }) ?? [];
+    const langlinks = page.langlinks ?? [];
+    // llprop=url normally populates every url, so the registry is consulted only on the rare miss.
+    const index = langlinks.some((ll) => !ll.url) ? await this.editionIndex(ctx) : undefined;
 
-    return { languages };
+    const languages = langlinks.map((ll) => {
+      const host = index?.hosts[ll.lang.toLowerCase()];
+      const url =
+        ll.url ??
+        (host ? `${host}/wiki/${encodeURIComponent(ll.title.replace(/ /g, '_'))}` : undefined);
+      // The subdomain that actually serves the edition — the value usable as `language` on other
+      // tools. Derived from the real host so it stays correct when the MediaWiki code and the
+      // Wikipedia subdomain diverge (e.g. code "gsw" lives on subdomain "als").
+      const editionCode = url ? editionCodeFromUrl(url) : undefined;
+      return {
+        languageCode: ll.lang,
+        ...(editionCode && { editionCode }),
+        // formatversion=2: title is a plain key, not '*'.
+        title: ll.title,
+        ...(url && { url }),
+      };
+    });
+
+    return { title: page.title ?? title, languages };
   }
 
-  /** Find geotagged Wikipedia articles near a coordinate. */
+  /**
+   * Find geotagged Wikipedia articles near a coordinate.
+   *
+   * `limit` is clamped to {@link GEOSEARCH_MAX_LIMIT}, the ceiling `action=paraminfo` reports for
+   * `gslimit` and the ceiling an anonymous caller actually gets — geosearch's `highmax` of 5000
+   * needs `apihighlimits`, which this server never holds. Geosearch has no `offset` or `continue`,
+   * so the clamp is the entire reachable set.
+   *
+   * `truncated` is established by requesting one result past the clamp and reporting the overflow,
+   * so a match count landing exactly on `limit` is not misreported as truncated. At the upstream
+   * ceiling there is no room to probe, and a full page is reported as truncated — nothing further
+   * is retrievable there either way.
+   */
   async searchNearby(
     latitude: number,
     longitude: number,
@@ -826,20 +1153,24 @@ export class WikipediaService {
       longitude: number;
       distance_meters: number;
     }>;
+    truncated: boolean;
   }> {
+    const cap = Math.min(Math.max(limit, 1), GEOSEARCH_MAX_LIMIT);
+    const probe = Math.min(cap + 1, GEOSEARCH_MAX_LIMIT);
+
     const raw = await this.actionGet<ActionGeoSearchRaw>(
       language,
       {
         action: 'query',
         list: 'geosearch',
         gscoord: `${latitude}|${longitude}`,
-        gsradius: String(Math.min(radiusMeters, 10_000)),
-        gslimit: String(Math.min(limit, 50)),
+        gsradius: String(Math.min(radiusMeters, GEOSEARCH_MAX_RADIUS_METERS)),
+        gslimit: String(probe),
       },
       ctx,
     );
 
-    const results =
+    const matches =
       raw.query?.geosearch?.map((r) => ({
         title: r.title,
         pageid: r.pageid,
@@ -848,7 +1179,12 @@ export class WikipediaService {
         distance_meters: r.dist,
       })) ?? [];
 
-    return { results };
+    return {
+      results: matches.slice(0, cap),
+      // Filling the probe means more may exist. At the ceiling the probe equals the cap, so a full
+      // page reports truncated — correct either way, since nothing past it is retrievable.
+      truncated: matches.length >= probe,
+    };
   }
 }
 
@@ -875,25 +1211,12 @@ export function getWikipediaService(): WikipediaService {
 }
 
 /**
- * Report whether `language` is a structurally-valid code that names no existing Wikipedia edition —
- * the signal a tool handler uses to reject it with the typed `invalid_language` contract before any
- * network call, mirroring how the structural BCP 47 check is already pre-validated in-handler.
- *
- * Returns `false` whenever a single-instance base-URL override is configured: that mode fixes the
- * host and may serve any editions, so the Wikipedia-specific edition list must not gate it.
- */
-export function isUnknownEdition(language: string): boolean {
-  if (_service?.baseUrl) return false;
-  return !KNOWN_WIKIPEDIA_EDITIONS.has(language.toLowerCase());
-}
-
-/**
  * Report whether `title` is blank or whitespace-only — the signal a tool handler uses to reject it
  * with the typed `not_found` contract before any network call. A blank title otherwise leaks an
  * inconsistent generic upstream error that varies by endpoint (an absent `query` object, an
  * `invalidtitle` API error, or a 403 whose raw message carries the fetch URL); the pre-fetch guard
- * normalizes all of them to one typed result, mirroring how `isUnknownEdition` pre-validates
- * language codes in-handler.
+ * normalizes all of them to one typed result, mirroring how `WikipediaService.isUnknownEdition`
+ * pre-validates language codes in-handler.
  */
 export function isBlankTitle(title: string): boolean {
   return !title.trim();

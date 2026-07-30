@@ -284,8 +284,8 @@ No enforced rate limits, but:
 **Input:**
 - `latitude: number` — WGS 84 latitude (−90 to 90)
 - `longitude: number` — WGS 84 longitude (−180 to 180)
-- `radius_meters?: number` — search radius in meters (default 1000, max 10000)
-- `limit?: number` — max results (default 10, max 50)
+- `radius_meters?: number` — search radius in meters (default 1000, min 10, max 10000 — the `gsradius` bounds `action=paraminfo` reports)
+- `limit?: number` — max results (default 10, max 500 — the `gslimit` ceiling an anonymous caller gets). Geosearch has no `offset`/`continue`, so this is the whole reachable set
 - `language?: string` — language edition code (default `"en"`)
 
 **Output:** Array of results: `{ title, pageid, latitude, longitude, distance_meters }`, sorted ascending by `distance_meters`. Includes `total_results` count.
@@ -307,7 +307,7 @@ No enforced rate limits, but:
 - `title: string` — article title
 - `language?: string` — language edition to query from (default `"en"`)
 
-**Output:** Array of language entries: `{ language_code, edition_code, title, url }`. `edition_code` is the Wikipedia subdomain (derived from the article URL host) to pass as `language` to other tools — it can differ from `language_code` for some editions (e.g. `gsw` → `als`). The source language is not included — only other editions. Includes `total_languages` count.
+**Output:** Array of language entries: `{ language_code, edition_code?, title, url }`. `edition_code` is the Wikipedia subdomain (derived from the article URL host) to pass as `language` to other tools — it can differ from `language_code` for some editions (e.g. `gsw` → `als`). `edition_code` and `url` are both omitted when the serving host cannot be established, rather than composed from `language_code`, which is not the subdomain for mismatch editions. Redirect titles are resolved, and `source_title` reports the resolved article. The source language is not included — only other editions. Includes `total_languages` count.
 
 **Errors:**
 - `not_found` (NotFound) — no article exists for the title in the specified language. Recovery: use `wikipedia_search` to find the correct title.

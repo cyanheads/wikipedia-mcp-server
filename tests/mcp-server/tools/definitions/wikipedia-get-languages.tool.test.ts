@@ -6,16 +6,20 @@
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { wikipediaGetLanguages } from '@/mcp-server/tools/definitions/wikipedia-get-languages.tool.js';
-import * as svcModule from '@/services/wikipedia/wikipedia-service.js';
+import { mockWikipediaService } from '../../../helpers/wikipedia-service-mock.js';
 
 describe('wikipediaGetLanguages', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    // Baseline stub so the pre-fetch edition guard resolves offline; tests that need
+    // domain methods call mockWikipediaService again with their own.
+    mockWikipediaService();
   });
 
   it('returns language editions for a valid article', async () => {
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       getLanguages: vi.fn().mockResolvedValue({
+        title: 'Python (programming language)',
         languages: [
           {
             languageCode: 'fr',
@@ -29,7 +33,7 @@ describe('wikipediaGetLanguages', () => {
           },
         ],
       }),
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext();
     const input = wikipediaGetLanguages.input.parse({ title: 'Python (programming language)' });
@@ -42,9 +46,9 @@ describe('wikipediaGetLanguages', () => {
   });
 
   it('throws no_other_languages when article has no translations', async () => {
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
-      getLanguages: vi.fn().mockResolvedValue({ languages: [] }),
-    } as unknown as svcModule.WikipediaService);
+    mockWikipediaService({
+      getLanguages: vi.fn().mockResolvedValue({ title: 'Very Local Article', languages: [] }),
+    });
 
     const ctx = createMockContext({ errors: wikipediaGetLanguages.errors });
     const input = wikipediaGetLanguages.input.parse({ title: 'Very Local Article' });
@@ -86,13 +90,13 @@ describe('wikipediaGetLanguages', () => {
 
   it('throws not_found with data.reason when article is missing (issue #12)', async () => {
     const { notFound } = await import('@cyanheads/mcp-ts-core/errors');
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       getLanguages: vi
         .fn()
         .mockRejectedValue(
           notFound('No Wikipedia article found for "ZZZMissing" in language "en".'),
         ),
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext({ errors: wikipediaGetLanguages.errors });
     const input = wikipediaGetLanguages.input.parse({ title: 'ZZZMissing' });
@@ -102,8 +106,9 @@ describe('wikipediaGetLanguages', () => {
   });
 
   it('maps language entries from service to output shape', async () => {
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       getLanguages: vi.fn().mockResolvedValue({
+        title: 'Python (programming language)',
         languages: [
           {
             languageCode: 'ja',
@@ -113,7 +118,7 @@ describe('wikipediaGetLanguages', () => {
           },
         ],
       }),
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext();
     const input = wikipediaGetLanguages.input.parse({ title: 'Python (programming language)' });
@@ -128,8 +133,9 @@ describe('wikipediaGetLanguages', () => {
   });
 
   it('surfaces edition_code distinct from language_code (issue #17)', async () => {
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       getLanguages: vi.fn().mockResolvedValue({
+        title: 'Python (programming language)',
         languages: [
           {
             languageCode: 'gsw',
@@ -139,7 +145,7 @@ describe('wikipediaGetLanguages', () => {
           },
         ],
       }),
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext();
     const input = wikipediaGetLanguages.input.parse({ title: 'Python (programming language)' });
@@ -176,6 +182,7 @@ describe('wikipediaGetLanguages', () => {
 
   it('passes source language to service', async () => {
     const getLanguagesFn = vi.fn().mockResolvedValue({
+      title: 'Python (langage)',
       languages: [
         {
           languageCode: 'en',
@@ -184,9 +191,9 @@ describe('wikipediaGetLanguages', () => {
         },
       ],
     });
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       getLanguages: getLanguagesFn,
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext();
     const input = wikipediaGetLanguages.input.parse({ title: 'Python (langage)', language: 'fr' });
@@ -196,20 +203,50 @@ describe('wikipediaGetLanguages', () => {
     expect(result.source_language).toBe('fr');
   });
 
-  it('source_title echoes the input title', async () => {
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+  it('source_title reports the resolved title rather than echoing the input (issue #27)', async () => {
+    mockWikipediaService({
       getLanguages: vi.fn().mockResolvedValue({
+        title: 'New York City',
         languages: [
-          { languageCode: 'de', title: 'Python', url: 'https://de.wikipedia.org/wiki/Python' },
+          { languageCode: 'de', title: 'New York City', url: 'https://de.wikipedia.org/wiki/NYC' },
         ],
       }),
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext();
-    const input = wikipediaGetLanguages.input.parse({ title: 'Python (programming language)' });
+    // "NYC" redirects to "New York City"; the response must name the article the links belong to.
+    const input = wikipediaGetLanguages.input.parse({ title: 'NYC' });
     const result = await wikipediaGetLanguages.handler(input, ctx);
 
-    expect(result.source_title).toBe('Python (programming language)');
+    expect(result.source_title).toBe('New York City');
+  });
+
+  it('omits url and edition_code for an entry with no known host (issue #24)', async () => {
+    mockWikipediaService({
+      getLanguages: vi.fn().mockResolvedValue({
+        title: 'Test',
+        languages: [{ languageCode: 'zzz', title: 'Test (Unknown)' }],
+      }),
+    });
+
+    const ctx = createMockContext();
+    const input = wikipediaGetLanguages.input.parse({ title: 'Test' });
+    const result = await wikipediaGetLanguages.handler(input, ctx);
+
+    expect(result.languages[0]).toEqual({ language_code: 'zzz', title: 'Test (Unknown)' });
+  });
+
+  it('format marks an entry whose host is unknown instead of rendering an empty link (issue #24)', () => {
+    const blocks = wikipediaGetLanguages.format!({
+      source_title: 'Test',
+      source_language: 'en',
+      languages: [{ language_code: 'zzz', title: 'Test (Unknown)' }],
+      total_languages: 1,
+    });
+    const text = blocks.map((b) => (b.type === 'text' ? b.text : '')).join('');
+    expect(text).toContain('edition subdomain unavailable');
+    expect(text).toContain('no URL available');
+    expect(text).not.toContain('zzz.wikipedia.org');
   });
 
   it('format output does not expose secrets or env var names', () => {
@@ -233,9 +270,9 @@ describe('wikipediaGetLanguages', () => {
   });
 
   it('non-McpError from service propagates without wrapping', async () => {
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       getLanguages: vi.fn().mockRejectedValue(new Error('Upstream timeout')),
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext({ errors: wikipediaGetLanguages.errors });
     const input = wikipediaGetLanguages.input.parse({ title: 'Python' });

@@ -6,16 +6,20 @@
 import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { wikipediaSearchNearby } from '@/mcp-server/tools/definitions/wikipedia-search-nearby.tool.js';
-import * as svcModule from '@/services/wikipedia/wikipedia-service.js';
+import { mockWikipediaService } from '../../../helpers/wikipedia-service-mock.js';
 
 describe('wikipediaSearchNearby', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    // Baseline stub so the pre-fetch edition guard resolves offline; tests that need
+    // domain methods call mockWikipediaService again with their own.
+    mockWikipediaService();
   });
 
   it('returns nearby articles for valid coordinates', async () => {
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       searchNearby: vi.fn().mockResolvedValue({
+        truncated: false,
         results: [
           {
             title: 'Space Needle',
@@ -33,7 +37,7 @@ describe('wikipediaSearchNearby', () => {
           },
         ],
       }),
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext();
     const input = wikipediaSearchNearby.input.parse({
@@ -56,9 +60,9 @@ describe('wikipediaSearchNearby', () => {
   });
 
   it('returns empty results with a notice when no articles found', async () => {
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
-      searchNearby: vi.fn().mockResolvedValue({ results: [] }),
-    } as unknown as svcModule.WikipediaService);
+    mockWikipediaService({
+      searchNearby: vi.fn().mockResolvedValue({ results: [], truncated: false }),
+    });
 
     const ctx = createMockContext({ errors: wikipediaSearchNearby.errors });
     const input = wikipediaSearchNearby.input.parse({ latitude: 0, longitude: 0 });
@@ -89,11 +93,12 @@ describe('wikipediaSearchNearby', () => {
 
   it('caps radius at 10000m', async () => {
     const nearbyFn = vi.fn().mockResolvedValue({
+      truncated: false,
       results: [{ title: 'T', pageid: 1, latitude: 0, longitude: 0, distance_meters: 100 }],
     });
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       searchNearby: nearbyFn,
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext();
     const input = wikipediaSearchNearby.input.parse({
@@ -188,6 +193,26 @@ describe('wikipediaSearchNearby', () => {
     ).toThrow();
   });
 
+  it('rejects radius_meters below the upstream 10 m floor at schema parse time (issue #30)', () => {
+    // Upstream gsradius reports min: 10; 5 previously passed the schema and came back as a raw
+    // `outofrange` API error instead of this tool's typed contract.
+    expect(() =>
+      wikipediaSearchNearby.input.parse({ latitude: 48.8566, longitude: 2.3522, radius_meters: 5 }),
+    ).toThrow(/10/);
+    expect(() =>
+      wikipediaSearchNearby.input.parse({ latitude: 48.8566, longitude: 2.3522, radius_meters: 9 }),
+    ).toThrow();
+  });
+
+  it('accepts radius_meters exactly at the floor (issue #30)', () => {
+    const input = wikipediaSearchNearby.input.parse({
+      latitude: 48.8566,
+      longitude: 2.3522,
+      radius_meters: 10,
+    });
+    expect(input.radius_meters).toBe(10);
+  });
+
   it('throws invalid_coordinates for -91 latitude (lower bound)', async () => {
     const ctx = createMockContext({ errors: wikipediaSearchNearby.errors });
     const input = wikipediaSearchNearby.input.parse({ latitude: -91, longitude: 0 });
@@ -204,26 +229,76 @@ describe('wikipediaSearchNearby', () => {
     });
   });
 
-  it('caps limit at 50 and passes it to service', async () => {
-    const nearbyFn = vi.fn().mockResolvedValue({ results: [] });
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+  it('rejects a limit above the geosearch ceiling at schema parse time (issue #29)', () => {
+    expect(() =>
+      wikipediaSearchNearby.input.parse({ latitude: 0, longitude: 0, limit: 999 }),
+    ).toThrow();
+  });
+
+  it('passes a limit up to the geosearch ceiling through to the service (issue #29)', async () => {
+    const nearbyFn = vi.fn().mockResolvedValue({ results: [], truncated: false });
+    mockWikipediaService({
       searchNearby: nearbyFn,
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext({ errors: wikipediaSearchNearby.errors });
     const input = wikipediaSearchNearby.input.parse({
       latitude: 0,
       longitude: 0,
-      limit: 999,
+      limit: 500,
     });
     await wikipediaSearchNearby.handler(input, ctx);
 
-    // arg index 3 is limit
-    expect(nearbyFn.mock.calls[0]?.[3]).toBe(50);
+    // arg index 3 is limit — no longer clamped to 50 on the way in.
+    expect(nearbyFn.mock.calls[0]?.[3]).toBe(500);
+  });
+
+  it('reports truncated with pagination-free guidance when the service overflows (issue #29)', async () => {
+    mockWikipediaService({
+      searchNearby: vi.fn().mockResolvedValue({
+        truncated: true,
+        results: [{ title: 'T', pageid: 1, latitude: 0, longitude: 0, distance_meters: 10 }],
+      }),
+    });
+
+    const ctx = createMockContext();
+    const input = wikipediaSearchNearby.input.parse({ latitude: 0, longitude: 0, limit: 1 });
+    await wikipediaSearchNearby.handler(input, ctx);
+
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.truncated).toBe(true);
+    expect(enrichment.cap).toBe(1);
+    // The tool has no filter parameters, so the notice must not advise narrowing with filters.
+    expect(enrichment.notice).toContain('radius_meters');
+    expect(enrichment.notice).toContain('500');
+    expect(enrichment.notice).not.toMatch(/filter/i);
+  });
+
+  it('reports truncated false for a full page that is not an overflow (issue #29)', async () => {
+    mockWikipediaService({
+      searchNearby: vi.fn().mockResolvedValue({
+        truncated: false,
+        results: [
+          { title: 'A', pageid: 1, latitude: 0, longitude: 0, distance_meters: 10 },
+          { title: 'B', pageid: 2, latitude: 0, longitude: 0, distance_meters: 20 },
+        ],
+      }),
+    });
+
+    const ctx = createMockContext();
+    const input = wikipediaSearchNearby.input.parse({ latitude: 0, longitude: 0, limit: 2 });
+    await wikipediaSearchNearby.handler(input, ctx);
+
+    const enrichment = getEnrichment(ctx);
+    // Exactly `limit` matches is not truncation — the old `results.length >= limit` said it was.
+    expect(enrichment.truncated).toBe(false);
+    expect(enrichment.shown).toBe(2);
+    expect(enrichment.notice).toBeUndefined();
   });
 
   it('passes non-default language to service', async () => {
     const nearbyFn = vi.fn().mockResolvedValue({
+      truncated: false,
       results: [
         {
           title: 'Tour Eiffel',
@@ -234,9 +309,9 @@ describe('wikipediaSearchNearby', () => {
         },
       ],
     });
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       searchNearby: nearbyFn,
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext();
     const input = wikipediaSearchNearby.input.parse({
@@ -270,9 +345,9 @@ describe('wikipediaSearchNearby', () => {
   });
 
   it('service error propagates without swallowing', async () => {
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       searchNearby: vi.fn().mockRejectedValue(new Error('Upstream failure')),
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext({ errors: wikipediaSearchNearby.errors });
     const input = wikipediaSearchNearby.input.parse({ latitude: 0, longitude: 0 });
@@ -281,9 +356,9 @@ describe('wikipediaSearchNearby', () => {
 
   it('enrichment radiusMetersUsed reflects effective (capped) value', async () => {
     const nearbyFn = vi.fn().mockResolvedValue({ results: [] });
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       searchNearby: nearbyFn,
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext({ errors: wikipediaSearchNearby.errors });
     const input = wikipediaSearchNearby.input.parse({

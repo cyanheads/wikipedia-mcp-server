@@ -8,7 +8,7 @@ import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import {
   getWikipediaService,
   isBlankTitle,
-  isUnknownEdition,
+  isMalformedLanguage,
 } from '@/services/wikipedia/wikipedia-service.js';
 
 export const wikipediaGetSummary = tool('wikipedia_get_summary', {
@@ -65,8 +65,9 @@ export const wikipediaGetSummary = tool('wikipedia_get_summary', {
 
   async handler(input, ctx) {
     const { language } = input;
+    const svc = getWikipediaService();
 
-    if (!/^[a-z]{2,3}(-[a-z0-9]+)*$/i.test(language)) {
+    if (isMalformedLanguage(language)) {
       throw ctx.fail(
         'invalid_language',
         `Invalid language code "${language}". Use a BCP 47 language code such as "fr", "de", or "ja".`,
@@ -74,9 +75,9 @@ export const wikipediaGetSummary = tool('wikipedia_get_summary', {
       );
     }
 
-    // Reject a structurally-valid code that names no Wikipedia edition (skipped when a
-    // single-instance base-URL override is set — that host may serve any editions).
-    if (isUnknownEdition(language)) {
+    // Reject a code that names no Wikipedia edition, checked against the live sitematrix registry
+    // (skipped when a single-instance base-URL override is set — that host may serve any editions).
+    if (await svc.isUnknownEdition(language, ctx)) {
       throw ctx.fail(
         'invalid_language',
         `Language edition "${language}" does not exist on Wikipedia. Use a valid Wikipedia language code such as "fr", "de", or "ja".`,
@@ -100,7 +101,6 @@ export const wikipediaGetSummary = tool('wikipedia_get_summary', {
 
     ctx.log.info('Fetching summary', { title: input.title, language });
 
-    const svc = getWikipediaService();
     let result: Awaited<ReturnType<typeof svc.getSummary>>;
     try {
       result = await svc.getSummary(input.title, language, ctx);

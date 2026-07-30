@@ -10,7 +10,7 @@ import { getServerConfig } from '@/config/server-config.js';
 import {
   getWikipediaService,
   isBlankTitle,
-  isUnknownEdition,
+  isMalformedLanguage,
   splitArticleIntoSections,
 } from '@/services/wikipedia/wikipedia-service.js';
 
@@ -91,9 +91,10 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
 
   async handler(input, ctx) {
     const { language } = input;
+    const svc = getWikipediaService();
 
     // Validate language code eagerly so the contract reason appears in data.reason.
-    if (!/^[a-z]{2,3}(-[a-z0-9]+)*$/i.test(language)) {
+    if (isMalformedLanguage(language)) {
       throw ctx.fail(
         'invalid_language',
         `Invalid language code "${language}". Use a BCP 47 language code such as "fr", "de", or "ja".`,
@@ -101,9 +102,9 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
       );
     }
 
-    // Reject a structurally-valid code that names no Wikipedia edition (skipped when a
-    // single-instance base-URL override is set — that host may serve any editions).
-    if (isUnknownEdition(language)) {
+    // Reject a code that names no Wikipedia edition, checked against the live sitematrix registry
+    // (skipped when a single-instance base-URL override is set — that host may serve any editions).
+    if (await svc.isUnknownEdition(language, ctx)) {
       throw ctx.fail(
         'invalid_language',
         `Language edition "${language}" does not exist on Wikipedia. Use a valid Wikipedia language code such as "fr", "de", or "ja".`,
@@ -141,8 +142,6 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
         },
       );
     }
-
-    const svc = getWikipediaService();
 
     if (input.section_index != null) {
       // Section-targeted path: wikitext + stripping

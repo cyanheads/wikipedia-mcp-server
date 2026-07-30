@@ -6,7 +6,7 @@
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { wikipediaGetSections } from '@/mcp-server/tools/definitions/wikipedia-get-sections.tool.js';
-import * as svcModule from '@/services/wikipedia/wikipedia-service.js';
+import { mockWikipediaService } from '../../../helpers/wikipedia-service-mock.js';
 
 const mockSections = {
   title: 'Python (programming language)',
@@ -21,12 +21,15 @@ const mockSections = {
 describe('wikipediaGetSections', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    // Baseline stub so the pre-fetch edition guard resolves offline; tests that need
+    // domain methods call mockWikipediaService again with their own.
+    mockWikipediaService();
   });
 
   it('returns sections for a valid article', async () => {
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       getSections: vi.fn().mockResolvedValue(mockSections),
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext();
     const input = wikipediaGetSections.input.parse({ title: 'Python (programming language)' });
@@ -39,9 +42,9 @@ describe('wikipediaGetSections', () => {
   });
 
   it('throws no_sections when article has no sections', async () => {
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       getSections: vi.fn().mockResolvedValue({ title: 'Stub Article', pageid: 1, sections: [] }),
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext({ errors: wikipediaGetSections.errors });
     const input = wikipediaGetSections.input.parse({ title: 'Stub Article' });
@@ -88,13 +91,13 @@ describe('wikipediaGetSections', () => {
 
   it('throws not_found with data.reason when article is missing (issue #12)', async () => {
     const { notFound } = await import('@cyanheads/mcp-ts-core/errors');
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       getSections: vi
         .fn()
         .mockRejectedValue(
           notFound('No Wikipedia article found for "ZZZMissing" in language "en".'),
         ),
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext({ errors: wikipediaGetSections.errors });
     const input = wikipediaGetSections.input.parse({ title: 'ZZZMissing' });
@@ -120,13 +123,13 @@ describe('wikipediaGetSections', () => {
   });
 
   it('surfaces the redirect-resolved title in output (issue #19)', async () => {
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       getSections: vi.fn().mockResolvedValue({
         title: 'New York City',
         pageid: 645042,
         sections: [{ index: 1, number: '1', title: 'Etymology', level: 2 }],
       }),
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext();
     // Caller passes the alias "NYC"; output should carry the resolved article title.
@@ -142,9 +145,9 @@ describe('wikipediaGetSections', () => {
       pageid: 9999,
       sections: [{ index: 1, number: '1', title: 'Histoire', level: 2 }],
     });
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       getSections: getSectionsFn,
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext();
     const input = wikipediaGetSections.input.parse({ title: 'Python (langage)', language: 'fr' });
@@ -155,9 +158,9 @@ describe('wikipediaGetSections', () => {
   });
 
   it('total_sections matches sections array length', async () => {
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       getSections: vi.fn().mockResolvedValue(mockSections),
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext();
     const input = wikipediaGetSections.input.parse({ title: 'Python (programming language)' });
@@ -200,9 +203,9 @@ describe('wikipediaGetSections', () => {
   });
 
   it('non-McpError from service propagates without wrapping', async () => {
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       getSections: vi.fn().mockRejectedValue(new Error('Network failure')),
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext({ errors: wikipediaGetSections.errors });
     const input = wikipediaGetSections.input.parse({ title: 'Python' });

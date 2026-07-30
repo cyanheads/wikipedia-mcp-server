@@ -6,7 +6,7 @@
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { wikipediaGetSummary } from '@/mcp-server/tools/definitions/wikipedia-get-summary.tool.js';
-import * as svcModule from '@/services/wikipedia/wikipedia-service.js';
+import { mockWikipediaService } from '../../../helpers/wikipedia-service-mock.js';
 
 const mockSummary = {
   title: 'Python (programming language)',
@@ -22,12 +22,15 @@ const mockSummary = {
 describe('wikipediaGetSummary', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    // Baseline stub so the pre-fetch edition guard resolves offline; tests that need
+    // domain methods call mockWikipediaService again with their own.
+    mockWikipediaService();
   });
 
   it('returns summary fields for a valid article', async () => {
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       getSummary: vi.fn().mockResolvedValue(mockSummary),
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext();
     const input = wikipediaGetSummary.input.parse({ title: 'Python (programming language)' });
@@ -43,8 +46,58 @@ describe('wikipediaGetSummary', () => {
     expect(result.language).toBe('en');
   });
 
+  it('resolves a real edition the hand-maintained allowlist rejected (issue #26)', async () => {
+    const getSummaryFn = vi
+      .fn()
+      .mockResolvedValue({ ...mockSummary, title: 'Ayiti', extract: 'Ayiti se yon peyi.' });
+    mockWikipediaService({ getSummary: getSummaryFn });
+
+    const ctx = createMockContext({ errors: wikipediaGetSummary.errors });
+    // ht.wikipedia.org answers HTTP 200 and wikipedia_get_languages advertises "ht", but the
+    // allowlist called it nonexistent.
+    const input = wikipediaGetSummary.input.parse({ title: 'Ayiti', language: 'ht' });
+    const result = await wikipediaGetSummary.handler(input, ctx);
+
+    expect(getSummaryFn).toHaveBeenCalledWith('Ayiti', 'ht', ctx);
+    expect(result.language).toBe('ht');
+  });
+
+  it('resolves the "simple" edition, whose code is longer than three letters (issue #26)', async () => {
+    const getSummaryFn = vi
+      .fn()
+      .mockResolvedValue({ ...mockSummary, title: 'Python (programming language)' });
+    mockWikipediaService({ getSummary: getSummaryFn });
+
+    const ctx = createMockContext({ errors: wikipediaGetSummary.errors });
+    const input = wikipediaGetSummary.input.parse({
+      title: 'Python (programming language)',
+      language: 'simple',
+    });
+    const result = await wikipediaGetSummary.handler(input, ctx);
+
+    expect(getSummaryFn).toHaveBeenCalledWith('Python (programming language)', 'simple', ctx);
+    expect(result.language).toBe('simple');
+  });
+
+  it('rejects the phantom "hat" code up front with no URL in the message (issue #26)', async () => {
+    const getSummaryFn = vi.fn().mockResolvedValue(mockSummary);
+    mockWikipediaService({ getSummary: getSummaryFn });
+
+    const ctx = createMockContext({ errors: wikipediaGetSummary.errors });
+    const input = wikipediaGetSummary.input.parse({ title: 'Ayiti', language: 'hat' });
+    const rejection = await wikipediaGetSummary.handler(input, ctx).then(
+      () => undefined,
+      (err: unknown) => err as { message: string; data: { reason: string } },
+    );
+
+    expect(rejection?.data.reason).toBe('invalid_language');
+    // The guard exists to stop a bogus subdomain from being retried into a URL-leaking error.
+    expect(rejection?.message).not.toMatch(/https?:\/\//);
+    expect(getSummaryFn).not.toHaveBeenCalled();
+  });
+
   it('surfaces disambiguation page_type without throwing', async () => {
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       getSummary: vi.fn().mockResolvedValue({
         ...mockSummary,
         title: 'Python',
@@ -52,7 +105,7 @@ describe('wikipediaGetSummary', () => {
         wikidataQid: undefined,
         thumbnailUrl: undefined,
       }),
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext();
     const input = wikipediaGetSummary.input.parse({ title: 'Python' });
@@ -62,14 +115,14 @@ describe('wikipediaGetSummary', () => {
   });
 
   it('handles sparse upstream (no thumbnail, no QID)', async () => {
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       getSummary: vi.fn().mockResolvedValue({
         ...mockSummary,
         wikidataQid: undefined,
         thumbnailUrl: undefined,
         description: undefined,
       }),
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext();
     const input = wikipediaGetSummary.input.parse({ title: 'SomePage' });
@@ -136,13 +189,13 @@ describe('wikipediaGetSummary', () => {
 
   it('throws not_found with data.reason when article is missing (issue #12)', async () => {
     const { notFound } = await import('@cyanheads/mcp-ts-core/errors');
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       getSummary: vi
         .fn()
         .mockRejectedValue(
           notFound('No Wikipedia article found for "ZZZMissing" in language "en".'),
         ),
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext({ errors: wikipediaGetSummary.errors });
     const input = wikipediaGetSummary.input.parse({ title: 'ZZZMissing' });
@@ -169,9 +222,9 @@ describe('wikipediaGetSummary', () => {
 
   it('passes non-default language to service', async () => {
     const getSummaryFn = vi.fn().mockResolvedValue({ ...mockSummary, title: 'Python (langage)' });
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       getSummary: getSummaryFn,
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext();
     const input = wikipediaGetSummary.input.parse({ title: 'Python (langage)', language: 'fr' });
@@ -200,9 +253,9 @@ describe('wikipediaGetSummary', () => {
       ...mockSummary,
       title: 'Tōkyō Tawā',
     });
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       getSummary: getSummaryFn,
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext();
     const input = wikipediaGetSummary.input.parse({ title: 'Tōkyō Tawā' });
@@ -211,9 +264,9 @@ describe('wikipediaGetSummary', () => {
   });
 
   it('non-McpError from service propagates without wrapping', async () => {
-    vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
+    mockWikipediaService({
       getSummary: vi.fn().mockRejectedValue(new TypeError('Unexpected upstream shape')),
-    } as unknown as svcModule.WikipediaService);
+    });
 
     const ctx = createMockContext({ errors: wikipediaGetSummary.errors });
     const input = wikipediaGetSummary.input.parse({ title: 'Python' });

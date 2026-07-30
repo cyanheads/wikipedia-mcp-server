@@ -94,13 +94,19 @@ export type ActionWikitextRaw = {
   error?: { code?: string; info?: string };
 };
 
-/** Action API langlinks response (formatversion=2 shape, llprop=url). */
+/**
+ * Action API langlinks response (formatversion=2 shape, llprop=url).
+ *
+ * With `redirects=true` the page entry is the redirect *target*, so `pages[].title` is the
+ * resolved article title rather than the requested alias.
+ */
 export type ActionLangLinksRaw = {
   query?: {
     pages?: Record<
       string,
       {
         pageid?: number;
+        /** Resolved article title — the redirect target when the request followed one. */
         title?: string;
         missing?: string;
         langlinks?: Array<{
@@ -113,6 +119,37 @@ export type ActionLangLinksRaw = {
       }
     >;
   };
+};
+
+/**
+ * One language's row in an `action=sitematrix` response.
+ *
+ * `site[]` lists every project for that language; the Wikipedia edition is the entry whose
+ * `code` is `wiki`. `closed` marks a read-only edition — the host still answers, so a closed
+ * edition is a valid `language` input.
+ */
+export type SiteMatrixLanguage = {
+  code?: string;
+  site?: Array<{
+    url?: string;
+    code?: string;
+    closed?: boolean;
+  }>;
+};
+
+/**
+ * `action=sitematrix` response (formatversion=2, `smtype=language`).
+ *
+ * `sitematrix` is an object, not an array: every language sits under a numeric-string key
+ * (`"0"`, `"1"`, …) alongside a `count` number. `specials` — the non-language wikis, whose
+ * `wikipedia.org` members are ArbCom, test, anniversary, and archive hosts rather than any
+ * language edition — is omitted by `smtype=language`, so nothing here reads it.
+ *
+ * `simple` (Simple English) is a language row like any other, not a special.
+ */
+export type SiteMatrixRaw = {
+  /** Values are {@link SiteMatrixLanguage} under numeric keys and a number under `count`. */
+  sitematrix?: Record<string, unknown>;
 };
 
 /** Action API geosearch response. */

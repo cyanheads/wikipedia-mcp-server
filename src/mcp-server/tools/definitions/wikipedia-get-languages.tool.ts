@@ -8,13 +8,13 @@ import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import {
   getWikipediaService,
   isBlankTitle,
-  isUnknownEdition,
+  isMalformedLanguage,
 } from '@/services/wikipedia/wikipedia-service.js';
 
 export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
   title: 'Get Wikipedia Article Languages',
   description:
-    'List the language editions available for a Wikipedia article. Returns language codes, article titles in each language, and full URLs. Useful for cross-language research and for discovering the correct article title in a target language before fetching it. The language parameter specifies which edition to query from.',
+    'List the language editions available for a Wikipedia article. Returns language codes, article titles in each language, and full URLs. Useful for cross-language research and for discovering the correct article title in a target language before fetching it. Redirect pages are followed automatically, and source_title reports the resolved article the links belong to. The language parameter specifies which edition to query from.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     title: z.string().describe('Article title in the source language edition.'),
@@ -26,7 +26,11 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
       ),
   }),
   output: z.object({
-    source_title: z.string().describe('Article title in the source language edition.'),
+    source_title: z
+      .string()
+      .describe(
+        'Resolved article title in the source language edition — the redirect target when the input was an alias.',
+      ),
     source_language: z.string().describe('The language edition that was queried.'),
     languages: z
       .array(
@@ -39,11 +43,17 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
               ),
             edition_code: z
               .string()
+              .optional()
               .describe(
-                'Wikipedia edition subdomain that serves this article (e.g. "als"). Pass THIS value as the `language` parameter to other wikipedia-mcp-server tools; language_code is not always a valid edition.',
+                'Wikipedia edition subdomain that serves this article (e.g. "als"). Pass THIS value as the `language` parameter to other wikipedia-mcp-server tools; language_code is not always a valid edition. Absent when the serving host could not be established — language_code alone does not determine it.',
               ),
             title: z.string().describe('Article title in this language edition.'),
-            url: z.string().describe('Full URL to the article in this language edition.'),
+            url: z
+              .string()
+              .optional()
+              .describe(
+                'Full URL to the article in this language edition. Absent when the API omitted it and no host is known for the language code.',
+              ),
           })
           .describe('A single language edition entry.'),
       )
@@ -74,8 +84,9 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
 
   async handler(input, ctx) {
     const { language } = input;
+    const svc = getWikipediaService();
 
-    if (!/^[a-z]{2,3}(-[a-z0-9]+)*$/i.test(language)) {
+    if (isMalformedLanguage(language)) {
       throw ctx.fail(
         'invalid_language',
         `Invalid language code "${language}". Use a BCP 47 language code such as "fr", "de", or "ja".`,
@@ -83,9 +94,9 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
       );
     }
 
-    // Reject a structurally-valid code that names no Wikipedia edition (skipped when a
-    // single-instance base-URL override is set — that host may serve any editions).
-    if (isUnknownEdition(language)) {
+    // Reject a code that names no Wikipedia edition, checked against the live sitematrix registry
+    // (skipped when a single-instance base-URL override is set — that host may serve any editions).
+    if (await svc.isUnknownEdition(language, ctx)) {
       throw ctx.fail(
         'invalid_language',
         `Language edition "${language}" does not exist on Wikipedia. Use a valid Wikipedia language code such as "fr", "de", or "ja".`,
@@ -109,7 +120,6 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
 
     ctx.log.info('Fetching language links', { title: input.title, language });
 
-    const svc = getWikipediaService();
     let getLanguagesResult: Awaited<ReturnType<typeof svc.getLanguages>>;
     try {
       getLanguagesResult = await svc.getLanguages(input.title, language, ctx);
@@ -123,7 +133,7 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
       }
       throw err;
     }
-    const { languages } = getLanguagesResult;
+    const { title: resolvedTitle, languages } = getLanguagesResult;
 
     if (languages.length === 0) {
       throw ctx.fail(
@@ -137,16 +147,16 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
       );
     }
 
-    ctx.log.info('Language links fetched', { title: input.title, count: languages.length });
+    ctx.log.info('Language links fetched', { title: resolvedTitle, count: languages.length });
 
     return {
-      source_title: input.title,
+      source_title: resolvedTitle,
       source_language: language,
       languages: languages.map((l) => ({
         language_code: l.languageCode,
-        edition_code: l.editionCode,
+        ...(l.editionCode && { edition_code: l.editionCode }),
         title: l.title,
-        url: l.url,
+        ...(l.url && { url: l.url }),
       })),
       total_languages: languages.length,
     };
@@ -158,9 +168,13 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
       `**${result.total_languages} languages available**\n`,
     ];
     for (const lang of result.languages) {
-      lines.push(
-        `- **${lang.title}** — pass \`language: "${lang.edition_code}"\` (code \`${lang.language_code}\`): [article](${lang.url})`,
-      );
+      // An entry whose serving host is unknown carries neither edition_code nor url — say so
+      // rather than rendering an empty link the caller cannot follow.
+      const target = lang.edition_code
+        ? `pass \`language: "${lang.edition_code}"\``
+        : 'edition subdomain unavailable';
+      const link = lang.url ? `: [article](${lang.url})` : ' (no URL available)';
+      lines.push(`- **${lang.title}** — ${target} (code \`${lang.language_code}\`)${link}`);
     }
     return [{ type: 'text', text: lines.join('\n') }];
   },
