@@ -14,21 +14,20 @@ import {
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import type { RequestContextLike } from '@cyanheads/mcp-ts-core/utils';
 import { fetchWithTimeout, logger, withRetry } from '@cyanheads/mcp-ts-core/utils';
-import wtf from 'wtf_wikipedia';
 import type {
   ActionExtractsRaw,
   ActionGeoSearchRaw,
   ActionLangLinksRaw,
+  ActionParseTextRaw,
   ActionSearchRaw,
   ActionSectionsRaw,
-  ActionWikitextRaw,
   RestSummaryRaw,
   SiteMatrixLanguage,
   SiteMatrixRaw,
 } from './types.js';
 
 // ---------------------------------------------------------------------------
-// Wikitext stripping pipeline
+// Parser-HTML → plain-text pipeline
 // ---------------------------------------------------------------------------
 
 /**
@@ -39,39 +38,257 @@ import type {
  */
 const HEADING_LINE = /^(={2,6})\s*(.+?)\s*\1\s*$/gm;
 
-/**
- * Strip MediaWiki markup from raw wikitext and return clean plain text.
- * Uses wtf_wikipedia for the heavy lifting, then applies heading-preservation
- * and blank-line normalization as a post-pass.
- */
-function stripWikitext(wikitext: string): string {
-  // wtf_wikipedia handles links, templates, refs, bold/italic
-  const doc = wtf(wikitext);
-  let text = doc.text();
+/** Open-tag test for one class token, compiled once per rule. */
+function hasClass(token: string): (openTag: string) => boolean {
+  const re = new RegExp(`class\\s*=\\s*"[^"]*\\b${token}\\b`, 'i');
+  return (openTag) => re.test(openTag);
+}
 
-  // Preserve section headings — wtf strips them, but we want structure.
-  // Re-inject from the raw wikitext using a simple regex pass.
-  const headings = [...wikitext.matchAll(HEADING_LINE)].flatMap((m) => {
-    const level = m[1]?.length;
-    const title = m[2];
-    return level && title ? [{ level, title }] : [];
+/**
+ * `role="presentation"` is the parser's own marker for a table it lays content out in rather than
+ * one holding data — set by `{{col-begin}}`, succession boxes, and the other layout templates — so
+ * it tracks new layout templates instead of a hand-maintained class list.
+ */
+const PRESENTATION_ROLE = /\brole\s*=\s*"presentation"/i;
+
+/**
+ * MediaWiki's marker for page furniture that is not article content. Maintenance banners
+ * (`{{Update}}` and the rest of the ambox family) are `role="presentation"` tables carrying it, so
+ * the marker is what separates a layout table wrapping real prose from one wrapping an editor
+ * notice about the article.
+ */
+const NOT_CONTENT = /\bclass\s*=\s*"[^"]*\bmetadata\b/i;
+
+/** Whether a table lays out article content, and so must survive rather than be dropped. */
+function isLayoutTable(openTag: string): boolean {
+  return PRESENTATION_ROLE.test(openTag) && !NOT_CONTENT.test(openTag);
+}
+
+/** An element MediaWiki hides from the rendered page with an inline style. */
+const HIDDEN_BY_STYLE = /\bstyle\s*=\s*"[^"]*display\s*:\s*none/i;
+
+/**
+ * Elements dropped whole from parser HTML, keyed by tag name. Each value tests the element's own
+ * open tag, so a rule reaches only the elements carrying the artifact it is written for.
+ *
+ * `figure` goes because the plain-text conventions of the full-article extract path drop it too.
+ * `table` goes unless {@link isLayoutTable} — a layout table wraps ordinary lists and paragraphs,
+ * so dropping it takes real prose with it. The rest are artifacts of asking the parser for one
+ * section in isolation: for a section that cites something, `sup.reference` is the `[1]` footnote
+ * marker whose target is not in the payload, `ol.references` is the reference list the parser
+ * appends after the content, and `span.mw-ext-cite-error` is its complaint that the article's
+ * `<references/>` tag lives in a section this payload does not contain. A section citing nothing
+ * carries none of the three.
+ */
+const DROP_RULES: Readonly<Record<string, (openTag: string) => boolean>> = {
+  style: () => true,
+  script: () => true,
+  figure: () => true,
+  table: (openTag) => !isLayoutTable(openTag),
+  sup: hasClass('reference'),
+  ol: hasClass('references'),
+  span: hasClass('mw-ext-cite-error'),
+};
+
+/**
+ * Tags with no end tag. A nesting walk started from one would find no close and consume the rest of
+ * the payload, so they are never treated as containers — the generic tag strip removes them.
+ */
+const VOID_TAGS = new Set([
+  'area',
+  'base',
+  'br',
+  'col',
+  'embed',
+  'hr',
+  'img',
+  'input',
+  'link',
+  'meta',
+  'param',
+  'source',
+  'track',
+  'wbr',
+]);
+
+/**
+ * Any element's open tag; group 1 is the tag name. Held without the global flag and cloned per scan,
+ * so no `lastIndex` from one document's walk can bleed into the next.
+ */
+const OPEN_TAG = /<([a-z][a-z0-9]*)\b[^>]*>/i;
+
+/**
+ * The Math extension's rendered formula: a `display:none` MathML twin for screen readers, then an
+ * `<img>` whose `alt` carries the TeX the article itself stores. Dropping the hidden twin removes
+ * the MathML leaf text that otherwise renders as a column of single glyphs; recovering the `alt`
+ * keeps the formula, which lived only inside that twin's `<annotation>` before.
+ */
+const MATH_FALLBACK_IMAGE =
+  /<img\b[^>]*\bclass\s*=\s*"[^"]*\bmwe-math-fallback-image-[^"]*"[^>]*>/gi;
+
+/** The `alt` attribute of a single tag, still HTML-escaped as the parser emitted it. */
+const ALT_ATTRIBUTE = /\balt\s*=\s*"([^"]*)"/i;
+
+/** Named HTML entities the MediaWiki parser emits, beyond the numeric escapes handled generically. */
+const NAMED_ENTITIES: Readonly<Record<string, string>> = {
+  amp: '&',
+  apos: "'",
+  gt: '>',
+  lt: '<',
+  nbsp: ' ',
+  quot: '"',
+};
+
+/** One entity: a decimal reference, a hex reference, or a name. */
+const HTML_ENTITY = /&(?:#(\d+)|#x([0-9a-f]+)|([a-z]+));/gi;
+
+/**
+ * Index just past the end tag closing the `tagName` element whose body starts at `from`, honoring
+ * nesting so an inner element of the same tag does not end the outer one — the ordinary case for
+ * Wikipedia tables, where a non-greedy match would stop at an inner `</table>` and spill the outer
+ * table's remaining cells into the text as prose. An unclosed element runs to the end of `html`.
+ */
+function elementEnd(html: string, tagName: string, from: number): number {
+  const boundary = new RegExp(`<${tagName}\\b[^>]*>|</${tagName}\\s*>`, 'gi');
+  boundary.lastIndex = from;
+  let depth = 1;
+  for (let next = boundary.exec(html); next; next = boundary.exec(html)) {
+    depth += next[0].startsWith('</') ? -1 : 1;
+    if (depth === 0) return next.index + next[0].length;
+  }
+  return html.length;
+}
+
+/**
+ * Whether an element must be dropped whole, judged from its open tag alone.
+ *
+ * The hidden-element test comes first and is tag-agnostic: MediaWiki hides screen-reader MathML and
+ * unrendered gadget chrome behind an inline `display:none` on whatever element wraps them, so an
+ * enumeration of gadget class names would keep needing new entries. Whatever the page does not
+ * render is not content.
+ */
+function isDropped(openTag: string, tagName: string): boolean {
+  return HIDDEN_BY_STYLE.test(openTag) || (DROP_RULES[tagName]?.(openTag) ?? false);
+}
+
+/**
+ * Remove every element {@link isDropped} selects, in one pass over `html`'s open tags.
+ *
+ * A selected element is removed with its whole subtree, so a nested selection inside it needs no
+ * separate visit. An element that is *not* selected is walked into, so a data table nested in a
+ * layout table still goes while the layout table's own content survives.
+ */
+function dropElements(html: string): string {
+  const openTag = new RegExp(OPEN_TAG.source, 'gi');
+  let kept = '';
+  let cursor = 0;
+  for (let open = openTag.exec(html); open; open = openTag.exec(html)) {
+    const tagName = (open[1] as string).toLowerCase();
+    if (VOID_TAGS.has(tagName) || !isDropped(open[0], tagName)) continue;
+
+    const end = elementEnd(html, tagName, open.index + open[0].length);
+    kept += html.slice(cursor, open.index);
+    cursor = end;
+    openTag.lastIndex = end;
+  }
+  return kept + html.slice(cursor);
+}
+
+/**
+ * Decode the HTML escapes the MediaWiki parser emits.
+ *
+ * One left-to-right pass, so a decoded ampersand is never re-read as the start of another entity:
+ * an article that writes about a character reference reaches here as `&amp;#39;` and must decode to
+ * the literal text `&#39;`, not to `'`. Chained passes cannot express that, and where the inner
+ * reference is outside Unicode's range (`&amp;#1114112;`) the second pass has no character to
+ * produce at all. An unrecognized name or an out-of-range code point keeps its escape as written.
+ */
+function decodeEntities(text: string): string {
+  return text.replace(
+    HTML_ENTITY,
+    (match, dec: string | undefined, hex: string | undefined, name: string | undefined) => {
+      if (name !== undefined) return NAMED_ENTITIES[name.toLowerCase()] ?? match;
+      const code = dec === undefined ? Number.parseInt(hex as string, 16) : Number(dec);
+      return code <= 0x10ffff ? String.fromCodePoint(code) : match;
+    },
+  );
+}
+
+/**
+ * Sentinel wrapping a `<pre>` block's index while the surrounding text is whitespace-normalized.
+ * `U+FFFF` is a permanent noncharacter, so no parser output can collide with it, and it is not
+ * whitespace, so the collapsing passes leave it in place.
+ */
+const PRE_SENTINEL = /\uFFFF(\d+)\uFFFF/g;
+
+/**
+ * Convert the MediaWiki parser's HTML for one section (`action=parse&prop=text`) into the same
+ * plain-text shape the full-article extract path returns: `== Heading ==` markers in document
+ * order, paragraphs separated by a blank line, list items one per line.
+ *
+ * Sourcing section reads from rendered HTML rather than raw wikitext is what makes inline templates
+ * survive — `{{code|if}}` reaches this function already expanded to `if`, where a wikitext stripper
+ * has to re-implement the template grammar and drops what it cannot expand.
+ *
+ * `<pre>` blocks keep their internal line breaks and indentation while everything around them is
+ * collapsed, because in a code sample indentation is syntax — an unindented Python listing reads as
+ * valid code and is not, which is worse than omitting it.
+ *
+ * Pure and exported for unit testing.
+ */
+export function htmlSectionToPlainText(html: string): string {
+  let text = html.replace(/<!--[\s\S]*?-->/g, '');
+
+  // Lift each formula out of its `<img alt>` before anything is dropped, so the TeX survives the
+  // removal of the hidden MathML twin that used to be its only carrier. The alt is inserted still
+  // escaped, so the single decode pass below reads it exactly once.
+  text = text.replace(MATH_FALLBACK_IMAGE, (match) => ALT_ATTRIBUTE.exec(match)?.[1] ?? '');
+
+  text = dropElements(text);
+
+  // Park preformatted blocks behind sentinels so the whitespace pass cannot flatten them.
+  const preBlocks: string[] = [];
+  text = text.replace(/<pre\b[^>]*>([\s\S]*?)<\/pre\s*>/gi, (_match, body: string) => {
+    preBlocks.push(body);
+    return `\n\n\uFFFF${preBlocks.length - 1}\uFFFF\n\n`;
   });
 
-  // Prepend headings as == Heading == markers when present and not already in text.
-  if (headings[0] && !text.startsWith(headings[0].title)) {
-    const headingMarkers = headings
-      .map(({ level, title }) => `${'='.repeat(level)} ${title} ${'='.repeat(level)}`)
-      .join('\n\n');
-    text = `${headingMarkers}\n\n${text}`;
-  }
+  // Headings become the `== Heading ==` markers both read paths use for structure.
+  text = text.replace(
+    /<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1\s*>/gi,
+    (_match, level: string, inner: string) => {
+      const bar = '='.repeat(Math.max(2, Number(level)));
+      return `\n\n${bar} ${inner.replace(/<[^>]+>/g, '').trim()} ${bar}\n\n`;
+    },
+  );
 
-  // Remove HTML comments that may have survived.
-  text = text.replace(/<!--[\s\S]*?-->/g, '');
+  // A list item is one line; every other block boundary is a paragraph break. `tr`/`td`/`th` are
+  // boundaries because a layout table's cells reach here — without them two columns of a
+  // `{{col-begin}}` list concatenate into one line.
+  text = decodeEntities(
+    text
+      // Closing tag first, consuming the newline that follows it, so consecutive items land on
+      // consecutive lines instead of being separated by a blank one.
+      .replace(/<\/li\s*>\s*/gi, '')
+      .replace(/<li\b[^>]*>/gi, '\n')
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<\/?(p|div|ul|ol|dl|dd|dt|blockquote|section|tr|td|th)\b[^>]*>/gi, '\n\n')
+      .replace(/<[^>]+>/g, ''),
+  );
 
-  // Collapse multiple blank lines to a single blank line.
-  text = text.replace(/\n{3,}/g, '\n\n');
+  text = text
+    .replace(/[^\S\n]+/g, ' ')
+    .replace(/ *\n */g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 
-  return text.trim();
+  return text.replace(PRE_SENTINEL, (match, index: string) => {
+    const body = preBlocks[Number(index)];
+    if (body === undefined) return match;
+    return decodeEntities(body.replace(/<[^>]+>/g, ''))
+      .replace(/[^\S\n]+$/gm, '')
+      .replace(/^\n+|\n+$/g, '');
+  });
 }
 
 /**
@@ -106,17 +323,9 @@ export function splitArticleIntoSections(
 // Strip HTML snippet markup from Action API search results
 // ---------------------------------------------------------------------------
 
+/** Drop the `<span class="searchmatch">` highlight markup a snippet carries, then unescape it. */
 function stripSnippetHtml(html: string): string {
-  const stripped = html.replace(/<[^>]+>/g, '');
-  // Decode the most common HTML entities that the Action API leaves in snippets.
-  return stripped
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#039;/g, "'")
-    .replace(/&apos;/g, "'")
-    .trim();
+  return decodeEntities(html.replace(/<[^>]+>/g, '')).trim();
 }
 
 // ---------------------------------------------------------------------------
@@ -934,20 +1143,36 @@ export class WikipediaService {
     };
   }
 
-  /** Fetch a single section's wikitext and strip it to plain text. */
+  /**
+   * Fetch a single section as plain text, rendered from the parser's HTML for that section.
+   *
+   * `section=N` returns the requested section together with every subsection nested under it, and
+   * the same index space `getSections` reports — both properties of the endpoint, not of this
+   * method. An out-of-range index is the API's own `nosuchsection`, so no separate bounds check
+   * against the section list is needed.
+   *
+   * `prop=text` rather than `prop=wikitext`: the parser expands templates and emits headings inline,
+   * so inline `{{code}}`-style templates survive and each subsection heading stays attached to its
+   * own body. See {@link htmlSectionToPlainText}.
+   */
   async getArticleSection(
     title: string,
     sectionIndex: number,
     language: string,
     ctx: RequestContextLike,
   ): Promise<{ title: string; pageid: number | undefined; sectionTitle: string; content: string }> {
-    const raw = await this.actionGet<ActionWikitextRaw>(
+    const raw = await this.actionGet<ActionParseTextRaw>(
       language,
       {
         action: 'parse',
         page: title,
-        prop: 'wikitext',
+        prop: 'text',
         section: String(sectionIndex),
+        // Suppress the edit links, table of contents, and parser report — page furniture that
+        // would only be stripped again on the way to plain text.
+        disableeditsection: 'true',
+        disabletoc: 'true',
+        disablelimitreport: 'true',
         // Resolve redirects so a section read on an alias (e.g. "NYC") targets the resolved
         // article; without it the alias stub has no sections and the API returns nosuchsection.
         redirects: 'true',
@@ -976,13 +1201,12 @@ export class WikipediaService {
       throw serviceUnavailable(`Wikipedia API error: ${raw.error.info ?? errCode}`);
     }
 
-    // formatversion=2: wikitext is a plain string, not { '*': string }.
-    const wikitext = raw.parse?.wikitext ?? '';
-    const content = stripWikitext(wikitext);
+    // formatversion=2: text is a plain string, not { '*': string }.
+    const content = htmlSectionToPlainText(raw.parse?.text ?? '');
 
-    // Derive section title from the first heading in the wikitext.
-    const headingMatch = /^={2,6}\s*(.+?)\s*={2,6}/m.exec(wikitext);
-    const sectionTitle = headingMatch?.[1] ?? `Section ${sectionIndex}`;
+    // The section's own heading opens its rendered text; markup inside it is already stripped, so
+    // a heading like `<i>Pax Romana</i>` reports as `Pax Romana`.
+    const sectionTitle = [...content.matchAll(HEADING_LINE)][0]?.[2] ?? `Section ${sectionIndex}`;
 
     return {
       title: raw.parse?.title ?? title,

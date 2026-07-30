@@ -17,7 +17,7 @@ import {
 export const wikipediaGetArticle = tool('wikipedia_get_article', {
   title: 'Get Wikipedia Article',
   description:
-    'Fetch article content as clean plain text. Without section_index: returns the full article with == Section == markers preserved for structure — or, when the article exceeds the size budget, a compact section outline (truncated: true) that points to wikipedia_get_sections plus a section_index read instead of the full text. With section_index (from wikipedia_get_sections): returns just that section as plain text. Section-targeted reads are faster and smaller when only part of the article is needed. Redirect pages are followed automatically.',
+    'Fetch article content as clean plain text. Without section_index: returns the full article with == Section == markers preserved for structure — or, when the article exceeds the size budget, a compact section outline (truncated: true) that points to wikipedia_get_sections plus a section_index read instead of the full text. With section_index (from wikipedia_get_sections): returns that section and every subsection nested under it, each heading above its own body. Section-targeted reads are faster and smaller when only part of the article is needed. Data tables are omitted from both paths, so a section whose body is entirely a data table returns its heading and little else; tables used only for layout, such as multi-column lists, keep their content. Redirect pages are followed automatically.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     title: z.string().describe('Article title (e.g. "Python (programming language)").'),
@@ -25,7 +25,7 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
       .number()
       .optional()
       .describe(
-        'Section index from wikipedia_get_sections. Omit for the full article. Providing this returns only the targeted section as plain text.',
+        'Section index from wikipedia_get_sections. Omit for the full article. Providing this returns the targeted section plus every subsection nested under it, as plain text.',
       ),
     language: z
       .string()
@@ -41,7 +41,7 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
     content: z
       .string()
       .describe(
-        'Plain-text article content. Full articles include == Section == markers. When truncated is true, this instead carries a section outline (heading names and byte sizes) plus a pointer to the targeted-read path.',
+        'Plain-text article content. Both full articles and section reads carry == Section == markers above the text each one heads. When truncated is true, this instead carries a section outline (heading names and byte sizes) plus a pointer to the targeted-read path.',
       ),
     section_title: z
       .string()
@@ -127,9 +127,9 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
     }
 
     // Reject section_index < 1 — indices start at 1 (wikipedia_get_sections output).
-    // Index 0 refers to the lead section (wikitext parsing returns templates/infoboxes, not
-    // readable text); negative values are nonsensical and leak a raw API error.
-    // Full-article reads handle the lead via the extracts API.
+    // Index 0 is the lead section, which wikipedia_get_sections never lists and which
+    // wikipedia_get_summary and full-article reads already cover; negative values are nonsensical
+    // and leak a raw API error.
     if (input.section_index != null && input.section_index < 1) {
       throw ctx.fail(
         'invalid_section',
@@ -144,7 +144,7 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
     }
 
     if (input.section_index != null) {
-      // Section-targeted path: wikitext + stripping
+      // Section-targeted path: the section plus its subsections, rendered to plain text.
       ctx.log.info('Fetching article section', {
         title: input.title,
         sectionIndex: input.section_index,

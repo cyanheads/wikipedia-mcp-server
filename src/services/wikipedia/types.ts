@@ -83,13 +83,18 @@ export type ActionSectionsRaw = {
   error?: { code?: string; info?: string };
 };
 
-/** Action API parse/wikitext response (formatversion=2 shape). */
-export type ActionWikitextRaw = {
+/**
+ * Action API parse response for rendered section HTML (`prop=text`, formatversion=2 shape).
+ *
+ * With `section=N` the payload is that section plus every subsection nested under it, and an
+ * out-of-range index arrives as `error.code === 'nosuchsection'` rather than an empty body.
+ */
+export type ActionParseTextRaw = {
   parse?: {
     title?: string;
     pageid?: number;
     /** formatversion=2: plain string. formatversion=1 used `{ '*': string }` — no longer used. */
-    wikitext?: string;
+    text?: string;
   };
   error?: { code?: string; info?: string };
 };

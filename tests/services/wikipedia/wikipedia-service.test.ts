@@ -5,6 +5,7 @@
  */
 
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -13,6 +14,7 @@ import {
   type EditionIndex,
   GEOSEARCH_MAX_LIMIT,
   getWikipediaService,
+  htmlSectionToPlainText,
   initWikipediaService,
   isBlankTitle,
   isMalformedLanguage,
@@ -439,7 +441,7 @@ describe('WikipediaService — redirect resolution (issue #19)', () => {
       parse: {
         title: 'New York City',
         pageid: 645042,
-        wikitext: '== Etymology ==\n\nIn 1664, New York was named after the Duke of York.',
+        text: '<div class="mw-heading mw-heading2"><h2 id="Etymology">Etymology</h2></div>\n<p>In 1664, New York was named after the Duke of York.\n</p>',
       },
     });
 
@@ -506,21 +508,21 @@ describe('WikipediaService.search — HTML entity decoding (issue #3)', () => {
   });
 });
 
-describe('WikipediaService.getArticleSection — formatversion=2 wikitext (issue #1)', () => {
+describe('WikipediaService.getArticleSection — formatversion=2 parse text (issue #1)', () => {
   beforeEach(() => {
     initService();
   });
 
-  it('reads wikitext as a plain string (formatversion=2 shape)', async () => {
+  it('reads parse.text as a plain string (formatversion=2 shape)', async () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    // formatversion=2: wikitext is `string`, not `{ '*': string }`.
+    // formatversion=2: text is `string`, not `{ '*': string }`.
     vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
       parse: {
         title: 'Albert Einstein',
         pageid: 736,
-        wikitext: '== Special relativity ==\n\nEinstein developed special relativity.',
+        text: '<div class="mw-heading mw-heading2"><h2 id="Special_relativity">Special relativity</h2></div>\n<p>Einstein developed special relativity.\n</p>',
       },
     });
 
@@ -877,24 +879,25 @@ describe('WikipediaService.getArticleSection — error codes', () => {
     });
   });
 
-  it('derives sectionTitle from heading when wikitext contains one', async () => {
+  it('derives sectionTitle from the rendered heading, markup stripped', async () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
     vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
       parse: {
-        title: 'Python (programming language)',
-        pageid: 23862,
-        wikitext: '== History ==\n\nPython was created in 1991 by Guido van Rossum.',
+        title: 'Roman Empire',
+        pageid: 25507,
+        // tocdata reports this heading as `<i>Pax Romana</i>`; the rendered text carries no markup.
+        text: '<div class="mw-heading mw-heading3"><h3 id="Pax_Romana"><i>Pax Romana</i></h3></div>\n<p>The Roman peace lasted two centuries.\n</p>',
       },
     });
 
-    const result = await svc.getArticleSection('Python (programming language)', 1, 'en', ctx);
-    expect(result.sectionTitle).toBe('History');
-    expect(result.content).toContain('Python');
+    const result = await svc.getArticleSection('Roman Empire', 3, 'en', ctx);
+    expect(result.sectionTitle).toBe('Pax Romana');
+    expect(result.content).toContain('Roman peace');
   });
 
-  it('falls back to "Section N" title when wikitext has no heading', async () => {
+  it('falls back to "Section N" title when the rendered section has no heading', async () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
@@ -902,7 +905,7 @@ describe('WikipediaService.getArticleSection — error codes', () => {
       parse: {
         title: 'Article',
         pageid: 42,
-        wikitext: 'Just plain text without a heading.',
+        text: '<p>Just plain text without a heading.\n</p>',
       },
     });
 
@@ -1433,5 +1436,426 @@ describe('splitArticleIntoSections — section splitting (issue #23)', () => {
 
   it('returns an empty array for empty content', () => {
     expect(splitArticleIntoSections('')).toEqual([]);
+  });
+});
+
+/**
+ * Fixture shaped like `action=parse&prop=text&section=N` for a section that has subsections, with
+ * the noise the parser attaches to an isolated section parse: a deduplicated template stylesheet, a
+ * `[1]` footnote marker whose target is not in the payload, and the reference list plus cite-error
+ * complaint appended after the content. Inline `{{code}}` templates arrive already expanded, which
+ * is the property the wikitext path could not have.
+ */
+const SECTION_WITH_SUBSECTIONS_HTML = `<div class="mw-content-ltr mw-parser-output" lang="en" dir="ltr">
+<div class="mw-heading mw-heading2"><h2 id="Syntax_and_semantics">Syntax and semantics</h2></div>
+<style data-mw-deduplicate="TemplateStyles:r1">.mw-parser-output .hatnote{font-style:italic}</style>
+<p>Python is meant to be an easily readable language.<sup id="cite_ref-1" class="reference"><a href="#cite_note-1"><span class="cite-bracket">&#91;</span>1<span class="cite-bracket">&#93;</span></a></sup>
+</p>
+<div class="mw-heading mw-heading3"><h3 id="Indentation">Indentation</h3></div>
+<p>Python uses <a href="/wiki/Whitespace_character" title="Whitespace character">whitespace</a> indentation to delimit blocks.
+</p>
+<div class="mw-heading mw-heading3"><h3 id="Statements_and_control_flow">Statements and control flow</h3></div>
+<p>Python's statements include the following:
+</p>
+<ul><li>The assignment statement, using a single equals sign <code>=</code></li>
+<li>The <code>if</code> statement, which conditionally executes a block of code, along with <code>else</code> and <code>elif</code> (a contraction of <code>else if</code>)</li></ul>
+<div class="mw-heading mw-heading3"><h3 id="Function_syntax">Function syntax</h3></div>
+<p>Here is an example:
+</p>
+<pre><span class="kw">def</span> printer(input1):
+    print(input1)
+
+printer(<span class="st">"hello"</span>)
+</pre>
+<div class="reflist"><ol class="references">
+<li id="cite_note-1"><span class="reference-text">Some citation.</span></li>
+</ol></div><p><span class="error mw-ext-cite-error" lang="en" dir="ltr">Cite error: There are <code>&lt;ref&gt;</code> tags on this page.</span></p></div>`;
+
+describe('htmlSectionToPlainText — parser HTML rendering (issue #28)', () => {
+  const text = htmlSectionToPlainText(SECTION_WITH_SUBSECTIONS_HTML);
+
+  it('keeps every subsection heading attached to its own body, in document order', () => {
+    // The wikitext path hoisted all headings into one leading block, so the body that followed had
+    // no headings inside it and no way to tell where one subsection ended and the next began.
+    expect(text).toContain(
+      '=== Indentation ===\n\nPython uses whitespace indentation to delimit blocks.',
+    );
+    expect(text.indexOf('== Syntax and semantics ==')).toBeLessThan(
+      text.indexOf('Python is meant to be an easily readable language.'),
+    );
+    expect(text.indexOf('Python is meant to be an easily readable language.')).toBeLessThan(
+      text.indexOf('=== Indentation ==='),
+    );
+    expect(text.indexOf('=== Indentation ===')).toBeLessThan(
+      text.indexOf('=== Statements and control flow ==='),
+    );
+    // No two headings are adjacent — that adjacency was the fake table of contents.
+    expect(text).not.toMatch(/^={2,6} .+ ={2,6}\n\n={2,6} /m);
+  });
+
+  it('preserves inline template text that wikitext stripping dropped', () => {
+    expect(text).toContain(
+      'The if statement, which conditionally executes a block of code, along with else and elif (a contraction of else if)',
+    );
+    expect(text).toContain('The assignment statement, using a single equals sign =');
+  });
+
+  it('renders each list item on its own line', () => {
+    expect(text).toContain(
+      "Python's statements include the following:\n\nThe assignment statement, using a single equals sign =\nThe if statement,",
+    );
+  });
+
+  it('preserves line breaks and indentation inside a pre block', () => {
+    expect(text).toContain('def printer(input1):\n    print(input1)\n\nprinter("hello")');
+  });
+
+  it('drops stylesheets, footnote markers, the appended reference list, and the cite-error notice', () => {
+    expect(text).not.toContain('mw-parser-output');
+    expect(text).not.toContain('font-style');
+    expect(text).not.toContain('[1]');
+    expect(text).not.toContain('Some citation.');
+    expect(text).not.toContain('Cite error');
+  });
+
+  it('leaves no HTML tags, entities, or sentinels in the output', () => {
+    expect(text).not.toMatch(/<\/?[a-z][a-z0-9]*[\s>/]/i);
+    expect(text).not.toMatch(/&(?:[a-z]+|#\d+|#x[0-9a-f]+);/i);
+    expect(text).not.toMatch(/\uFFFF/);
+  });
+
+  it('drops a table whole, including one nested inside another', () => {
+    const nested =
+      '<p>Before.</p><table><tr><td>outer cell<table><tr><td>inner cell</td></tr></table>trailing outer cell</td></tr></table><p>After.</p>';
+    expect(htmlSectionToPlainText(nested)).toBe('Before.\n\nAfter.');
+  });
+
+  it('drops an element hidden with an inline style, whatever its tag', () => {
+    expect(
+      htmlSectionToPlainText(
+        '<p>Kept.</p><div style="display:none">Hidden.</div><p>Also kept.</p>',
+      ),
+    ).toBe('Kept.\n\nAlso kept.');
+    // Casing, spacing, and neighbouring declarations are all things MediaWiki emits.
+    expect(
+      htmlSectionToPlainText('<p>A</p><span style="border:1px; display: NONE;padding:0">B</span>'),
+    ).toBe('A');
+    // Only `none` hides an element — every other display value is visible content.
+    expect(htmlSectionToPlainText('<p>A</p><div style="display:block">B</div>')).toBe('A\n\nB');
+  });
+
+  it('does not consume the rest of the payload for a hidden void element', () => {
+    // `<img>` has no end tag, so a nesting walk started from it would find no close and delete
+    // everything after it.
+    expect(
+      htmlSectionToPlainText('<p>Before.</p><img style="display:none" src="x"><p>After.</p>'),
+    ).toBe('Before.\n\nAfter.');
+  });
+
+  it('drops figures but keeps a same-tag element without the required class', () => {
+    expect(
+      htmlSectionToPlainText('<p>Text.</p><figure><figcaption>Caption.</figcaption></figure>'),
+    ).toBe('Text.');
+    // `sup` is dropped only when it carries the `reference` class.
+    expect(htmlSectionToPlainText('<p>E = mc<sup>2</sup></p>')).toBe('E = mc2');
+  });
+
+  it('decodes named and numeric entities', () => {
+    expect(
+      htmlSectionToPlainText('<p>Tom &amp; Jerry &#8212; &quot;quoted&quot; &lt;tag&gt;</p>'),
+    ).toBe('Tom & Jerry — "quoted" <tag>');
+  });
+
+  it('decodes each entity once, so an escaped reference stays literal text', () => {
+    // An article writing *about* a character reference arrives as `&amp;#39;` and means the six
+    // characters `&#39;` — decoding the ampersand and then re-reading the result yields an
+    // apostrophe instead.
+    expect(htmlSectionToPlainText('<p>Escape it as &amp;#39; or &amp;amp; in wikitext.</p>')).toBe(
+      'Escape it as &#39; or &amp; in wikitext.',
+    );
+  });
+
+  it('keeps a numeric reference outside Unicode range as written', () => {
+    // `String.fromCodePoint` throws above U+10FFFF, and `&amp;#1114112;` is exactly what an article
+    // documenting the range limit contains.
+    expect(htmlSectionToPlainText('<p>&amp;#1114112; is out of range.</p>')).toBe(
+      '&#1114112; is out of range.',
+    );
+    expect(htmlSectionToPlainText('<p>so is &amp;#x110000;</p>')).toBe('so is &#x110000;');
+  });
+
+  it('cannot be made to inject a pre block into surrounding prose', () => {
+    // The `<pre>` placeholder is a U+FFFF-delimited index. Decoding must not be able to synthesize
+    // that shape from escaped text, or the parked block lands in the middle of the paragraph.
+    expect(
+      htmlSectionToPlainText('<p>lead &amp;#xFFFF;0&amp;#xFFFF; tail</p><pre>  code</pre>'),
+    ).toBe('lead &#xFFFF;0&#xFFFF; tail\n\n  code');
+  });
+
+  it('returns an empty string for empty input', () => {
+    expect(htmlSectionToPlainText('')).toBe('');
+  });
+});
+
+/**
+ * Fixture shaped like `{{col-begin}}`'s output: two `<ul>` lists laid out in columns by a
+ * `role="presentation"` table, preceded by a hatnote. This is the whole body of a Discography or
+ * Filmography section, so dropping the table leaves the heading and the hatnote alone.
+ */
+const LAYOUT_TABLE_HTML = `<div class="mw-heading mw-heading2"><h2 id="Discography">Discography</h2></div>
+<div role="note" class="hatnote navigation-not-searchable">Main article: <a href="/wiki/D" title="D">D</a></div>
+<div>
+<table class="col-begin" role="presentation">
+<tbody><tr>
+<td class="col-break col-break-2">
+<p><b>Studio albums</b>
+</p>
+<ul><li><i><a href="/wiki/One" title="One">One</a></i> (2006)</li>
+<li><i><a href="/wiki/Two" title="Two">Two</a></i> (2008)</li></ul>
+</td>
+<td class="col-break col-break-2">
+<p><b>Re-recorded albums</b>
+</p>
+<ul><li><i><a href="/wiki/Three" title="Three">Three</a></i> (2021)</li></ul>
+</td></tr></tbody></table></div>`;
+
+describe('htmlSectionToPlainText — layout vs data tables (issue #32)', () => {
+  it('keeps the lists a layout table wraps, one item per line', () => {
+    const text = htmlSectionToPlainText(LAYOUT_TABLE_HTML);
+    expect(text).toBe(
+      '== Discography ==\n\nMain article: D\n\nStudio albums\n\nOne (2006)\nTwo (2008)\n\nRe-recorded albums\n\nThree (2021)',
+    );
+  });
+
+  it('separates adjacent cells instead of concatenating them into one line', () => {
+    // Without `td` as a block boundary the two columns run together as `Two (2008)Re-recorded`.
+    expect(htmlSectionToPlainText(LAYOUT_TABLE_HTML)).not.toMatch(/\(2008\)[^\n]/);
+    expect(
+      htmlSectionToPlainText(
+        '<table role="presentation"><tbody><tr><th>Header</th></tr><tr><td>Left</td><td>Right</td></tr></tbody></table>',
+      ),
+    ).toBe('Header\n\nLeft\n\nRight');
+  });
+
+  it('still drops a data table whole, leaking no cell text into the prose', () => {
+    const data =
+      '<p>Lead.</p><table class="wikitable"><tbody><tr><th>Year</th><th>Title</th></tr><tr><td>2006</td><td>One</td></tr></tbody></table><p>Trailing.</p>';
+    expect(htmlSectionToPlainText(data)).toBe('Lead.\n\nTrailing.');
+  });
+
+  it('drops a layout table nested inside a data table along with its parent', () => {
+    const nested =
+      '<p>Lead.</p><table class="wikitable"><tbody><tr><td>cell<table role="presentation"><tbody><tr><td><ul><li>list item</li></ul></td></tr></tbody></table>trailing cell</td></tr></tbody></table><p>After.</p>';
+    const text = htmlSectionToPlainText(nested);
+    expect(text).toBe('Lead.\n\nAfter.');
+    expect(text).not.toContain('list item');
+  });
+
+  it('drops a data table nested inside a layout table while keeping the layout table content', () => {
+    const nested =
+      '<table role="presentation"><tbody><tr><td><ul><li>keep me</li></ul><table class="wikitable"><tbody><tr><td>drop me</td></tr></tbody></table><p>keep me too</p></td></tr></tbody></table>';
+    const text = htmlSectionToPlainText(nested);
+    expect(text).toBe('keep me\n\nkeep me too');
+    expect(text).not.toContain('drop me');
+  });
+
+  it('drops a maintenance banner, which is a layout table carrying an editor notice', () => {
+    // The ambox family is `role="presentation"` plus `class="metadata"` — page furniture about the
+    // article, not the article.
+    const ambox =
+      '<p>Body.</p><table class="box-Update plainlinks metadata ambox ambox-content" role="presentation"><tbody><tr><td class="mbox-text">This article needs to be updated. (November 2024)</td></tr></tbody></table>';
+    expect(htmlSectionToPlainText(ambox)).toBe('Body.');
+  });
+});
+
+/**
+ * Fixture shaped like the Math extension's output for one display formula: a `display:none` MathML
+ * twin for screen readers, then the fallback `<img>` whose `alt` carries the TeX.
+ */
+const DISPLAY_MATH_HTML = `<p>The time evolution of a quantum state is described by the Schrödinger equation:
+<span class="mwe-math-element mwe-math-element-block"><span class="mwe-math-mathml-display mwe-math-mathml-a11y" style="display: none;"><math display="block" xmlns="http://www.w3.org/1998/Math/MathML" alttext="{\\displaystyle i\\hbar {\\frac {\\partial }{\\partial t}}\\psi (t)=H\\psi (t).}">
+  <semantics>
+    <mrow class="MJX-TeXAtom-ORD">
+      <mstyle displaystyle="true" scriptlevel="0">
+        <mi>i</mi>
+        <mi class="MJX-variant">&#x210F;</mi>
+        <mi>&#x03C8;</mi>
+        <mo>=</mo>
+        <mi>H</mi>
+        <mo>.</mo>
+      </mstyle>
+    </mrow>
+    <annotation encoding="application/x-tex">{\\displaystyle i\\hbar {\\frac {\\partial }{\\partial t}}\\psi (t)=H\\psi (t).}</annotation>
+  </semantics>
+</math></span><img src="https://wikimedia.org/api/rest_v1/media/math/render/svg/5c41b5" class="mwe-math-fallback-image-display mw-invert skin-invert" aria-hidden="true" style="vertical-align: -2.005ex;" alt="{\\displaystyle i\\hbar {\\frac {\\partial }{\\partial t}}\\psi (t)=H\\psi (t).}"></span>
+</p>
+<p>Here <span class="mwe-math-element mwe-math-element-inline"><span class="mwe-math-mathml-inline mwe-math-mathml-a11y" style="display: none;"><math xmlns="http://www.w3.org/1998/Math/MathML" alttext="{\\displaystyle H}"><semantics><mrow><mi>H</mi></mrow><annotation encoding="application/x-tex">{\\displaystyle H}</annotation></semantics></math></span><img src="https://wikimedia.org/api/rest_v1/media/math/render/svg/75a9ed" class="mwe-math-fallback-image-inline mw-invert skin-invert" aria-hidden="true" alt="{\\displaystyle H}"></span> denotes the Hamiltonian.
+</p>`;
+
+/**
+ * Fixture shaped like a `{{calculator}}` gadget: an outer container the page hides until the gadget
+ * script runs, holding button labels, per-step state, and the hidden formula fields that drive it.
+ */
+const CALCULATOR_GADGET_HTML = `<div class="mw-heading mw-heading3"><h3 id="Optimizing_bubble_sort">Optimizing bubble sort</h3></div>
+<div class="bubble-sort-demo calculator-container calculatorgadget-enabled" style="border: 1px solid #a2a9b1; float: right; display:none;padding:0.5em">
+<p><b>Step by step bubble sort</b>
+</p>
+<p><span class="calculator-field-button cdx-button cdx-button--action-destructive">Reset</span>
+<span class="calculator-field-button cdx-button cdx-button--weight-primary">Next step</span>
+</p>
+<p><span class="calculator-field">44</span> <span class="calculator-field">3</span>
+</p>
+<p><span class="calculator-field calculator-hideifzero">Comparing A and A</span><span class="calculator-field">Swapping since &gt;</span>
+</p>
+<span class="calculator-field" id="calculator-field-step" data-calculator-type="hidden" style="display:none;">0</span>
+</div>
+<p>The bubble sort algorithm can be optimized by observing that the n-th pass finds the n-th largest element.
+</p>`;
+
+describe('htmlSectionToPlainText — elements the page hides (issue #33)', () => {
+  it('renders each formula exactly once, as the TeX the fallback image carries', () => {
+    const text = htmlSectionToPlainText(DISPLAY_MATH_HTML);
+    expect(text).toBe(
+      'The time evolution of a quantum state is described by the Schrödinger equation:\n{\\displaystyle i\\hbar {\\frac {\\partial }{\\partial t}}\\psi (t)=H\\psi (t).}\n\nHere {\\displaystyle H} denotes the Hamiltonian.',
+    );
+    // Two carriers of the same TeX reached here: the hidden `<annotation>` and the image `alt`.
+    expect(text.match(/\\psi \(t\)=H\\psi \(t\)\./g)).toHaveLength(1);
+    // The MathML leaf text rendered as a column of one glyph per source line.
+    expect(text).not.toMatch(/^ℏ$/m);
+    expect(text).not.toContain('application/x-tex');
+  });
+
+  it('keeps an inline formula glued to its surrounding punctuation', () => {
+    const inline =
+      '<p>where (<span class="mwe-math-element"><span class="mwe-math-mathml-inline mwe-math-mathml-a11y" style="display: none;"><math><mi>n</mi></math></span><img src="s" class="mwe-math-fallback-image-inline" alt="{\\displaystyle n}"></span>) is the count.</p>';
+    expect(htmlSectionToPlainText(inline)).toBe('where ({\\displaystyle n}) is the count.');
+  });
+
+  it('decodes an escaped TeX operator once, not twice', () => {
+    // The `alt` arrives escaped; inserting it before the single decode pass is what keeps
+    // `&amp;` literal rather than re-reading the decoded `&` as another entity.
+    const escaped =
+      '<p><img src="s" class="mwe-math-fallback-image-inline" alt="{\\displaystyle a&lt;b\\ \\&amp;\\ c&gt;d}"></p>';
+    expect(htmlSectionToPlainText(escaped)).toBe('{\\displaystyle a<b\\ \\&\\ c>d}');
+  });
+
+  it('drops a math image that carries no alt rather than emitting a placeholder', () => {
+    expect(
+      htmlSectionToPlainText('<p>x<img src="s" class="mwe-math-fallback-image-inline">y</p>'),
+    ).toBe('xy');
+  });
+
+  it('leaves no gadget chrome or widget state in a calculator section', () => {
+    const text = htmlSectionToPlainText(CALCULATOR_GADGET_HTML);
+    expect(text).toBe(
+      '=== Optimizing bubble sort ===\n\nThe bubble sort algorithm can be optimized by observing that the n-th pass finds the n-th largest element.',
+    );
+    for (const chrome of ['Reset', 'Next step', 'Step by step', 'Comparing A and A', 'Swapping']) {
+      expect(text).not.toContain(chrome);
+    }
+  });
+});
+
+describe('WikipediaService.getArticleSection — rendered section reads (issue #28)', () => {
+  beforeEach(() => {
+    initService();
+  });
+
+  /** Stub `actionGet` with the given parse payload and hand back the spy for param assertions. */
+  function stubParse(payload: unknown) {
+    const svc = getWikipediaService();
+    const spy = vi
+      .spyOn(svc as unknown as { actionGet: unknown }, 'actionGet')
+      .mockResolvedValue(payload);
+    return { svc, spy };
+  }
+
+  it('requests rendered section HTML, not wikitext, with the index forwarded verbatim', async () => {
+    const { svc, spy } = stubParse({
+      parse: { title: 'Python (programming language)', pageid: 23862, text: '<p>Body.</p>' },
+    });
+
+    await svc.getArticleSection('Python (programming language)', 4, 'en', createMockContext());
+
+    const params = spy.mock.calls[0]?.[1] as Record<string, string>;
+    expect(params.prop).toBe('text');
+    expect(params).not.toHaveProperty('wikitext');
+    expect(params.prop).not.toBe('wikitext');
+    // The index space is the endpoint's own, shared with getSections' tocdata indices.
+    expect(params.section).toBe('4');
+    expect(params.page).toBe('Python (programming language)');
+  });
+
+  it('returns every subsection of the requested section, each under its own heading', async () => {
+    const { svc } = stubParse({
+      parse: {
+        title: 'Python (programming language)',
+        pageid: 23862,
+        text: SECTION_WITH_SUBSECTIONS_HTML,
+      },
+    });
+
+    const result = await svc.getArticleSection(
+      'Python (programming language)',
+      4,
+      'en',
+      createMockContext(),
+    );
+
+    expect(result.sectionTitle).toBe('Syntax and semantics');
+    // `section=N` returns the section plus all of its subsections; none may be dropped.
+    for (const heading of ['Indentation', 'Statements and control flow', 'Function syntax']) {
+      expect(result.content).toContain(`=== ${heading} ===`);
+    }
+    expect(splitArticleIntoSections(result.content).map((p) => p.heading)).toEqual([
+      'Syntax and semantics',
+      'Indentation',
+      'Statements and control flow',
+      'Function syntax',
+    ]);
+  });
+
+  it('returns a lone heading and body for a section without subsections', async () => {
+    const { svc } = stubParse({
+      parse: {
+        title: 'TypeScript',
+        pageid: 25344315,
+        text: '<div class="mw-heading mw-heading2"><h2 id="History">History</h2></div>\n<p>TypeScript was first released in October 2012.\n</p>',
+      },
+    });
+
+    const result = await svc.getArticleSection('TypeScript', 1, 'en', createMockContext());
+
+    expect(result.sectionTitle).toBe('History');
+    expect(result.content).toBe('== History ==\n\nTypeScript was first released in October 2012.');
+    expect(splitArticleIntoSections(result.content)).toHaveLength(1);
+  });
+
+  it('forwards the first and the last section index unchanged', async () => {
+    const { svc, spy } = stubParse({
+      parse: { title: 'TypeScript', pageid: 25344315, text: '<p>Body.</p>' },
+    });
+    const ctx = createMockContext();
+
+    await svc.getArticleSection('TypeScript', 1, 'en', ctx);
+    await svc.getArticleSection('TypeScript', 15, 'en', ctx);
+
+    const sections = spy.mock.calls.map((call) => (call[1] as Record<string, string>).section);
+    expect(sections).toEqual(['1', '15']);
+  });
+
+  it('surfaces an out-of-range index as the API nosuchsection validation error', async () => {
+    // Bounds stay with the endpoint: `prop=text` reports `nosuchsection` exactly as `prop=wikitext`
+    // did, so no separate check against the section list is needed.
+    const { svc } = stubParse({
+      error: { code: 'nosuchsection', info: 'There is no section 999 in TypeScript.' },
+    });
+
+    await expect(
+      svc.getArticleSection('TypeScript', 999, 'en', createMockContext()),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      message: expect.stringContaining('does not exist'),
+    });
   });
 });

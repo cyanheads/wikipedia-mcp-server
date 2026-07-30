@@ -8,7 +8,7 @@
 |:-----|:------------|:-----------|:------------|:-------|
 | `wikipedia_search` | Full-text search across articles. Returns ranked results with plain-text titles, snippets, and page IDs. Use when the exact article title is unknown or to find multiple articles on a topic. | `query`, `limit`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `no_results` (NotFound), `invalid_language` (InvalidParams) |
 | `wikipedia_get_summary` | Fetch the lead section summary for an article — the 2–4 paragraph intro that answers "what is X?". Returns plain-text extract, Wikidata QID for cross-referencing, description, and thumbnail URL. Handles disambiguation pages: returns `page_type: "disambiguation"` so the agent can detect and pivot to a more specific search. | `title`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `invalid_language` (InvalidParams) |
-| `wikipedia_get_article` | Fetch article content as clean plain text. Full-article path uses `action=query&prop=extracts&explaintext=true` (40–100KB for major articles). Section-targeted path uses `action=parse&prop=wikitext&section={index}` with wikitext stripping applied — use `section_index` (from `wikipedia_get_sections`) to retrieve a single section. Prefer section targeting when only part of the article is needed. | `title`, `section_index`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `invalid_section` (InvalidParams), `invalid_language` (InvalidParams) |
+| `wikipedia_get_article` | Fetch article content as clean plain text. Full-article path uses `action=query&prop=extracts&explaintext=true` (40–100KB for major articles). Section-targeted path uses `action=parse&prop=text&section={index}`, rendering the parser's HTML for that section to plain text — use `section_index` (from `wikipedia_get_sections`) to retrieve a single section and its subsections. Prefer section targeting when only part of the article is needed. | `title`, `section_index`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `invalid_section` (InvalidParams), `invalid_language` (InvalidParams) |
 | `wikipedia_get_sections` | Fetch the table of contents for an article — section titles, numbers, levels, and `section_index` values. Call this before `wikipedia_get_article` when only a specific section is needed. The returned `section_index` values are the identifiers for targeted section reads. | `title`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `no_sections` (NotFound), `invalid_language` (InvalidParams) |
 | `wikipedia_search_nearby` | Find Wikipedia articles about places near a geographic coordinate. Returns articles within a radius, sorted by distance. Useful for "what's notable near X?" research. | `latitude`, `longitude`, `radius_meters`, `limit`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `no_results` (NotFound), `invalid_coordinates` (InvalidParams), `invalid_language` (InvalidParams) |
 | `wikipedia_get_languages` | List the language editions available for an article. Returns each edition's language code, tool-usable subdomain code, article title, and URL. Use for cross-language research or to find a non-English article title for a known concept. | `title`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `no_other_languages` (NotFound), `invalid_language` (InvalidParams) |
@@ -105,11 +105,13 @@ The idea doc proposed `wikipedia_get_sections` + section ID parameter on `wikipe
 The tool has two meaningfully different implementations sharing one name:
 
 - **Full article** — `action=query&prop=extracts&explaintext=true` (optionally `&exsectionformat=wiki` to preserve `== Section == ` markers). Returns plain text directly — no markup stripping needed. Size: 40–100KB.
-- **Section-targeted** — `action=parse&prop=wikitext&section={index}`. Returns raw wikitext for just that section. Wikitext must be stripped before returning (see wikitext stripping below). Size: 1–10KB, much more manageable.
+- **Section-targeted** — `action=parse&prop=text&section={index}`. Returns the parser's HTML for that section and every subsection under it, converted to plain text before returning (see [Section reads render parser HTML, not wikitext](#section-reads-render-parser-html-not-wikitext)). Size: 1–15KB, much more manageable.
 
-The two paths differ in: which API action is called, whether stripping is needed, and the order-of-magnitude difference in output size. Document both code paths in the handler and in inline comments so maintainers don't assume the full-article path is reused for section reads.
+The two paths differ in: which API action is called, how the response is converted to plain text, and the order-of-magnitude difference in output size. Document both code paths in the handler and in inline comments so maintainers don't assume the full-article path is reused for section reads.
 
 ### Wikitext stripping
+
+> Superseded — see [Section reads render parser HTML, not wikitext](#section-reads-render-parser-html-not-wikitext). The wikitext pipeline below is the original design and no longer describes the implementation; it is kept for the reasoning that led there.
 
 Section-targeted reads via `action=parse&prop=wikitext` return raw MediaWiki markup. This must be stripped before returning — agents can't use wikitext directly and the markup is noise in LLM context. The stripping pipeline:
 
@@ -124,6 +126,28 @@ Section-targeted reads via `action=parse&prop=wikitext` return raw MediaWiki mar
 9. Multiple blank lines → collapsed to single blank line
 
 Implementation: use `wtf_wikipedia` (npm: `wtf-wikipedia`) for the heavy lifting — it handles the recursive template and link grammar correctly. Regex alone is insufficient for nested templates. After `wtf_wikipedia` converts to plain text, apply the heading marker preservation and blank-line normalization as a post-pass. Verify output against real section wikitext from high-traffic articles (Python, United States, World War II) during implementation.
+
+### Section reads render parser HTML, not wikitext
+
+Section-targeted reads call `action=parse&prop=text&section={index}` and convert the parser's HTML for that section to plain text. This replaces the wikitext pipeline above, and the `wtf_wikipedia` dependency with it.
+
+Two properties of the wikitext approach could not be fixed in place:
+
+- **Templates.** A stripper outside the parser has to re-implement the template grammar, and drops what it cannot expand. Inline `{{code}}`/`{{mono}}` templates stripped to empty strings, rendering "The  statement, which conditionally executes a block of code, along with   and   (a contraction of  )". The parser expands templates before this server sees the content, so the same sentence arrives whole.
+- **Heading placement.** Wikitext stripping removed headings, so they were re-injected as one block at the top — asserting a structure the undifferentiated prose below did not have. HTML carries each heading inline with its own body, so document order is preserved without reconstruction.
+
+Two alternatives were measured against the live API and rejected:
+
+- **Slicing the full-article extract at heading _N_.** Attractive because the extract already renders both correctly, but the index space does not survive: `prop=extracts` drops sections whose body is entirely citation-template lists, heading and all. On `Barack Obama` the extract carries 46 headings against tocdata's 49 (the missing three are `Bibliography`'s `Books`, `Audiobooks`, and `Articles`), so every index from 36 up would resolve to the wrong section — silently, with plausible content. `Winston Churchill` and `Pacific Ocean` each drop one the same way. Positional counting held on the other 86 of 89 articles sampled, which is what makes the failure dangerous rather than obvious.
+- **Slicing the extract but resolving the target heading through tocdata instead of by position.** Fixes the count drift for headings the extract does carry, but a section the extract omits entirely has nothing to resolve to, so indices that work today would start failing.
+
+Keeping `action=parse&section={index}` avoids the question: the index space, the "section plus all of its subsections" scope, and the out-of-range `nosuchsection` error are all the endpoint's own behavior and are unchanged. Only the rendering moved.
+
+Three rendering conventions are deliberate:
+
+- **Data tables and figures are dropped; layout tables are not.** The original rule dropped every `<table>`, matching what the full-article extract path does, so that both paths rendered the same article the same way. That symmetry cost real content: MediaWiki also emits `<table>` for pure layout — `{{col-begin}}` and friends wrap ordinary `<ul>`/`<p>` content in one to arrange it in columns — so `Taylor Swift` / `Discography` came back as its heading plus a hatnote, 134 bytes against 526 with the lists kept, and the same shape emptied Filmography, Bibliography, and Works sections. A user-facing content regression outranks the symmetry preference, so a table marked `role="presentation"` — the parser's own discriminator for layout, which tracks new layout templates without a hand-maintained class list — is kept and its `<tbody>`/`<tr>`/`<td>` shell rendered as block boundaries. Section reads are now better than the full-article path for these list shapes, which is the accepted trade. Genuine data tables still go: cell-by-cell plain text loses the row and column relationship that makes them data. Maintenance banners are the one exception among layout tables — the ambox family is `role="presentation"` plus `class="metadata"`, MediaWiki's marker for page furniture, so the class is what separates a table wrapping article prose from one wrapping an editor notice about the article.
+- **Elements the page hides are dropped, judged from `display:none` in an inline style rather than a class list.** Tag stripping alone kept the text of markup MediaWiki never renders. The Math extension emits a screen-reader MathML twin behind `display:none`, so every formula rendered twice — once as a column of one glyph per source line, then again as the `{\displaystyle …}` TeX from the twin's `<annotation>`; `{{calculator}}` gadgets are hidden until their script runs, so button labels and widget state landed mid-section. The general rule was chosen over enumerating gadget class names because the hiding is what the shapes have in common and new gadgets would each need an entry. Since the TeX lived only inside the twin, the formula is recovered from `img.mwe-math-fallback-image-*`'s `alt` before anything is dropped.
+- **`<pre>` blocks keep their line breaks and indentation**, which the extract path does not — it drops code samples entirely. In a code sample indentation is syntax; an unindented Python listing reads as valid code and is not, which is worse than omitting it.
 
 ### Disambiguation handling
 
@@ -182,7 +206,7 @@ All requests: `format=json`
 | `action=query&titles={t}&prop=extracts&explaintext=true&exintro=true` | `wikipedia_get_article` (intro) |
 | `action=query&titles={t}&prop=extracts&explaintext=true&exsectionformat=wiki` | `wikipedia_get_article` (full) |
 | `action=parse&page={t}&prop=sections` | `wikipedia_get_sections` |
-| `action=parse&page={t}&prop=wikitext&section={index}` | `wikipedia_get_article` (section) |
+| `action=parse&page={t}&prop=text&section={index}` | `wikipedia_get_article` (section) |
 | `action=query&titles={t}&prop=langlinks&lllimit=500` | `wikipedia_get_languages` |
 | `action=query&list=geosearch&gscoord={lat}\|{lon}&gsradius={r}&gslimit={n}` | `wikipedia_search_nearby` |
 
@@ -240,7 +264,7 @@ No enforced rate limits, but:
 
 ### `wikipedia_get_article`
 
-**Description:** Fetch article content as clean plain text. Two code paths depending on whether `section_index` is provided. Without `section_index`: returns the full article via `action=query&prop=extracts&explaintext=true` — 40–100KB for major articles, with `== Section == ` markers preserved for structure. With `section_index` (from `wikipedia_get_sections`): returns just that section via `action=parse&prop=wikitext`, with wikitext markup stripped to plain text. Prefer section targeting when the full article exceeds what is needed.
+**Description:** Fetch article content as clean plain text. Two code paths depending on whether `section_index` is provided. Without `section_index`: returns the full article via `action=query&prop=extracts&explaintext=true` — 40–100KB for major articles, with `== Section == ` markers preserved for structure. With `section_index` (from `wikipedia_get_sections`): returns that section and its subsections via `action=parse&prop=text`, with the parser's HTML rendered to plain text. Prefer section targeting when the full article exceeds what is needed.
 
 **Input:**
 - `title: string` — article title
