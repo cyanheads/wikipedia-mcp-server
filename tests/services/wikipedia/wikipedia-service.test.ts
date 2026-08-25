@@ -8,7 +8,8 @@ import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { logger } from '@cyanheads/mcp-ts-core/utils';
+import { beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import {
   buildBaseUrl,
   type EditionIndex,
@@ -22,6 +23,13 @@ import {
   splitArticleIntoSections,
   WikipediaService,
 } from '@/services/wikipedia/wikipedia-service.js';
+
+/**
+ * `apiGet` is the private fetch seam every public method funnels through. Spying on it needs the
+ * method declared as a function: `vi.spyOn` narrows its key parameter to the callable properties of
+ * the object it is handed, so an `{ apiGet: unknown }` cast leaves it with none to choose from.
+ */
+type PrivateApiGet = { apiGet: (...args: unknown[]) => Promise<unknown> };
 
 const mockConfig = {} as AppConfig;
 const TEST_USER_AGENT =
@@ -70,6 +78,20 @@ function initService(baseUrl?: string): WikipediaService {
 beforeEach(() => {
   storageBacking.clear();
 });
+
+/**
+ * Silence and record `logger.warning` for one test. `vi.spyOn` hands back the *existing* spy when
+ * one is already installed, so the recorded calls have to be cleared per test and the original
+ * restored afterwards — otherwise a later test reads an earlier one's warning.
+ */
+function captureWarnings() {
+  const spy = vi.spyOn(logger, 'warning').mockImplementation(() => undefined);
+  spy.mockClear();
+  onTestFinished(() => {
+    spy.mockRestore();
+  });
+  return spy;
+}
 
 describe('WikipediaService init/accessor', () => {
   beforeEach(() => {
@@ -367,11 +389,88 @@ describe('WikipediaService edition index — cache and fallback (issue #26)', ()
     expect(svc.fetchEditionIndex).toHaveBeenCalledTimes(1);
   });
 
+  it('refetches and warns when the storage read throws', async () => {
+    const warned = captureWarnings();
+    const throwingStorage = {
+      get: async () => {
+        throw new Error('storage backend offline');
+      },
+      set: async (key: string, value: unknown) => {
+        storageBacking.set(key, value);
+      },
+    } as unknown as StorageService;
+    initWikipediaService(mockConfig, throwingStorage, TEST_USER_AGENT);
+    const svc = getWikipediaService();
+    vi.spyOn(svc, 'fetchEditionIndex').mockResolvedValue(TEST_EDITION_INDEX);
+    const ctx = createMockContext();
+
+    // An unreadable cache degrades to a refetch, not to a failed call.
+    expect(await svc.isUnknownEdition('ht', ctx)).toBe(false);
+    expect(svc.fetchEditionIndex).toHaveBeenCalledTimes(1);
+
+    expect(warned).toHaveBeenCalledWith(
+      expect.stringContaining('unreadable from storage'),
+      expect.anything(),
+    );
+    const [, payload] = warned.mock.calls[0] ?? [];
+    // The correlation fields survive, and the underlying failure reaches the emitted line —
+    // `withExtra` rides `extra`, which the logger flattens into the same field the old context
+    // spread wrote directly.
+    expect(payload).toMatchObject({ requestId: ctx.requestId });
+    expect(JSON.stringify(payload)).toContain('storage backend offline');
+  });
+
+  it('serves the index from the memo and warns when persisting it fails', async () => {
+    const warned = captureWarnings();
+    const readOnlyStorage = {
+      get: async (key: string) => storageBacking.get(key) ?? null,
+      set: async () => {
+        throw new Error('storage is read-only');
+      },
+    } as unknown as StorageService;
+    initWikipediaService(mockConfig, readOnlyStorage, TEST_USER_AGENT);
+    const svc = getWikipediaService();
+    vi.spyOn(svc, 'fetchEditionIndex').mockResolvedValue(TEST_EDITION_INDEX);
+    const ctx = createMockContext();
+
+    // A failed write is memo-only, not a failed resolution — and the second call is still served
+    // from the memo rather than refetching.
+    expect(await svc.isUnknownEdition('gsw', ctx)).toBe(false);
+    expect(await svc.editionHost('gsw', ctx)).toBe('https://als.wikipedia.org');
+    expect(svc.fetchEditionIndex).toHaveBeenCalledTimes(1);
+
+    expect(warned).toHaveBeenCalledWith(
+      expect.stringContaining('could not be persisted'),
+      expect.anything(),
+    );
+    const [, payload] = warned.mock.calls[0] ?? [];
+    expect(payload).toMatchObject({ requestId: ctx.requestId });
+    expect(JSON.stringify(payload)).toContain('storage is read-only');
+  });
+
+  it('warns with the upstream failure detail when the sitematrix fetch fails', async () => {
+    const warned = captureWarnings();
+    initWikipediaService(mockConfig, mockStorage, TEST_USER_AGENT);
+    const svc = getWikipediaService();
+    vi.spyOn(svc, 'fetchEditionIndex').mockRejectedValue(new Error('sitematrix unreachable'));
+    const ctx = createMockContext();
+
+    await svc.isUnknownEdition('fr', ctx);
+
+    expect(warned).toHaveBeenCalledWith(
+      expect.stringContaining('sitematrix unavailable'),
+      expect.anything(),
+    );
+    const [, payload] = warned.mock.calls[0] ?? [];
+    expect(payload).toMatchObject({ requestId: ctx.requestId });
+    expect(JSON.stringify(payload)).toContain('sitematrix unreachable');
+  });
+
   it('forwards expectedStatuses from restGet to the fetch layer', async () => {
     const svc = initService();
     const ctx = createMockContext();
     const spy = vi
-      .spyOn(svc as unknown as { apiGet: unknown }, 'apiGet')
+      .spyOn(svc as unknown as PrivateApiGet, 'apiGet')
       .mockResolvedValue({ extract: 'x' });
 
     await svc.restGet('en', '/page/summary/Test', ctx, { expectedStatuses: [404] });
@@ -382,11 +481,62 @@ describe('WikipediaService edition index — cache and fallback (issue #26)', ()
     const svc = initService();
     const ctx = createMockContext();
     const fetchSpy = vi
-      .spyOn(svc as unknown as { apiGet: unknown }, 'apiGet')
+      .spyOn(svc as unknown as PrivateApiGet, 'apiGet')
       .mockResolvedValue({ query: { pages: {} } });
 
     await svc.actionGet('gsw', { action: 'query' }, ctx).catch(() => undefined);
     expect(fetchSpy.mock.calls[0]?.[0]).toContain('https://als.wikipedia.org/w/api.php');
+  });
+});
+
+describe('WikipediaService — caller cancellation', () => {
+  /** Record the `signal` the upstream request was issued with, answering a minimal 200. */
+  function stubFetch() {
+    const seen: (AbortSignal | null | undefined)[] = [];
+    const spy = vi.spyOn(globalThis, 'fetch').mockImplementation((_input, init) => {
+      seen.push(init?.signal);
+      return Promise.resolve(
+        new Response('{"extract":"x"}', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      );
+    });
+    onTestFinished(() => {
+      spy.mockRestore();
+    });
+    return seen;
+  }
+
+  it("composes the handler context's AbortSignal into the upstream request", async () => {
+    const svc = initService();
+    const seen = stubFetch();
+    const controller = new AbortController();
+    // The live handler `Context` carries a signal; `RequestContext` does not declare one, and
+    // `fetchWithTimeout` strips non-serializable context fields — so the service has to pass it
+    // through explicitly for a client disconnect to cancel the in-flight request.
+    const ctx = { ...createMockContext(), signal: controller.signal };
+
+    await svc.restGet('en', '/page/summary/Test', ctx);
+
+    const issued = seen[0];
+    expect(issued).toBeInstanceOf(AbortSignal);
+    expect(issued?.aborted).toBe(false);
+
+    controller.abort();
+    expect(issued?.aborted).toBe(true);
+  });
+
+  it('issues the request when the context carries no signal', async () => {
+    const svc = initService();
+    const seen = stubFetch();
+    const { signal: _unused, ...ctx } = createMockContext();
+
+    await expect(svc.restGet('en', '/page/summary/Test', ctx)).resolves.toMatchObject({
+      extract: 'x',
+    });
+    // The timeout deadline is still armed — only the caller-cancellation half is absent.
+    expect(seen[0]).toBeInstanceOf(AbortSignal);
   });
 });
 
@@ -412,7 +562,7 @@ describe('WikipediaService — redirect resolution (issue #19)', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    const spy = vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    const spy = vi.spyOn(svc, 'actionGet').mockResolvedValue({
       query: {
         redirects: [{ from: 'NYC', to: 'New York City' }],
         pages: {
@@ -437,7 +587,7 @@ describe('WikipediaService — redirect resolution (issue #19)', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    const spy = vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    const spy = vi.spyOn(svc, 'actionGet').mockResolvedValue({
       parse: {
         title: 'New York City',
         pageid: 645042,
@@ -455,7 +605,7 @@ describe('WikipediaService — redirect resolution (issue #19)', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    const spy = vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    const spy = vi.spyOn(svc, 'actionGet').mockResolvedValue({
       parse: {
         title: 'New York City',
         pageid: 645042,
@@ -489,7 +639,7 @@ describe('WikipediaService.search — HTML entity decoding (issue #3)', () => {
     const ctx = createMockContext();
 
     // Stub actionGet to return a snippet with raw HTML entities.
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       query: {
         searchinfo: { totalhits: 1 },
         search: [
@@ -518,7 +668,7 @@ describe('WikipediaService.getArticleSection — formatversion=2 parse text (iss
     const ctx = createMockContext();
 
     // formatversion=2: text is `string`, not `{ '*': string }`.
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       parse: {
         title: 'Albert Einstein',
         pageid: 736,
@@ -543,7 +693,7 @@ describe('WikipediaService.getLanguages — formatversion=2 langlinks (issue #2)
     const ctx = createMockContext();
 
     // formatversion=2: langlinks use `title` and optionally `url`.
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       query: {
         pages: {
           '23862': {
@@ -580,7 +730,7 @@ describe('WikipediaService.getLanguages — editionCode derivation (issue #17)',
     const ctx = createMockContext();
 
     // Alemannic: language code "gsw" but the edition lives on the "als" subdomain.
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       query: {
         pages: {
           '23862': {
@@ -607,7 +757,7 @@ describe('WikipediaService.getLanguages — editionCode derivation (issue #17)',
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       query: {
         pages: {
           '1': {
@@ -635,7 +785,7 @@ describe('WikipediaService.search — empty results', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       query: {
         searchinfo: { totalhits: 0 },
         search: [],
@@ -651,7 +801,7 @@ describe('WikipediaService.search — empty results', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       query: {
         search: [{ title: 'T', pageid: 1, snippet: 'S', wordcount: 10 }],
       },
@@ -665,7 +815,7 @@ describe('WikipediaService.search — empty results', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       query: {
         searchinfo: { totalhits: 1 },
         search: [
@@ -694,7 +844,7 @@ describe('WikipediaService.getArticleFull — not_found handling', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       query: {},
     });
 
@@ -707,7 +857,7 @@ describe('WikipediaService.getArticleFull — not_found handling', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       query: {
         pages: {
           '-1': { title: 'Nonexistent', missing: '' },
@@ -724,7 +874,7 @@ describe('WikipediaService.getArticleFull — not_found handling', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       query: {
         pages: {
           '1': { pageid: 1, title: 'Stub', extract: '' },
@@ -741,7 +891,7 @@ describe('WikipediaService.getArticleFull — not_found handling', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       query: {
         pages: {
           '23862': {
@@ -769,7 +919,7 @@ describe('WikipediaService.getSummary — REST API mapping', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { restGet: unknown }, 'restGet').mockResolvedValue({
+    vi.spyOn(svc, 'restGet').mockResolvedValue({
       type: 'standard',
       title: 'Python (programming language)',
       pageid: 23862,
@@ -793,7 +943,7 @@ describe('WikipediaService.getSummary — REST API mapping', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { restGet: unknown }, 'restGet').mockResolvedValue({
+    vi.spyOn(svc, 'restGet').mockResolvedValue({
       type: 'standard',
       title: 'Empty Article',
       pageid: 1,
@@ -808,7 +958,7 @@ describe('WikipediaService.getSummary — REST API mapping', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    const spy = vi.spyOn(svc as unknown as { restGet: unknown }, 'restGet').mockResolvedValue({
+    const spy = vi.spyOn(svc, 'restGet').mockResolvedValue({
       type: 'standard',
       title: 'Test',
       extract: 'Content.',
@@ -825,7 +975,7 @@ describe('WikipediaService.getSummary — REST API mapping', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { restGet: unknown }, 'restGet').mockRejectedValue(
+    vi.spyOn(svc, 'restGet').mockRejectedValue(
       new McpError(JsonRpcErrorCode.NotFound, 'Not found'),
     );
 
@@ -844,7 +994,7 @@ describe('WikipediaService.getArticleSection — error codes', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       error: { code: 'nosuchsection', info: 'There is no section 99.' },
     });
 
@@ -857,7 +1007,7 @@ describe('WikipediaService.getArticleSection — error codes', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       error: { code: 'missingtitle', info: 'The page you requested does not exist.' },
     });
 
@@ -870,7 +1020,7 @@ describe('WikipediaService.getArticleSection — error codes', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       error: { code: 'unknownerror', info: 'Something went wrong.' },
     });
 
@@ -883,7 +1033,7 @@ describe('WikipediaService.getArticleSection — error codes', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       parse: {
         title: 'Roman Empire',
         pageid: 25507,
@@ -901,7 +1051,7 @@ describe('WikipediaService.getArticleSection — error codes', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       parse: {
         title: 'Article',
         pageid: 42,
@@ -923,7 +1073,7 @@ describe('WikipediaService.getSections — error codes and fallback', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       error: { code: 'missingtitle', info: 'The page does not exist.' },
     });
 
@@ -936,7 +1086,7 @@ describe('WikipediaService.getSections — error codes and fallback', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       error: { code: 'unknownerror', info: 'Something went wrong.' },
     });
 
@@ -951,7 +1101,7 @@ describe('WikipediaService.getSections — error codes and fallback', () => {
 
     // prop=tocdata shape: sections nest under parse.tocdata and hLevel is a number (prop=sections
     // put them at parse.sections with a string `level`). Output must be identical either way.
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       parse: {
         title: 'Python (programming language)',
         pageid: 23862,
@@ -982,7 +1132,7 @@ describe('WikipediaService.getLanguages — missing page handling', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       query: {
         pages: {
           '-1': { title: 'Nonexistent', missing: '' },
@@ -999,7 +1149,7 @@ describe('WikipediaService.getLanguages — missing page handling', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       query: {
         pages: {
           '1': { pageid: 1, title: 'Local Article' },
@@ -1015,7 +1165,7 @@ describe('WikipediaService.getLanguages — missing page handling', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       query: {
         pages: {
           '1': {
@@ -1036,7 +1186,7 @@ describe('WikipediaService.getLanguages — missing page handling', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       query: {
         pages: {
           '1': {
@@ -1060,7 +1210,7 @@ describe('WikipediaService.getLanguages — missing page handling', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       query: {
         pages: {
           '1': {
@@ -1085,7 +1235,7 @@ describe('WikipediaService.getLanguages — missing page handling', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       query: {
         pages: {
           '1': {
@@ -1111,7 +1261,7 @@ describe('WikipediaService.getLanguages — redirect resolution (issue #27)', ()
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    const spy = vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    const spy = vi.spyOn(svc, 'actionGet').mockResolvedValue({
       query: {
         redirects: [{ from: 'NYC', to: 'New York City' }],
         pages: {
@@ -1141,7 +1291,7 @@ describe('WikipediaService.getLanguages — redirect resolution (issue #27)', ()
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       query: {
         pages: {
           '1': {
@@ -1166,7 +1316,7 @@ describe('WikipediaService.searchNearby — result mapping', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       query: {
         geosearch: [
           { pageid: 34567, ns: 0, title: 'Space Needle', lat: 47.6205, lon: -122.3493, dist: 150 },
@@ -1189,7 +1339,7 @@ describe('WikipediaService.searchNearby — result mapping', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       query: { geosearch: [] },
     });
 
@@ -1218,7 +1368,7 @@ describe('WikipediaService.searchNearby — limit ceiling and truncation (issue 
     const svc = getWikipediaService();
     const ctx = createMockContext();
     const spy = vi
-      .spyOn(svc as unknown as { actionGet: unknown }, 'actionGet')
+      .spyOn(svc, 'actionGet')
       .mockResolvedValue({ query: { geosearch: geoResults(200) } });
 
     const { results } = await svc.searchNearby(0, 0, 10_000, 200, 'en', ctx);
@@ -1231,7 +1381,7 @@ describe('WikipediaService.searchNearby — limit ceiling and truncation (issue 
     const svc = getWikipediaService();
     const ctx = createMockContext();
     const spy = vi
-      .spyOn(svc as unknown as { actionGet: unknown }, 'actionGet')
+      .spyOn(svc, 'actionGet')
       .mockResolvedValue({ query: { geosearch: geoResults(0) } });
 
     await svc.searchNearby(0, 0, 1000, 5000, 'en', ctx);
@@ -1247,7 +1397,7 @@ describe('WikipediaService.searchNearby — limit ceiling and truncation (issue 
     const ctx = createMockContext();
     // Upstream returns no total, so truncation is established by the probe result: exactly `limit`
     // matches means the probe found nothing extra.
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       query: { geosearch: geoResults(10) },
     });
 
@@ -1259,7 +1409,7 @@ describe('WikipediaService.searchNearby — limit ceiling and truncation (issue 
   it('reports truncated true on genuine overflow and trims the probe result', async () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       query: { geosearch: geoResults(11) },
     });
 
@@ -1272,7 +1422,7 @@ describe('WikipediaService.searchNearby — limit ceiling and truncation (issue 
   it('reports truncated at the ceiling, where there is no room to probe', async () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       query: { geosearch: geoResults(GEOSEARCH_MAX_LIMIT) },
     });
 
@@ -1316,7 +1466,7 @@ describe('WikipediaService — output contains no secrets', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { restGet: unknown }, 'restGet').mockResolvedValue({
+    vi.spyOn(svc, 'restGet').mockResolvedValue({
       type: 'standard',
       title: 'Test',
       pageid: 1,
@@ -1332,7 +1482,7 @@ describe('WikipediaService — output contains no secrets', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       query: {
         searchinfo: { totalhits: 1 },
         search: [{ title: 'Test', pageid: 1, snippet: 'Normal snippet content.', wordcount: 100 }],
@@ -1353,7 +1503,7 @@ describe('WikipediaService.search — pagination (issue #22)', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    const spy = vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    const spy = vi.spyOn(svc, 'actionGet').mockResolvedValue({
       query: {
         searchinfo: { totalhits: 100 },
         search: [{ title: 'R', pageid: 1, snippet: 'S', wordcount: 10 }],
@@ -1372,7 +1522,7 @@ describe('WikipediaService.search — pagination (issue #22)', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       query: {
         searchinfo: { totalhits: 6 },
         search: [{ title: 'Last', pageid: 9, snippet: 'S', wordcount: 10 }],
@@ -1387,7 +1537,7 @@ describe('WikipediaService.search — pagination (issue #22)', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    const spy = vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    const spy = vi.spyOn(svc, 'actionGet').mockResolvedValue({
       query: { searchinfo: { totalhits: 0 }, search: [] },
     });
 
@@ -1399,7 +1549,7 @@ describe('WikipediaService.search — pagination (issue #22)', () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
-    vi.spyOn(svc as unknown as { actionGet: unknown }, 'actionGet').mockResolvedValue({
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
       query: { searchinfo: { totalhits: 12 }, search: [] },
     });
 
@@ -1919,9 +2069,7 @@ describe('WikipediaService.getArticleSection — rendered section reads (issue #
   /** Stub `actionGet` with the given parse payload and hand back the spy for param assertions. */
   function stubParse(payload: unknown) {
     const svc = getWikipediaService();
-    const spy = vi
-      .spyOn(svc as unknown as { actionGet: unknown }, 'actionGet')
-      .mockResolvedValue(payload);
+    const spy = vi.spyOn(svc, 'actionGet').mockResolvedValue(payload);
     return { svc, spy };
   }
 

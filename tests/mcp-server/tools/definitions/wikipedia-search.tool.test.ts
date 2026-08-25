@@ -32,7 +32,7 @@ describe('wikipediaSearch', () => {
       }),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaSearch.errors });
     const input = wikipediaSearch.input.parse({ query: 'Python', limit: 10, language: 'en' });
     const result = await wikipediaSearch.handler(input, ctx);
 
@@ -72,7 +72,7 @@ describe('wikipediaSearch', () => {
       search: searchFn,
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaSearch.errors });
     const input = wikipediaSearch.input.parse({ query: 'Test' });
     await wikipediaSearch.handler(input, ctx);
 
@@ -88,7 +88,7 @@ describe('wikipediaSearch', () => {
       search: searchFn,
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaSearch.errors });
     const input = wikipediaSearch.input.parse({ query: 'Test', limit: 999 });
     await wikipediaSearch.handler(input, ctx);
 
@@ -147,7 +147,7 @@ describe('wikipediaSearch', () => {
       search: searchFn,
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaSearch.errors });
     const input = wikipediaSearch.input.parse({ query: 'Python', language: 'fr' });
     const result = await wikipediaSearch.handler(input, ctx);
 
@@ -171,7 +171,7 @@ describe('wikipediaSearch', () => {
       }),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaSearch.errors });
     const input = wikipediaSearch.input.parse({ query: 'test', limit: 1 });
     await wikipediaSearch.handler(input, ctx);
 
@@ -230,7 +230,7 @@ describe('wikipediaSearch', () => {
       search: searchFn,
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaSearch.errors });
     const input = wikipediaSearch.input.parse({ query: 'Python', limit: 5, offset: 5 });
     await wikipediaSearch.handler(input, ctx);
 
@@ -261,14 +261,14 @@ describe('wikipediaSearch', () => {
       search: searchFn,
     });
 
-    const ctx1 = createMockContext();
+    const ctx1 = createMockContext({ errors: wikipediaSearch.errors });
     const r1 = await wikipediaSearch.handler(
       wikipediaSearch.input.parse({ query: 'Q', limit: 2, offset: 0 }),
       ctx1,
     );
     expect(getEnrichment(ctx1).nextOffset).toBe(2);
 
-    const ctx2 = createMockContext();
+    const ctx2 = createMockContext({ errors: wikipediaSearch.errors });
     const r2 = await wikipediaSearch.handler(
       wikipediaSearch.input.parse({ query: 'Q', limit: 2, offset: 2 }),
       ctx2,
@@ -288,7 +288,7 @@ describe('wikipediaSearch', () => {
       }),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaSearch.errors });
     const input = wikipediaSearch.input.parse({ query: 'Python', offset: 5 });
     await wikipediaSearch.handler(input, ctx);
 
@@ -322,7 +322,7 @@ describe('wikipediaSearch', () => {
       search: searchFn,
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaSearch.errors });
     const input = wikipediaSearch.input.parse({ query: 'Test' });
     await wikipediaSearch.handler(input, ctx);
 

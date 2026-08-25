@@ -31,7 +31,7 @@ describe('wikipediaGetSections', () => {
       getSections: vi.fn().mockResolvedValue(mockSections),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaGetSections.errors });
     const input = wikipediaGetSections.input.parse({ title: 'Python (programming language)' });
     const result = await wikipediaGetSections.handler(input, ctx);
 
@@ -131,7 +131,7 @@ describe('wikipediaGetSections', () => {
       }),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaGetSections.errors });
     // Caller passes the alias "NYC"; output should carry the resolved article title.
     const input = wikipediaGetSections.input.parse({ title: 'NYC' });
     const result = await wikipediaGetSections.handler(input, ctx);
@@ -149,7 +149,7 @@ describe('wikipediaGetSections', () => {
       getSections: getSectionsFn,
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaGetSections.errors });
     const input = wikipediaGetSections.input.parse({ title: 'Python (langage)', language: 'fr' });
     const result = await wikipediaGetSections.handler(input, ctx);
 
@@ -162,7 +162,7 @@ describe('wikipediaGetSections', () => {
       getSections: vi.fn().mockResolvedValue(mockSections),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaGetSections.errors });
     const input = wikipediaGetSections.input.parse({ title: 'Python (programming language)' });
     const result = await wikipediaGetSections.handler(input, ctx);
 

@@ -25,7 +25,7 @@ describe('wikipediaGetArticle', () => {
       }),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaGetArticle.errors });
     const input = wikipediaGetArticle.input.parse({ title: 'Python (programming language)' });
     const result = await wikipediaGetArticle.handler(input, ctx);
 
@@ -45,7 +45,7 @@ describe('wikipediaGetArticle', () => {
       }),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaGetArticle.errors });
     const input = wikipediaGetArticle.input.parse({
       title: 'Python (programming language)',
       section_index: 1,
@@ -79,6 +79,7 @@ describe('wikipediaGetArticle', () => {
       content: '== History ==\nCreated in 1991.',
       section_title: undefined,
       content_type: 'full_article',
+      truncated: false,
       language: 'en',
     };
     const blocks = wikipediaGetArticle.format!(output);
@@ -96,6 +97,7 @@ describe('wikipediaGetArticle', () => {
       content: 'Python was created by Guido.',
       section_title: 'History',
       content_type: 'section',
+      truncated: false,
       language: 'en',
     };
     const blocks = wikipediaGetArticle.format!(output);
@@ -235,7 +237,7 @@ describe('wikipediaGetArticle', () => {
       }),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaGetArticle.errors });
     // Caller passes the alias "NYC"; output should carry the resolved article title.
     const input = wikipediaGetArticle.input.parse({ title: 'NYC' });
     const result = await wikipediaGetArticle.handler(input, ctx);
@@ -253,7 +255,7 @@ describe('wikipediaGetArticle', () => {
       getArticleFull: getArticleFullFn,
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaGetArticle.errors });
     const input = wikipediaGetArticle.input.parse({ title: 'Python (langage)', language: 'fr' });
     const result = await wikipediaGetArticle.handler(input, ctx);
 
@@ -268,6 +270,7 @@ describe('wikipediaGetArticle', () => {
       content: 'Some article content.',
       section_title: undefined,
       content_type: 'full_article',
+      truncated: false,
       language: 'en',
     };
     const blocks = wikipediaGetArticle.format!(output);
@@ -285,7 +288,7 @@ describe('wikipediaGetArticle', () => {
       }),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaGetArticle.errors });
     const input = wikipediaGetArticle.input.parse({ title: 'Albert Einstein' });
     const result = await wikipediaGetArticle.handler(input, ctx);
     expect(result.section_title).toBeUndefined();
@@ -301,7 +304,7 @@ describe('wikipediaGetArticle', () => {
       }),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaGetArticle.errors });
     const input = wikipediaGetArticle.input.parse({ title: 'Small Article' });
     const result = await wikipediaGetArticle.handler(input, ctx);
 
@@ -325,7 +328,7 @@ describe('wikipediaGetArticle', () => {
       }),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaGetArticle.errors });
     const input = wikipediaGetArticle.input.parse({ title: 'Big Article' });
     const result = await wikipediaGetArticle.handler(input, ctx);
 

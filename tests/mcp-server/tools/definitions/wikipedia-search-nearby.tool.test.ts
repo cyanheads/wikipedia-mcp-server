@@ -39,7 +39,7 @@ describe('wikipediaSearchNearby', () => {
       }),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaSearchNearby.errors });
     const input = wikipediaSearchNearby.input.parse({
       latitude: 47.6205,
       longitude: -122.3493,
@@ -100,7 +100,7 @@ describe('wikipediaSearchNearby', () => {
       searchNearby: nearbyFn,
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaSearchNearby.errors });
     const input = wikipediaSearchNearby.input.parse({
       latitude: 0,
       longitude: 0,
@@ -261,7 +261,7 @@ describe('wikipediaSearchNearby', () => {
       }),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaSearchNearby.errors });
     const input = wikipediaSearchNearby.input.parse({ latitude: 0, longitude: 0, limit: 1 });
     await wikipediaSearchNearby.handler(input, ctx);
 
@@ -285,7 +285,7 @@ describe('wikipediaSearchNearby', () => {
       }),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaSearchNearby.errors });
     const input = wikipediaSearchNearby.input.parse({ latitude: 0, longitude: 0, limit: 2 });
     await wikipediaSearchNearby.handler(input, ctx);
 
@@ -313,7 +313,7 @@ describe('wikipediaSearchNearby', () => {
       searchNearby: nearbyFn,
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaSearchNearby.errors });
     const input = wikipediaSearchNearby.input.parse({
       latitude: 48.858,
       longitude: 2.294,

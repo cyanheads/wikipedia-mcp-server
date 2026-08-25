@@ -35,7 +35,7 @@ describe('wikipediaGetLanguages', () => {
       }),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaGetLanguages.errors });
     const input = wikipediaGetLanguages.input.parse({ title: 'Python (programming language)' });
     const result = await wikipediaGetLanguages.handler(input, ctx);
 
@@ -120,7 +120,7 @@ describe('wikipediaGetLanguages', () => {
       }),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaGetLanguages.errors });
     const input = wikipediaGetLanguages.input.parse({ title: 'Python (programming language)' });
     const result = await wikipediaGetLanguages.handler(input, ctx);
 
@@ -147,7 +147,7 @@ describe('wikipediaGetLanguages', () => {
       }),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaGetLanguages.errors });
     const input = wikipediaGetLanguages.input.parse({ title: 'Python (programming language)' });
     const result = await wikipediaGetLanguages.handler(input, ctx);
 
@@ -195,7 +195,7 @@ describe('wikipediaGetLanguages', () => {
       getLanguages: getLanguagesFn,
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaGetLanguages.errors });
     const input = wikipediaGetLanguages.input.parse({ title: 'Python (langage)', language: 'fr' });
     const result = await wikipediaGetLanguages.handler(input, ctx);
 
@@ -213,7 +213,7 @@ describe('wikipediaGetLanguages', () => {
       }),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaGetLanguages.errors });
     // "NYC" redirects to "New York City"; the response must name the article the links belong to.
     const input = wikipediaGetLanguages.input.parse({ title: 'NYC' });
     const result = await wikipediaGetLanguages.handler(input, ctx);
@@ -229,7 +229,7 @@ describe('wikipediaGetLanguages', () => {
       }),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaGetLanguages.errors });
     const input = wikipediaGetLanguages.input.parse({ title: 'Test' });
     const result = await wikipediaGetLanguages.handler(input, ctx);
 

@@ -32,7 +32,7 @@ describe('wikipediaGetSummary', () => {
       getSummary: vi.fn().mockResolvedValue(mockSummary),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaGetSummary.errors });
     const input = wikipediaGetSummary.input.parse({ title: 'Python (programming language)' });
     const result = await wikipediaGetSummary.handler(input, ctx);
 
@@ -85,7 +85,8 @@ describe('wikipediaGetSummary', () => {
 
     const ctx = createMockContext({ errors: wikipediaGetSummary.errors });
     const input = wikipediaGetSummary.input.parse({ title: 'Ayiti', language: 'hat' });
-    const rejection = await wikipediaGetSummary.handler(input, ctx).then(
+    // `handler` is declared `Promise<T> | T`, so normalize before attaching a rejection handler.
+    const rejection = await Promise.resolve(wikipediaGetSummary.handler(input, ctx)).then(
       () => undefined,
       (err: unknown) => err as { message: string; data: { reason: string } },
     );
@@ -107,7 +108,7 @@ describe('wikipediaGetSummary', () => {
       }),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaGetSummary.errors });
     const input = wikipediaGetSummary.input.parse({ title: 'Python' });
     const result = await wikipediaGetSummary.handler(input, ctx);
 
@@ -124,7 +125,7 @@ describe('wikipediaGetSummary', () => {
       }),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaGetSummary.errors });
     const input = wikipediaGetSummary.input.parse({ title: 'SomePage' });
     const result = await wikipediaGetSummary.handler(input, ctx);
 
@@ -226,7 +227,7 @@ describe('wikipediaGetSummary', () => {
       getSummary: getSummaryFn,
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaGetSummary.errors });
     const input = wikipediaGetSummary.input.parse({ title: 'Python (langage)', language: 'fr' });
     const result = await wikipediaGetSummary.handler(input, ctx);
 
@@ -257,7 +258,7 @@ describe('wikipediaGetSummary', () => {
       getSummary: getSummaryFn,
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: wikipediaGetSummary.errors });
     const input = wikipediaGetSummary.input.parse({ title: 'Tōkyō Tawā' });
     const result = await wikipediaGetSummary.handler(input, ctx);
     expect(result.title).toBe('Tōkyō Tawā');

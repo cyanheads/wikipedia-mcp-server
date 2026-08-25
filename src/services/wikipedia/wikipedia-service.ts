@@ -12,8 +12,8 @@ import {
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
-import type { RequestContextLike } from '@cyanheads/mcp-ts-core/utils';
-import { fetchWithTimeout, logger, withRetry } from '@cyanheads/mcp-ts-core/utils';
+import type { RequestContext } from '@cyanheads/mcp-ts-core/utils';
+import { fetchWithTimeout, logger, withExtra, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import type {
   ActionExtractsRaw,
   ActionGeoSearchRaw,
@@ -793,6 +793,18 @@ function editionCodeFromUrl(url: string): string | undefined {
 // WikipediaService
 // ---------------------------------------------------------------------------
 
+/**
+ * The context every service method takes: the canonical {@link RequestContext} the logger and
+ * storage layer read, plus the live `AbortSignal` a handler context carries.
+ *
+ * `RequestContext` is closed and declares no `signal` — it is the serializable projection, and the
+ * network helpers strip non-serializable fields from the context they are handed. Cancellation has
+ * to be wired through `fetchWithTimeout`'s own `signal` option instead, so the type names the field
+ * rather than casting to reach it. A caller holding only a plain `RequestContext` still satisfies
+ * this: the request simply runs to its timeout with nothing to cancel it early.
+ */
+type ServiceContext = RequestContext & { signal?: AbortSignal };
+
 export class WikipediaService {
   /** Process-local index cache, so a warm process never re-reads storage per call. */
   private indexMemo?: { index: EditionIndex; expiresAt: number };
@@ -832,10 +844,10 @@ export class WikipediaService {
     url: string,
     operation: string,
     apiLabel: string,
-    ctx: RequestContextLike,
+    ctx: ServiceContext,
     options: { expectedStatuses?: number[]; timeoutMs?: number; maxRetries?: number } = {},
   ): Promise<T> {
-    const signal = (ctx as { signal?: AbortSignal }).signal;
+    const { signal } = ctx;
     return await withRetry(
       async () => {
         const response = await fetchWithTimeout(url, options.timeoutMs ?? 15_000, ctx, {
@@ -870,7 +882,7 @@ export class WikipediaService {
   async restGet<T>(
     language: string,
     path: string,
-    ctx: RequestContextLike,
+    ctx: ServiceContext,
     options: { expectedStatuses?: number[] } = {},
   ): Promise<T> {
     const base = await this.resolveBaseUrl(language, ctx);
@@ -887,7 +899,7 @@ export class WikipediaService {
   async actionGet<T>(
     language: string,
     params: Record<string, string>,
-    ctx: RequestContextLike,
+    ctx: ServiceContext,
   ): Promise<T> {
     const base = await this.resolveBaseUrl(language, ctx);
     const qs = new URLSearchParams({ format: 'json', formatversion: '2', ...params }).toString();
@@ -912,7 +924,7 @@ export class WikipediaService {
    * would recurse. Retries once rather than the default three — a caller is waiting on a guard
    * whose value is failing fast, and the fallback set covers the miss.
    */
-  async fetchEditionIndex(ctx: RequestContextLike): Promise<EditionIndex> {
+  async fetchEditionIndex(ctx: ServiceContext): Promise<EditionIndex> {
     const qs = new URLSearchParams({
       action: 'sitematrix',
       format: 'json',
@@ -941,7 +953,7 @@ export class WikipediaService {
    * single-instance override mode: that host may serve any editions, so no Wikipedia edition set
    * describes it and no sitematrix fetch is warranted.
    */
-  private async editionIndex(ctx: RequestContextLike): Promise<EditionIndex | undefined> {
+  private async editionIndex(ctx: ServiceContext): Promise<EditionIndex | undefined> {
     if (this.baseUrl) return;
 
     const now = Date.now();
@@ -953,7 +965,7 @@ export class WikipediaService {
     return await this.indexInFlight;
   }
 
-  private async buildEditionIndex(ctx: RequestContextLike): Promise<EditionIndex | undefined> {
+  private async buildEditionIndex(ctx: ServiceContext): Promise<EditionIndex | undefined> {
     try {
       const cached = await this.storage.get<EditionIndex>(EDITION_INDEX_STORAGE_KEY, ctx);
       if (cached?.hosts && Object.keys(cached.hosts).length > 0) {
@@ -961,10 +973,10 @@ export class WikipediaService {
         return cached;
       }
     } catch (err) {
-      logger.warning('Wikipedia edition index unreadable from storage; refetching.', {
-        ...ctx,
-        error: err instanceof Error ? err.message : String(err),
-      });
+      logger.warning(
+        'Wikipedia edition index unreadable from storage; refetching.',
+        withExtra(ctx, { error: err instanceof Error ? err.message : String(err) }),
+      );
     }
 
     try {
@@ -973,17 +985,17 @@ export class WikipediaService {
       await this.storage
         .set(EDITION_INDEX_STORAGE_KEY, index, ctx, { ttl: EDITION_INDEX_TTL_SECONDS })
         .catch((err: unknown) => {
-          logger.warning('Wikipedia edition index could not be persisted; memo only.', {
-            ...ctx,
-            error: err instanceof Error ? err.message : String(err),
-          });
+          logger.warning(
+            'Wikipedia edition index could not be persisted; memo only.',
+            withExtra(ctx, { error: err instanceof Error ? err.message : String(err) }),
+          );
         });
       return index;
     } catch (err) {
       this.indexRetryAfter = Date.now() + EDITION_INDEX_RETRY_AFTER_FAILURE_MS;
       logger.warning(
         'Wikipedia sitematrix unavailable; falling back to the offline edition set, which rejects some real editions.',
-        { ...ctx, error: err instanceof Error ? err.message : String(err) },
+        withExtra(ctx, { error: err instanceof Error ? err.message : String(err) }),
       );
       return;
     }
@@ -1005,7 +1017,7 @@ export class WikipediaService {
    * Always `false` in single-instance override mode: that host may serve any editions, so the
    * Wikipedia-specific edition set must not gate it.
    */
-  async isUnknownEdition(language: string, ctx: RequestContextLike): Promise<boolean> {
+  async isUnknownEdition(language: string, ctx: ServiceContext): Promise<boolean> {
     if (this.baseUrl) return false;
     if (isMalformedLanguage(language)) return true;
     const normalized = language.toLowerCase();
@@ -1018,7 +1030,7 @@ export class WikipediaService {
    * lookup that lets a langlinks entry missing its `url` resolve a real host from its language
    * code instead of interpolating one that may not exist.
    */
-  async editionHost(code: string, ctx: RequestContextLike): Promise<string | undefined> {
+  async editionHost(code: string, ctx: ServiceContext): Promise<string | undefined> {
     const index = await this.editionIndex(ctx);
     return index?.hosts[code.toLowerCase()];
   }
@@ -1029,7 +1041,7 @@ export class WikipediaService {
    * set when the registry is unavailable. Throws `invalid_language`-shaped validation errors,
    * which tool handlers pre-empt with their own typed `ctx.fail`.
    */
-  private async resolveBaseUrl(language: string, ctx: RequestContextLike): Promise<string> {
+  private async resolveBaseUrl(language: string, ctx: ServiceContext): Promise<string> {
     if (this.baseUrl) return this.baseUrl.replace(/\/+$/, '');
     assertStructuralLanguage(language);
     const index = await this.editionIndex(ctx);
@@ -1047,7 +1059,7 @@ export class WikipediaService {
   async getSummary(
     title: string,
     language: string,
-    ctx: RequestContextLike,
+    ctx: ServiceContext,
   ): Promise<{
     title: string;
     pageType: string;
@@ -1109,7 +1121,7 @@ export class WikipediaService {
     query: string,
     limit: number,
     language: string,
-    ctx: RequestContextLike,
+    ctx: ServiceContext,
     offset = 0,
   ): Promise<{
     results: Array<{ title: string; pageid: number; snippet: string; wordcount: number }>;
@@ -1148,7 +1160,7 @@ export class WikipediaService {
   async getArticleFull(
     title: string,
     language: string,
-    ctx: RequestContextLike,
+    ctx: ServiceContext,
   ): Promise<{ title: string; pageid: number | undefined; content: string }> {
     const raw = await this.actionGet<ActionExtractsRaw>(
       language,
@@ -1210,7 +1222,7 @@ export class WikipediaService {
     title: string,
     sectionIndex: number,
     language: string,
-    ctx: RequestContextLike,
+    ctx: ServiceContext,
   ): Promise<{ title: string; pageid: number | undefined; sectionTitle: string; content: string }> {
     const raw = await this.actionGet<ActionParseTextRaw>(
       language,
@@ -1271,7 +1283,7 @@ export class WikipediaService {
   async getSections(
     title: string,
     language: string,
-    ctx: RequestContextLike,
+    ctx: ServiceContext,
   ): Promise<{
     title: string;
     pageid: number | undefined;
@@ -1341,7 +1353,7 @@ export class WikipediaService {
   async getLanguages(
     title: string,
     sourceLanguage: string,
-    ctx: RequestContextLike,
+    ctx: ServiceContext,
   ): Promise<{
     title: string;
     languages: Array<{
@@ -1419,7 +1431,7 @@ export class WikipediaService {
     radiusMeters: number,
     limit: number,
     language: string,
-    ctx: RequestContextLike,
+    ctx: ServiceContext,
   ): Promise<{
     results: Array<{
       title: string;
