@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.17](changelog/0.1.x/0.1.17.md) — 2026-08-25
+
+Adopt mcp-ts-core 0.12.3's MCP SDK v2 migration (strict tool inputs, outputSchema error envelope, JSON Schema 2020-12); settle MCP_SESSION_MODE on stateless; bump Bun to 1.4.0
+
 ## [0.1.16](changelog/0.1.x/0.1.16.md) — 2026-07-29
 
 Section-targeted reads no longer render sister-project, library-resource, portal-bar, and spoken-article boxes as prose

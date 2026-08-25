@@ -15,7 +15,7 @@ const ServerConfigSchema = z.object({
     ),
   userAgent: z
     .string()
-    .default('wikipedia-mcp-server/0.1.16 (https://github.com/cyanheads/wikipedia-mcp-server)')
+    .default('wikipedia-mcp-server/0.1.17 (https://github.com/cyanheads/wikipedia-mcp-server)')
     .describe('User-Agent header sent with every request per Wikimedia policy'),
   articleOverflowBytes: z.coerce
     .number()
