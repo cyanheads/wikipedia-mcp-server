@@ -3,8 +3,14 @@
 #
 # This stage installs all dependencies (including dev), builds the TypeScript
 # source code into JavaScript, and prepares the production assets.
+#
+# Pinned to $BUILDPLATFORM so the compile runs natively on the builder rather
+# than under QEMU for each target: Bun 1.4.0 aborts (SIGABRT, JSC memory
+# assertion) compiling under x86_64 emulation. The output is architecture-
+# independent JavaScript, and the production stage installs its own native
+# dependencies per target, so nothing platform-specific crosses the boundary.
 # ==============================================================================
-FROM oven/bun:1.4.0 AS build
+FROM --platform=$BUILDPLATFORM oven/bun:1.4.0 AS build
 
 WORKDIR /usr/src/app
 
