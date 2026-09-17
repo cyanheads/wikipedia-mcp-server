@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.1](changelog/0.2.x/0.2.1.md) — 2026-09-17
+
+Fix wikipedia_get_article/get_sections lead-section (section_index 0) handling; wikipedia_search_articles rejects invalid input and discloses its result window; four tools reject MediaWiki-illegal titles; adopt mcp-ts-core 0.13.3
+
 ## [0.2.0](changelog/0.2.x/0.2.0.md) — 2026-09-17 · ⚠️ Breaking
 
 Breaking: wikipedia_search renamed to wikipedia_search_articles; fix wikipedia_get_sections titles carrying raw tocdata markup; adopt mcp-ts-core 0.13.2
