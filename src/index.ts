@@ -17,10 +17,16 @@ await createApp({
   prompts: [],
   instructions: `Wikipedia MCP server providing encyclopedic context via the MediaWiki REST API and Action API.
 - Use wikipedia_get_summary for "what is X?" lookups (90% of cases) — returns the lead section, Wikidata QID, and thumbnail.
-- Use wikipedia_search when the exact article title is unknown.
+- Use wikipedia_search_articles when the exact article title is unknown.
 - Use wikipedia_get_sections then wikipedia_get_article with section_index for targeted section reads — much smaller than full articles.
 - All tools support a language parameter (default "en") for multi-language workflows.
-- wikipedia_get_summary returns page_type: "disambiguation" for disambiguation pages — follow up with wikipedia_search.`,
+- wikipedia_get_summary returns page_type: "disambiguation" for disambiguation pages — follow up with wikipedia_search_articles.`,
+  /**
+   * No handler asks the caller for input mid-request, so nothing here needs the 2025-era session
+   * channel. Declared in source rather than left to a deployment's `MCP_SESSION_MODE`, which still
+   * wins whenever it carries a meaningful value.
+   */
+  sessionMode: 'stateless',
   landing: { requireAuth: false },
   setup(core) {
     const serverConfig = getServerConfig();
