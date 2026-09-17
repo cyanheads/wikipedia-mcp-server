@@ -14,7 +14,7 @@ import {
 export const wikipediaGetSummary = tool('wikipedia_get_summary', {
   title: 'Get Wikipedia Summary',
   description:
-    'Fetch the lead-section summary for a Wikipedia article — the 2–4 paragraph intro that answers "what is X?". Returns plain-text extract, Wikidata QID (wikibase_item) for cross-referencing with wikidata-mcp-server, short description, and thumbnail URL. Redirect pages are followed automatically. When page_type is "disambiguation", the title matched a disambiguation page — call wikipedia_search with a more specific query to find the intended article. Prefer this over wikipedia_get_article unless full article depth is needed.',
+    'Fetch the lead-section summary for a Wikipedia article — the 2–4 paragraph intro that answers "what is X?". Returns plain-text extract, Wikidata QID (wikibase_item) for cross-referencing with wikidata-mcp-server, short description, and thumbnail URL. Redirect pages are followed automatically. When page_type is "disambiguation", the title matched a disambiguation page — call wikipedia_search_articles with a more specific query to find the intended article. Prefer this over wikipedia_get_article unless full article depth is needed.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     title: z
@@ -30,7 +30,7 @@ export const wikipediaGetSummary = tool('wikipedia_get_summary', {
     page_type: z
       .string()
       .describe(
-        'Page type from the Wikipedia REST API. Common values: "standard" (regular article), "disambiguation" (disambiguation page), "no-extract" (article with no extract). When "disambiguation", call wikipedia_search with a more specific query.',
+        'Page type from the Wikipedia REST API. Common values: "standard" (regular article), "disambiguation" (disambiguation page), "no-extract" (article with no extract). When "disambiguation", call wikipedia_search_articles with a more specific query.',
       ),
     pageid: z.number().optional().describe('Wikipedia page ID. Absent when the API omits it.'),
     wikibase_item: z
@@ -53,7 +53,8 @@ export const wikipediaGetSummary = tool('wikipedia_get_summary', {
       reason: 'not_found',
       code: JsonRpcErrorCode.NotFound,
       when: 'No Wikipedia article exists for the given title.',
-      recovery: 'Use wikipedia_search to discover the correct article title and try again.',
+      recovery:
+        'Use wikipedia_search_articles to discover the correct article title and try again.',
     },
     {
       reason: 'invalid_language',
@@ -90,10 +91,10 @@ export const wikipediaGetSummary = tool('wikipedia_get_summary', {
     if (isBlankTitle(input.title)) {
       throw ctx.fail(
         'not_found',
-        'Article title must not be blank. Provide a title, or use wikipedia_search to find one.',
+        'Article title must not be blank. Provide a title, or use wikipedia_search_articles to find one.',
         {
           recovery: {
-            hint: 'Provide a non-empty article title, or use wikipedia_search to discover one.',
+            hint: 'Provide a non-empty article title, or use wikipedia_search_articles to discover one.',
           },
         },
       );
@@ -109,7 +110,7 @@ export const wikipediaGetSummary = tool('wikipedia_get_summary', {
         throw ctx.fail('not_found', err.message, {
           title: input.title,
           language,
-          recovery: { hint: 'Use wikipedia_search to find the correct article title.' },
+          recovery: { hint: 'Use wikipedia_search_articles to find the correct article title.' },
         });
       }
       throw err;

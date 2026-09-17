@@ -1,6 +1,6 @@
 /**
- * @fileoverview wikipedia_search tool — full-text search across Wikipedia articles.
- * @module mcp-server/tools/definitions/wikipedia-search.tool
+ * @fileoverview wikipedia_search_articles tool — full-text search across Wikipedia articles.
+ * @module mcp-server/tools/definitions/wikipedia-search-articles.tool
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
@@ -10,7 +10,7 @@ import {
   isMalformedLanguage,
 } from '@/services/wikipedia/wikipedia-service.js';
 
-export const wikipediaSearch = tool('wikipedia_search', {
+export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
   title: 'Search Wikipedia',
   description:
     'Search Wikipedia articles by full-text query. Returns ranked results with plain-text titles, snippets (HTML stripped), page IDs, and word counts. Best when the exact article title is unknown or when multiple articles on a topic are needed. Pass a result title to wikipedia_get_summary, wikipedia_get_article, or wikipedia_get_sections for follow-up reads. Use offset to page beyond the first result page. Supports all Wikipedia language editions.',

@@ -1,19 +1,30 @@
 /**
- * @fileoverview Tests for wikipedia_search tool.
- * @module tests/mcp-server/tools/definitions/wikipedia-search.tool.test
+ * @fileoverview Tests for wikipedia_search_articles tool.
+ * @module tests/mcp-server/tools/definitions/wikipedia-search-articles.tool.test
  */
 
 import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { wikipediaSearch } from '@/mcp-server/tools/definitions/wikipedia-search.tool.js';
+import { allToolDefinitions } from '@/mcp-server/tools/definitions/index.js';
+import { wikipediaSearchArticles } from '@/mcp-server/tools/definitions/wikipedia-search-articles.tool.js';
 import { mockWikipediaService } from '../../../helpers/wikipedia-service-mock.js';
 
-describe('wikipediaSearch', () => {
+describe('wikipediaSearchArticles', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     // Baseline stub so the pre-fetch edition guard resolves offline; tests that need
     // domain methods call mockWikipediaService again with their own.
     mockWikipediaService();
+  });
+
+  it('registers under the articles-search name, with the bare name retired (issue #37)', () => {
+    expect(wikipediaSearchArticles.name).toBe('wikipedia_search_articles');
+    const registered = allToolDefinitions.map((definition) => definition.name);
+    expect(registered).toContain('wikipedia_search_articles');
+    // The old name is gone from tools/list rather than kept as a second, identical entry.
+    expect(registered).not.toContain('wikipedia_search');
+    // The sibling coordinate search keeps its own name.
+    expect(registered).toContain('wikipedia_search_nearby');
   });
 
   it('returns ranked results for a valid query', async () => {
@@ -32,9 +43,13 @@ describe('wikipediaSearch', () => {
       }),
     });
 
-    const ctx = createMockContext({ errors: wikipediaSearch.errors });
-    const input = wikipediaSearch.input.parse({ query: 'Python', limit: 10, language: 'en' });
-    const result = await wikipediaSearch.handler(input, ctx);
+    const ctx = createMockContext({ errors: wikipediaSearchArticles.errors });
+    const input = wikipediaSearchArticles.input.parse({
+      query: 'Python',
+      limit: 10,
+      language: 'en',
+    });
+    const result = await wikipediaSearchArticles.handler(input, ctx);
 
     expect(result.results).toHaveLength(2);
     expect(result.results[0]?.title).toBe('Python (programming language)');
@@ -52,9 +67,9 @@ describe('wikipediaSearch', () => {
       search: vi.fn().mockResolvedValue({ results: [], totalResults: 0 }),
     });
 
-    const ctx = createMockContext({ errors: wikipediaSearch.errors });
-    const input = wikipediaSearch.input.parse({ query: 'xyzzy_no_match_ever_12345' });
-    const result = await wikipediaSearch.handler(input, ctx);
+    const ctx = createMockContext({ errors: wikipediaSearchArticles.errors });
+    const input = wikipediaSearchArticles.input.parse({ query: 'xyzzy_no_match_ever_12345' });
+    const result = await wikipediaSearchArticles.handler(input, ctx);
 
     expect(result.results).toHaveLength(0);
 
@@ -72,9 +87,9 @@ describe('wikipediaSearch', () => {
       search: searchFn,
     });
 
-    const ctx = createMockContext({ errors: wikipediaSearch.errors });
-    const input = wikipediaSearch.input.parse({ query: 'Test' });
-    await wikipediaSearch.handler(input, ctx);
+    const ctx = createMockContext({ errors: wikipediaSearchArticles.errors });
+    const input = wikipediaSearchArticles.input.parse({ query: 'Test' });
+    await wikipediaSearchArticles.handler(input, ctx);
 
     expect(searchFn).toHaveBeenCalledWith('Test', 10, 'en', ctx, 0);
   });
@@ -88,9 +103,9 @@ describe('wikipediaSearch', () => {
       search: searchFn,
     });
 
-    const ctx = createMockContext({ errors: wikipediaSearch.errors });
-    const input = wikipediaSearch.input.parse({ query: 'Test', limit: 999 });
-    await wikipediaSearch.handler(input, ctx);
+    const ctx = createMockContext({ errors: wikipediaSearchArticles.errors });
+    const input = wikipediaSearchArticles.input.parse({ query: 'Test', limit: 999 });
+    await wikipediaSearchArticles.handler(input, ctx);
 
     expect(searchFn).toHaveBeenCalledWith('Test', 50, 'en', ctx, 0);
   });
@@ -100,7 +115,7 @@ describe('wikipediaSearch', () => {
       results: [{ title: 'Python', pageid: 23862, snippet: 'A language.', wordcount: 4000 }],
       language: 'en',
     };
-    const blocks = wikipediaSearch.format!(output);
+    const blocks = wikipediaSearchArticles.format!(output);
     const text = blocks.map((b) => (b.type === 'text' ? b.text : '')).join('');
     expect(text).toContain('Python');
     expect(text).toContain('23862');
@@ -109,31 +124,31 @@ describe('wikipediaSearch', () => {
   });
 
   it('throws invalid_language with data.reason when language code is malformed (issue #5)', async () => {
-    const ctx = createMockContext({ errors: wikipediaSearch.errors });
-    const input = wikipediaSearch.input.parse({ query: 'Python', language: 'INVALID!!' });
-    await expect(wikipediaSearch.handler(input, ctx)).rejects.toMatchObject({
+    const ctx = createMockContext({ errors: wikipediaSearchArticles.errors });
+    const input = wikipediaSearchArticles.input.parse({ query: 'Python', language: 'INVALID!!' });
+    await expect(wikipediaSearchArticles.handler(input, ctx)).rejects.toMatchObject({
       data: { reason: 'invalid_language' },
     });
   });
 
   it('throws invalid_language with data.reason for a nonexistent edition (issue #18)', async () => {
-    const ctx = createMockContext({ errors: wikipediaSearch.errors });
-    const input = wikipediaSearch.input.parse({ query: 'Python', language: 'zz' });
-    await expect(wikipediaSearch.handler(input, ctx)).rejects.toMatchObject({
+    const ctx = createMockContext({ errors: wikipediaSearchArticles.errors });
+    const input = wikipediaSearchArticles.input.parse({ query: 'Python', language: 'zz' });
+    await expect(wikipediaSearchArticles.handler(input, ctx)).rejects.toMatchObject({
       data: { reason: 'invalid_language' },
     });
   });
 
   it('rejects float limit at schema parse time (issue #14)', () => {
-    expect(() => wikipediaSearch.input.parse({ query: 'Python', limit: 5.7 })).toThrow();
+    expect(() => wikipediaSearchArticles.input.parse({ query: 'Python', limit: 5.7 })).toThrow();
   });
 
   it('rejects negative limit at schema parse time (issue #10)', () => {
-    expect(() => wikipediaSearch.input.parse({ query: 'Python', limit: -1 })).toThrow();
+    expect(() => wikipediaSearchArticles.input.parse({ query: 'Python', limit: -1 })).toThrow();
   });
 
   it('rejects zero limit at schema parse time (issue #10)', () => {
-    expect(() => wikipediaSearch.input.parse({ query: 'Python', limit: 0 })).toThrow();
+    expect(() => wikipediaSearchArticles.input.parse({ query: 'Python', limit: 0 })).toThrow();
   });
 
   it('passes non-default language to service', async () => {
@@ -147,9 +162,9 @@ describe('wikipediaSearch', () => {
       search: searchFn,
     });
 
-    const ctx = createMockContext({ errors: wikipediaSearch.errors });
-    const input = wikipediaSearch.input.parse({ query: 'Python', language: 'fr' });
-    const result = await wikipediaSearch.handler(input, ctx);
+    const ctx = createMockContext({ errors: wikipediaSearchArticles.errors });
+    const input = wikipediaSearchArticles.input.parse({ query: 'Python', language: 'fr' });
+    const result = await wikipediaSearchArticles.handler(input, ctx);
 
     expect(searchFn).toHaveBeenCalledWith('Python', 10, 'fr', ctx, 0);
     expect(result.language).toBe('fr');
@@ -157,7 +172,7 @@ describe('wikipediaSearch', () => {
 
   it('format renders zero results correctly', () => {
     const output = { results: [], language: 'en' };
-    const blocks = wikipediaSearch.format!(output);
+    const blocks = wikipediaSearchArticles.format!(output);
     const text = blocks.map((b) => (b.type === 'text' ? b.text : '')).join('');
     expect(text).toContain('0 results');
     expect(text).toContain('en');
@@ -171,9 +186,9 @@ describe('wikipediaSearch', () => {
       }),
     });
 
-    const ctx = createMockContext({ errors: wikipediaSearch.errors });
-    const input = wikipediaSearch.input.parse({ query: 'test', limit: 1 });
-    await wikipediaSearch.handler(input, ctx);
+    const ctx = createMockContext({ errors: wikipediaSearchArticles.errors });
+    const input = wikipediaSearchArticles.input.parse({ query: 'test', limit: 1 });
+    await wikipediaSearchArticles.handler(input, ctx);
 
     const enrichment = getEnrichment(ctx);
     expect(enrichment.totalCount).toBe(500);
@@ -185,9 +200,9 @@ describe('wikipediaSearch', () => {
       search: searchFn,
     });
 
-    const ctx = createMockContext({ errors: wikipediaSearch.errors });
-    const input = wikipediaSearch.input.parse({ query: '東京タワー' });
-    const result = await wikipediaSearch.handler(input, ctx);
+    const ctx = createMockContext({ errors: wikipediaSearchArticles.errors });
+    const input = wikipediaSearchArticles.input.parse({ query: '東京タワー' });
+    const result = await wikipediaSearchArticles.handler(input, ctx);
     expect(result.results).toHaveLength(0);
     expect(searchFn).toHaveBeenCalledWith('東京タワー', 10, 'en', ctx, 0);
   });
@@ -204,7 +219,7 @@ describe('wikipediaSearch', () => {
       ],
       language: 'en',
     };
-    const blocks = wikipediaSearch.format!(output);
+    const blocks = wikipediaSearchArticles.format!(output);
     const text = blocks.map((b) => (b.type === 'text' ? b.text : '')).join('');
     expect(text).not.toMatch(/WIKIPEDIA_USER_AGENT|WIKIPEDIA_BASE_URL|process\.env/i);
     expect(text).not.toMatch(/Bearer\s+\S+|Authorization:/i);
@@ -215,9 +230,9 @@ describe('wikipediaSearch', () => {
       search: vi.fn().mockRejectedValue(new Error('Network error')),
     });
 
-    const ctx = createMockContext({ errors: wikipediaSearch.errors });
-    const input = wikipediaSearch.input.parse({ query: 'Python' });
-    await expect(wikipediaSearch.handler(input, ctx)).rejects.toThrow('Network error');
+    const ctx = createMockContext({ errors: wikipediaSearchArticles.errors });
+    const input = wikipediaSearchArticles.input.parse({ query: 'Python' });
+    await expect(wikipediaSearchArticles.handler(input, ctx)).rejects.toThrow('Network error');
   });
 
   it('forwards offset to the service and echoes pagination enrichment (issue #22)', async () => {
@@ -230,9 +245,9 @@ describe('wikipediaSearch', () => {
       search: searchFn,
     });
 
-    const ctx = createMockContext({ errors: wikipediaSearch.errors });
-    const input = wikipediaSearch.input.parse({ query: 'Python', limit: 5, offset: 5 });
-    await wikipediaSearch.handler(input, ctx);
+    const ctx = createMockContext({ errors: wikipediaSearchArticles.errors });
+    const input = wikipediaSearchArticles.input.parse({ query: 'Python', limit: 5, offset: 5 });
+    await wikipediaSearchArticles.handler(input, ctx);
 
     expect(searchFn).toHaveBeenCalledWith('Python', 5, 'en', ctx, 5);
     const enrichment = getEnrichment(ctx);
@@ -261,16 +276,16 @@ describe('wikipediaSearch', () => {
       search: searchFn,
     });
 
-    const ctx1 = createMockContext({ errors: wikipediaSearch.errors });
-    const r1 = await wikipediaSearch.handler(
-      wikipediaSearch.input.parse({ query: 'Q', limit: 2, offset: 0 }),
+    const ctx1 = createMockContext({ errors: wikipediaSearchArticles.errors });
+    const r1 = await wikipediaSearchArticles.handler(
+      wikipediaSearchArticles.input.parse({ query: 'Q', limit: 2, offset: 0 }),
       ctx1,
     );
     expect(getEnrichment(ctx1).nextOffset).toBe(2);
 
-    const ctx2 = createMockContext({ errors: wikipediaSearch.errors });
-    const r2 = await wikipediaSearch.handler(
-      wikipediaSearch.input.parse({ query: 'Q', limit: 2, offset: 2 }),
+    const ctx2 = createMockContext({ errors: wikipediaSearchArticles.errors });
+    const r2 = await wikipediaSearchArticles.handler(
+      wikipediaSearchArticles.input.parse({ query: 'Q', limit: 2, offset: 2 }),
       ctx2,
     );
     expect(getEnrichment(ctx2).nextOffset).toBeUndefined();
@@ -288,9 +303,9 @@ describe('wikipediaSearch', () => {
       }),
     });
 
-    const ctx = createMockContext({ errors: wikipediaSearch.errors });
-    const input = wikipediaSearch.input.parse({ query: 'Python', offset: 5 });
-    await wikipediaSearch.handler(input, ctx);
+    const ctx = createMockContext({ errors: wikipediaSearchArticles.errors });
+    const input = wikipediaSearchArticles.input.parse({ query: 'Python', offset: 5 });
+    await wikipediaSearchArticles.handler(input, ctx);
 
     const enrichment = getEnrichment(ctx);
     expect(enrichment.offset).toBe(5);
@@ -302,9 +317,9 @@ describe('wikipediaSearch', () => {
       search: vi.fn().mockResolvedValue({ results: [], totalResults: 12, nextOffset: undefined }),
     });
 
-    const ctx = createMockContext({ errors: wikipediaSearch.errors });
-    const input = wikipediaSearch.input.parse({ query: 'Python', offset: 9999 });
-    const result = await wikipediaSearch.handler(input, ctx);
+    const ctx = createMockContext({ errors: wikipediaSearchArticles.errors });
+    const input = wikipediaSearchArticles.input.parse({ query: 'Python', offset: 9999 });
+    const result = await wikipediaSearchArticles.handler(input, ctx);
 
     expect(result.results).toHaveLength(0);
     const enrichment = getEnrichment(ctx);
@@ -322,19 +337,19 @@ describe('wikipediaSearch', () => {
       search: searchFn,
     });
 
-    const ctx = createMockContext({ errors: wikipediaSearch.errors });
-    const input = wikipediaSearch.input.parse({ query: 'Test' });
-    await wikipediaSearch.handler(input, ctx);
+    const ctx = createMockContext({ errors: wikipediaSearchArticles.errors });
+    const input = wikipediaSearchArticles.input.parse({ query: 'Test' });
+    await wikipediaSearchArticles.handler(input, ctx);
 
     expect(searchFn).toHaveBeenCalledWith('Test', 10, 'en', ctx, 0);
     expect(getEnrichment(ctx).offset).toBe(0);
   });
 
   it('rejects negative offset at schema parse time (issue #22)', () => {
-    expect(() => wikipediaSearch.input.parse({ query: 'Python', offset: -1 })).toThrow();
+    expect(() => wikipediaSearchArticles.input.parse({ query: 'Python', offset: -1 })).toThrow();
   });
 
   it('rejects float offset at schema parse time (issue #22)', () => {
-    expect(() => wikipediaSearch.input.parse({ query: 'Python', offset: 2.5 })).toThrow();
+    expect(() => wikipediaSearchArticles.input.parse({ query: 'Python', offset: 2.5 })).toThrow();
   });
 });

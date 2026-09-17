@@ -6,7 +6,7 @@
 
 | Name | Description | Key Inputs | Annotations | Errors |
 |:-----|:------------|:-----------|:------------|:-------|
-| `wikipedia_search` | Full-text search across articles. Returns ranked results with plain-text titles, snippets, and page IDs. Use when the exact article title is unknown or to find multiple articles on a topic. | `query`, `limit`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `no_results` (NotFound), `invalid_language` (InvalidParams) |
+| `wikipedia_search_articles` | Full-text search across articles. Returns ranked results with plain-text titles, snippets, and page IDs. Use when the exact article title is unknown or to find multiple articles on a topic. | `query`, `limit`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `no_results` (NotFound), `invalid_language` (InvalidParams) |
 | `wikipedia_get_summary` | Fetch the lead section summary for an article — the 2–4 paragraph intro that answers "what is X?". Returns plain-text extract, Wikidata QID for cross-referencing, description, and thumbnail URL. Handles disambiguation pages: returns `page_type: "disambiguation"` so the agent can detect and pivot to a more specific search. | `title`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `invalid_language` (InvalidParams) |
 | `wikipedia_get_article` | Fetch article content as clean plain text. Full-article path uses `action=query&prop=extracts&explaintext=true` (40–100KB for major articles). Section-targeted path uses `action=parse&prop=text&section={index}`, rendering the parser's HTML for that section to plain text — use `section_index` (from `wikipedia_get_sections`) to retrieve a single section and its subsections. Prefer section targeting when only part of the article is needed. | `title`, `section_index`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `invalid_section` (InvalidParams), `invalid_language` (InvalidParams) |
 | `wikipedia_get_sections` | Fetch the table of contents for an article — section titles, numbers, levels, and `section_index` values. Call this before `wikipedia_get_article` when only a specific section is needed. The returned `section_index` values are the identifiers for targeted section reads. | `title`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `no_sections` (NotFound), `invalid_language` (InvalidParams) |
@@ -60,8 +60,8 @@ No API key needed. By default, language is a per-call parameter on every tool (d
 1. `WikipediaService` — `restGet` + `actionGet` with retry/backoff, User-Agent header
 2. Wikitext stripping utility — `wtf-wikipedia` integration + post-pass for heading markers and blank-line normalization; verify against real article wikitext before proceeding
 3. `wikipedia_get_summary` — REST API `/page/summary/{title}`, core "what is X?" tool
-4. `wikipedia_search` — Action API `action=query&list=search`, strip snippet HTML before returning
-5. `wikipedia_get_sections` — Action API `action=parse&prop=sections` with `== Title ==` fallback
+4. `wikipedia_search_articles` — Action API `action=query&list=search`, strip snippet HTML before returning
+5. `wikipedia_get_sections` — Action API `action=parse&prop=tocdata` (`line` rendered to plain text) with `== Title ==` fallback
 6. `wikipedia_get_article` — full-article path (`action=query&prop=extracts`) and section path (`action=parse&prop=wikitext` + stripping)
 7. `wikipedia_get_languages` — Action API `action=query&prop=langlinks`
 8. `wikipedia_search_nearby` — Action API `action=query&list=geosearch`
@@ -74,7 +74,7 @@ Each step is independently testable.
 
 ### Tool count: 6 instead of 7
 
-The idea doc proposed `wikipedia_random`. Deferred — random article retrieval has no agent workflow that justifies a dedicated tool. Agents exploring Wikipedia for research or testing can use `wikipedia_search` with broad queries. The Action API has `action=query&list=random` if demand warrants it later.
+The idea doc proposed `wikipedia_random`. Deferred — random article retrieval has no agent workflow that justifies a dedicated tool. Agents exploring Wikipedia for research or testing can use `wikipedia_search_articles` with broad queries. The Action API has `action=query&list=random` if demand warrants it later.
 
 ### Summary vs. article: two tools with a clear contract
 
@@ -95,10 +95,10 @@ For `wikipedia_get_article`, the Action API's `exsectionformat=wiki` with `expla
 
 The idea doc proposed `wikipedia_get_sections` + section ID parameter on `wikipedia_get_article`. This is confirmed correct by the API. The flow:
 
-1. `wikipedia_get_sections` — Action API `action=parse&prop=sections` returns `index` (integer), `number` (e.g. "2.1"), `line` (title), and `level` (heading depth) for every section
+1. `wikipedia_get_sections` — Action API `action=parse&prop=tocdata` returns `index`, `number` (e.g. "2.1"), `line` (the heading as rendered HTML), and `hLevel` (heading depth) for every section; `line` is stripped to plain text and whitespace-folded so it matches the `section_title` the article path reports for the same index
 2. `wikipedia_get_article` with `section_index` — Action API `action=parse&prop=wikitext&section={index}` returns wikitext for just that section; wikitext stripping is then applied (see below)
 
-**`prop=sections` mitigation:** The Action API notes `prop=sections` is deprecated in favor of `prop=tocdata`, but `tocdata` returned empty `entries: []` for live articles in testing. Chosen mitigation: use `prop=sections` as the primary path, and add a fallback that parses section headers (`== Title ==`) out of the full `action=query&prop=extracts` response if `prop=sections` ever returns empty. This keeps `wikipedia_get_sections` working even if Wikimedia flips the switch on `prop=sections`, without requiring a coordinated server update.
+**`prop=tocdata` and the fallback:** `prop=sections` is deprecated in favor of `prop=tocdata`, which the service reads (same data, renamed and re-nested fields). A fallback parses section headers (`== Title ==`) out of the full `action=query&prop=extracts` response whenever `tocdata` returns no sections, so `wikipedia_get_sections` keeps working for an article the parser reports no table of contents for.
 
 ### `wikipedia_get_article`: two distinct code paths
 
@@ -152,7 +152,7 @@ Four rendering conventions are deliberate:
 
 ### Disambiguation handling
 
-The REST API summary endpoint returns `"type": "disambiguation"` for disambiguation pages alongside a short extract like "Python may refer to:". This is not an error — surface it in the output schema with a `page_type` field (`"article" | "disambiguation" | "redirect"`). When the agent gets `page_type: "disambiguation"`, it should call `wikipedia_search` with a more specific query. Document this in the tool description.
+The REST API summary endpoint returns `"type": "disambiguation"` for disambiguation pages alongside a short extract like "Python may refer to:". This is not an error — surface it in the output schema with a `page_type` field (`"article" | "disambiguation" | "redirect"`). When the agent gets `page_type: "disambiguation"`, it should call `wikipedia_search_articles` with a more specific query. Document this in the tool description.
 
 ### Language as a per-call parameter
 
@@ -203,17 +203,17 @@ All requests: `format=json`
 
 | Action + params | Used by |
 |:----------------|:--------|
-| `action=query&list=search&srsearch={q}&srlimit={n}&srprop=snippet` | `wikipedia_search` |
+| `action=query&list=search&srsearch={q}&srlimit={n}&srprop=snippet` | `wikipedia_search_articles` |
 | `action=query&titles={t}&prop=extracts&explaintext=true&exintro=true` | `wikipedia_get_article` (intro) |
 | `action=query&titles={t}&prop=extracts&explaintext=true&exsectionformat=wiki` | `wikipedia_get_article` (full) |
-| `action=parse&page={t}&prop=sections` | `wikipedia_get_sections` |
+| `action=parse&page={t}&prop=tocdata` | `wikipedia_get_sections` |
 | `action=parse&page={t}&prop=text&section={index}` | `wikipedia_get_article` (section) |
 | `action=query&titles={t}&prop=langlinks&lllimit=500` | `wikipedia_get_languages` |
 | `action=query&list=geosearch&gscoord={lat}\|{lon}&gsradius={r}&gslimit={n}` | `wikipedia_search_nearby` |
 
 Pagination: Action API uses `continue` objects in the response. Tools that paginate internally (langlinks) should set `lllimit=500` to minimize round-trips. Search and geosearch results are bounded by the `limit` parameter.
 
-Snippet HTML: Search snippets include `<span class="searchmatch">` markup. Strip to plain text before returning. This is reflected in `wikipedia_search`'s output design — snippets are always plain text in the tool response.
+Snippet HTML: Search snippets include `<span class="searchmatch">` markup. Strip to plain text before returning. This is reflected in `wikipedia_search_articles`'s output design — snippets are always plain text in the tool response.
 
 ### Rate limits and resilience
 
@@ -226,7 +226,7 @@ No enforced rate limits, but:
 
 ## Tool Detail
 
-### `wikipedia_search`
+### `wikipedia_search_articles`
 
 **Description:** Full-text search across Wikipedia articles. Returns ranked results with plain-text titles, snippets (search match highlighted terms stripped to plain text), and page IDs. Use when the exact article title is unknown or to discover multiple articles on a topic. The `pageid` values in results can be used to resolve article titles for subsequent calls.
 
@@ -247,7 +247,7 @@ No enforced rate limits, but:
 
 ### `wikipedia_get_summary`
 
-**Description:** Fetch the lead-section summary for a Wikipedia article — the 2–4 paragraph intro that answers "what is X?". Returns a clean plain-text extract, Wikidata QID (`wikibase_item`) for cross-referencing with `wikidata-mcp-server`, description, and thumbnail URL. Disamb pages return `page_type: "disambiguation"` — not an error, but a signal to call `wikipedia_search` with a more specific query. Redirect pages are followed automatically; `page_type: "redirect"` is returned with the resolved title.
+**Description:** Fetch the lead-section summary for a Wikipedia article — the 2–4 paragraph intro that answers "what is X?". Returns a clean plain-text extract, Wikidata QID (`wikibase_item`) for cross-referencing with `wikidata-mcp-server`, description, and thumbnail URL. Disamb pages return `page_type: "disambiguation"` — not an error, but a signal to call `wikipedia_search_articles` with a more specific query. Redirect pages are followed automatically; `page_type: "redirect"` is returned with the resolved title.
 
 **Input:**
 - `title: string` — article title (URL-decoded; e.g., `"Python (programming language)"`)
@@ -256,7 +256,7 @@ No enforced rate limits, but:
 **Output:** `{ title, page_type, pageid, wikibase_item, description, extract, thumbnail_url }`. `page_type` is one of `"article" | "disambiguation" | "redirect"`. `wikibase_item` is the Wikidata QID (e.g., `"Q28865"`) — use to chain into `wikidata-mcp-server` without a separate title-to-QID lookup.
 
 **Errors:**
-- `not_found` (NotFound) — no article exists for the title. Recovery: use `wikipedia_search` to find the correct title.
+- `not_found` (NotFound) — no article exists for the title. Recovery: use `wikipedia_search_articles` to find the correct title.
 - `invalid_language` (InvalidParams) — unrecognized language code.
 
 **Annotations:** `readOnlyHint: true`, `openWorldHint: true`
@@ -275,7 +275,7 @@ No enforced rate limits, but:
 **Output:** `{ title, pageid, content, section_title?, content_type }`. `content` is always plain text. `content_type` is `"full_article"` or `"section"`. For section reads, `section_title` is included. For full articles, `content` includes `== Section ==` markers.
 
 **Errors:**
-- `not_found` (NotFound) — no article exists for the title. Recovery: use `wikipedia_search` to find the correct title.
+- `not_found` (NotFound) — no article exists for the title. Recovery: use `wikipedia_search_articles` to find the correct title.
 - `invalid_section` (InvalidParams) — `section_index` is out of range. Recovery: call `wikipedia_get_sections` first to obtain valid index values.
 - `invalid_language` (InvalidParams) — unrecognized language code.
 
@@ -294,7 +294,7 @@ No enforced rate limits, but:
 **Output:** Array of section entries: `{ index, number, title, level }`. `index` is the integer to pass as `section_index` in `wikipedia_get_article`. `level` is heading depth (2 = `==`, 3 = `===`).
 
 **Errors:**
-- `not_found` (NotFound) — no article exists for the title. Recovery: use `wikipedia_search` to find the correct title.
+- `not_found` (NotFound) — no article exists for the title. Recovery: use `wikipedia_search_articles` to find the correct title.
 - `no_sections` (NotFound) — article exists but has no sections (stub or very short article). Recovery: use `wikipedia_get_article` without `section_index` to read the full content.
 - `invalid_language` (InvalidParams) — unrecognized language code.
 
@@ -335,7 +335,7 @@ No enforced rate limits, but:
 **Output:** Array of language entries: `{ language_code, edition_code?, title, url }`. `edition_code` is the Wikipedia subdomain (derived from the article URL host) to pass as `language` to other tools — it can differ from `language_code` for some editions (e.g. `gsw` → `als`). `edition_code` and `url` are both omitted when the serving host cannot be established, rather than composed from `language_code`, which is not the subdomain for mismatch editions. Redirect titles are resolved, and `source_title` reports the resolved article. The source language is not included — only other editions. Includes `total_languages` count.
 
 **Errors:**
-- `not_found` (NotFound) — no article exists for the title in the specified language. Recovery: use `wikipedia_search` to find the correct title.
+- `not_found` (NotFound) — no article exists for the title in the specified language. Recovery: use `wikipedia_search_articles` to find the correct title.
 - `no_other_languages` (NotFound) — article exists but has no other language editions. Recovery: the article may be too new or too regional to have been translated yet.
 - `invalid_language` (InvalidParams) — unrecognized language code.
 
@@ -346,6 +346,6 @@ No enforced rate limits, but:
 ## Known Limitations
 
 - **Article size**: Full plaintext extracts for major articles are 40–100KB. `wikipedia_get_article` without `section_index` returns large payloads — the tool description prominently recommends section targeting when only part of the article is needed.
-- **`prop=sections` deprecation**: Mitigated — see Design Decisions. The fallback (parsing `== Title ==` headers from full-article text) keeps `wikipedia_get_sections` functional if `prop=sections` is disabled.
+- **`prop=sections` deprecation**: The service reads its replacement, `prop=tocdata`; the fallback (parsing `== Title ==` headers from full-article text) covers an article whose `tocdata` comes back empty.
 - **REST `related` endpoint**: The `/api/rest_v1/page/related/{title}` endpoint returned empty results during testing. Not used.
 - **Disambiguation**: The agent must handle `page_type: "disambiguation"` as a signal to refine the query, not as an error. Surfaced via `page_type` field in `wikipedia_get_summary` output.

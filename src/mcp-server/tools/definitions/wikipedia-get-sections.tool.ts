@@ -49,7 +49,8 @@ export const wikipediaGetSections = tool('wikipedia_get_sections', {
       reason: 'not_found',
       code: JsonRpcErrorCode.NotFound,
       when: 'No Wikipedia article exists for the given title.',
-      recovery: 'Use wikipedia_search to discover the correct article title and try again.',
+      recovery:
+        'Use wikipedia_search_articles to discover the correct article title and try again.',
     },
     {
       reason: 'no_sections',
@@ -92,10 +93,10 @@ export const wikipediaGetSections = tool('wikipedia_get_sections', {
     if (isBlankTitle(input.title)) {
       throw ctx.fail(
         'not_found',
-        'Article title must not be blank. Provide a title, or use wikipedia_search to find one.',
+        'Article title must not be blank. Provide a title, or use wikipedia_search_articles to find one.',
         {
           recovery: {
-            hint: 'Provide a non-empty article title, or use wikipedia_search to discover one.',
+            hint: 'Provide a non-empty article title, or use wikipedia_search_articles to discover one.',
           },
         },
       );
@@ -111,7 +112,7 @@ export const wikipediaGetSections = tool('wikipedia_get_sections', {
         throw ctx.fail('not_found', err.message, {
           title: input.title,
           language,
-          recovery: { hint: 'Use wikipedia_search to find the correct article title.' },
+          recovery: { hint: 'Use wikipedia_search_articles to find the correct article title.' },
         });
       }
       throw err;
