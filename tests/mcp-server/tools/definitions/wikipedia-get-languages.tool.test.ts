@@ -180,6 +180,42 @@ describe('wikipediaGetLanguages', () => {
     });
   });
 
+  it('refuses a title MediaWiki cannot name a page with, before any call (issue #42)', async () => {
+    const getLanguagesFn = vi.fn();
+    mockWikipediaService({ getLanguages: getLanguagesFn });
+
+    for (const title of ['Cat|Dog', 'Foo[bar]', 'A{b}']) {
+      const ctx = createMockContext({ errors: wikipediaGetLanguages.errors });
+      const rejection = await Promise.resolve(
+        wikipediaGetLanguages.handler(wikipediaGetLanguages.input.parse({ title }), ctx),
+      ).then(
+        () => undefined,
+        (err: unknown) => err as { message: string; data: { reason: string } },
+      );
+
+      expect(rejection?.data.reason).toBe('invalid_title');
+      expect(rejection?.message).not.toMatch(/https?:\/\//);
+    }
+    // "Cat|Dog" used to come back as Cat's 278 language links.
+    expect(getLanguagesFn).not.toHaveBeenCalled();
+  });
+
+  it('accepts a fragment title and titles that only look illegal (issue #42)', async () => {
+    const getLanguagesFn = vi.fn().mockResolvedValue({
+      title: 'Python (programming language)',
+      languages: [
+        { languageCode: 'fr', title: 'Python (langage)', url: 'https://fr.wikipedia.org/wiki/P' },
+      ],
+    });
+    mockWikipediaService({ getLanguages: getLanguagesFn });
+
+    for (const title of ['Python (programming language)#History', '100% Cat', 'A_B', ':Cat']) {
+      const ctx = createMockContext({ errors: wikipediaGetLanguages.errors });
+      await wikipediaGetLanguages.handler(wikipediaGetLanguages.input.parse({ title }), ctx);
+      expect(getLanguagesFn).toHaveBeenCalledWith(title, 'en', ctx);
+    }
+  });
+
   it('passes source language to service', async () => {
     const getLanguagesFn = vi.fn().mockResolvedValue({
       title: 'Python (langage)',

@@ -122,20 +122,110 @@ describe('wikipediaGetArticle', () => {
     });
   });
 
-  it('throws invalid_section for section_index=0 (issue #7)', async () => {
-    const ctx = createMockContext({ errors: wikipediaGetArticle.errors });
-    const input = wikipediaGetArticle.input.parse({ title: 'Python', section_index: 0 });
-    await expect(wikipediaGetArticle.handler(input, ctx)).rejects.toMatchObject({
-      data: { reason: 'invalid_section' },
+  it('reads the lead through section_index 0, which #7 used to reject (issues #7, #40)', async () => {
+    const getArticleSectionFn = vi.fn().mockResolvedValue({
+      title: 'United States',
+      pageid: 3434750,
+      sectionTitle: 'Introduction',
+      content: 'The United States of America is a country primarily located in North America.',
     });
+    mockWikipediaService({ getArticleSection: getArticleSectionFn });
+
+    const ctx = createMockContext({ errors: wikipediaGetArticle.errors });
+    const input = wikipediaGetArticle.input.parse({ title: 'United States', section_index: 0 });
+    const result = await wikipediaGetArticle.handler(input, ctx);
+
+    expect(getArticleSectionFn).toHaveBeenCalledWith('United States', 0, 'en', ctx);
+    expect(result.content_type).toBe('section');
+    // The label the overflow outline prints for the lead, never "Section 0".
+    expect(result.section_title).toBe('Introduction');
+    expect(result.section_title).not.toBe('Section 0');
+    expect(result.content).toContain('United States of America');
   });
 
-  it('throws invalid_section for negative section_index (issue #9)', async () => {
-    const ctx = createMockContext({ errors: wikipediaGetArticle.errors });
-    const input = wikipediaGetArticle.input.parse({ title: 'Python', section_index: -1 });
-    await expect(wikipediaGetArticle.handler(input, ctx)).rejects.toMatchObject({
-      data: { reason: 'invalid_section' },
+  it('rejects a negative section_index at schema parse time, before any call (issues #9, #40)', () => {
+    const getArticleSectionFn = vi.fn();
+    mockWikipediaService({ getArticleSection: getArticleSectionFn });
+
+    const parsed = wikipediaGetArticle.input.safeParse({ title: 'Python', section_index: -1 });
+    expect(parsed.success).toBe(false);
+    expect(parsed.error?.issues[0]?.path).toContain('section_index');
+    expect(getArticleSectionFn).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-integer section_index at schema parse time, before any call (issue #40)', () => {
+    const getArticleSectionFn = vi.fn();
+    mockWikipediaService({ getArticleSection: getArticleSectionFn });
+
+    const parsed = wikipediaGetArticle.input.safeParse({ title: 'Python', section_index: 1.5 });
+    expect(parsed.success).toBe(false);
+    expect(parsed.error?.issues[0]?.path).toContain('section_index');
+    expect(getArticleSectionFn).not.toHaveBeenCalled();
+  });
+
+  it('refuses a title MediaWiki cannot name a page with, before any call (issue #42)', async () => {
+    const getArticleFullFn = vi.fn();
+    const getArticleSectionFn = vi.fn();
+    mockWikipediaService({
+      getArticleFull: getArticleFullFn,
+      getArticleSection: getArticleSectionFn,
     });
+
+    for (const title of ['Cat|Dog', 'Foo[bar]', 'A{b}', 'A<B']) {
+      const ctx = createMockContext({ errors: wikipediaGetArticle.errors });
+      const rejection = await Promise.resolve(
+        wikipediaGetArticle.handler(wikipediaGetArticle.input.parse({ title }), ctx),
+      ).then(
+        () => undefined,
+        (err: unknown) => err as { message: string; data: { reason: string } },
+      );
+
+      expect(rejection?.data.reason).toBe('invalid_title');
+      // No upstream call means no "exists but has no readable content" claim and no fetch URL.
+      expect(rejection?.message).not.toMatch(/https?:\/\//);
+    }
+    expect(getArticleFullFn).not.toHaveBeenCalled();
+    expect(getArticleSectionFn).not.toHaveBeenCalled();
+  });
+
+  it('accepts a fragment title on both read paths (issue #42)', async () => {
+    const getArticleFullFn = vi.fn().mockResolvedValue({
+      title: 'Python (programming language)',
+      pageid: 23862,
+      content: 'Python is a language.',
+    });
+    const getArticleSectionFn = vi.fn().mockResolvedValue({
+      title: 'Python (programming language)',
+      pageid: 23862,
+      sectionTitle: 'History',
+      content: 'Python was created in 1991.',
+    });
+    mockWikipediaService({
+      getArticleFull: getArticleFullFn,
+      getArticleSection: getArticleSectionFn,
+    });
+
+    const fragment = 'Python (programming language)#History';
+    const ctx = createMockContext({ errors: wikipediaGetArticle.errors });
+    await wikipediaGetArticle.handler(wikipediaGetArticle.input.parse({ title: fragment }), ctx);
+    await wikipediaGetArticle.handler(
+      wikipediaGetArticle.input.parse({ title: fragment, section_index: 1 }),
+      ctx,
+    );
+
+    expect(getArticleFullFn).toHaveBeenCalledWith(fragment, 'en', ctx);
+    expect(getArticleSectionFn).toHaveBeenCalledWith(fragment, 1, 'en', ctx);
+  });
+
+  it('accepts titles that only look illegal (issue #42)', async () => {
+    const getArticleFullFn = vi.fn().mockResolvedValue({ title: 'T', pageid: 1, content: 'Body.' });
+    mockWikipediaService({ getArticleFull: getArticleFullFn });
+
+    for (const title of ['100% Cat', 'A_B', 'A+B', ':Cat', 'AC/DC']) {
+      const ctx = createMockContext({ errors: wikipediaGetArticle.errors });
+      await wikipediaGetArticle.handler(wikipediaGetArticle.input.parse({ title }), ctx);
+      expect(getArticleFullFn).toHaveBeenCalledWith(title, 'en', ctx);
+    }
   });
 
   it('throws not_found with data.reason when article is missing (issue #12)', async () => {
@@ -339,6 +429,9 @@ describe('wikipediaGetArticle', () => {
     // Outline points at this server's targeted-read path, not the framework default wording.
     expect(result.content).toContain('wikipedia_get_sections');
     expect(result.content).toContain('section_index');
+    // The outline names Introduction among its sections, so it also names the input that reads it.
+    expect(result.content).toContain('Introduction');
+    expect(result.content).toContain('section_index 0');
     // The outline lists section names and sizes, not the raw section bodies.
     expect(result.content).not.toContain('lorem ipsum');
   });

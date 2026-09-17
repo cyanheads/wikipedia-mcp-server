@@ -10,22 +10,30 @@ import { getServerConfig } from '@/config/server-config.js';
 import {
   getWikipediaService,
   isBlankTitle,
+  isInvalidTitle,
   isMalformedLanguage,
+  LEAD_SECTION_TITLE,
   splitArticleIntoSections,
 } from '@/services/wikipedia/wikipedia-service.js';
 
 export const wikipediaGetArticle = tool('wikipedia_get_article', {
   title: 'Get Wikipedia Article',
   description:
-    'Fetch article content as clean plain text. Without section_index: returns the full article with == Section == markers preserved for structure — or, when the article exceeds the size budget, a compact section outline (truncated: true) that points to wikipedia_get_sections plus a section_index read instead of the full text. With section_index (from wikipedia_get_sections): returns that section and every subsection nested under it, each heading above its own body. Section-targeted reads are faster and smaller when only part of the article is needed. Data tables are omitted from both paths, so a section whose body is entirely a data table returns its heading and little else; tables used only for layout, such as multi-column lists, keep their content. Page furniture is omitted as well — maintenance banners, sister-project and library-resource boxes, portal bars, and spoken-article notices — while a hatnote naming a related article is kept. Redirect pages are followed automatically.',
+    'Fetch article content as clean plain text. Without section_index: returns the full article with == Section == markers preserved for structure — or, when the article exceeds the size budget, a compact section outline (truncated: true) that points to wikipedia_get_sections plus a section_index read instead of the full text. With section_index (from wikipedia_get_sections): returns that section and every subsection nested under it, each heading above its own body. section_index 0 is the lead section, the text above the first heading, which is the full prose wikipedia_get_summary returns only a truncated fragment of. Section-targeted reads are faster and smaller when only part of the article is needed. Data tables are omitted from both paths, so a section whose body is entirely a data table returns its heading and little else; tables used only for layout, such as multi-column lists, keep their content. Page furniture is omitted as well — maintenance banners, sister-project and library-resource boxes, portal bars, and spoken-article notices — while a hatnote naming a related article is kept. Redirect pages are followed automatically.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
-    title: z.string().describe('Article title (e.g. "Python (programming language)").'),
+    title: z
+      .string()
+      .describe(
+        'Article title (e.g. "Python (programming language)"). A trailing #fragment is accepted and ignored; the characters < > [ ] { } and | cannot appear in a Wikipedia page name.',
+      ),
     section_index: z
       .number()
+      .int()
+      .min(0)
       .optional()
       .describe(
-        'Section index from wikipedia_get_sections. Omit for the full article. Providing this returns the targeted section plus every subsection nested under it, as plain text.',
+        'Section index from wikipedia_get_sections. 0 reads the lead section (Introduction) — the text above the first heading. Omit for the full article. Providing this returns the targeted section plus every subsection nested under it, as plain text.',
       ),
     language: z
       .string()
@@ -46,7 +54,9 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
     section_title: z
       .string()
       .optional()
-      .describe('Section title when section_index was provided. Absent for full-article reads.'),
+      .describe(
+        'Section title when section_index was provided — "Introduction" for the lead, which has no heading of its own. Absent for full-article reads.',
+      ),
     content_type: z.string().describe('Content type: "full_article" or "section".'),
     truncated: z
       .boolean()
@@ -75,6 +85,13 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
       when: 'No Wikipedia article exists for the given title.',
       recovery:
         'Use wikipedia_search_articles to discover the correct article title and try again.',
+    },
+    {
+      reason: 'invalid_title',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The title contains characters MediaWiki cannot name a page with.',
+      recovery:
+        'Use wikipedia_search_articles to find the exact article title and pass it verbatim.',
     },
     {
       reason: 'invalid_section',
@@ -127,23 +144,19 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
       );
     }
 
-    // Reject section_index < 1 — indices start at 1 (wikipedia_get_sections output).
-    // Index 0 is the lead section, which wikipedia_get_sections never lists and which
-    // wikipedia_get_summary and full-article reads already cover; negative values are nonsensical
-    // and leak a raw API error.
-    if (input.section_index != null && input.section_index < 1) {
+    // Reject a title MediaWiki cannot name a page with, before any fetch — `Cat|Dog` otherwise
+    // returns the `Cat` article, and `A<B` an "exists but has no readable content" claim.
+    if (isInvalidTitle(input.title)) {
       throw ctx.fail(
-        'invalid_section',
-        `section_index ${input.section_index} is not valid. Section indices start at 1 (use wikipedia_get_sections to discover valid values). To read the lead section, omit section_index entirely.`,
-        {
-          sectionIndex: input.section_index,
-          recovery: {
-            hint: 'Use wikipedia_get_sections to get valid indices (starting at 1). Omit section_index to read the full article including its lead section.',
-          },
-        },
+        'invalid_title',
+        `Article title "${input.title}" is not a valid Wikipedia page name. The characters < > [ ] { } and | are not allowed in a title, nor are percent escapes (%41), three or more tildes, or relative paths; a trailing #fragment is fine.`,
+        { title: input.title, ...ctx.recoveryFor('invalid_title') },
       );
     }
 
+    // Bounds on section_index live on the schema, so they advertise themselves in inputSchema and
+    // a negative or fractional value is rejected before the handler runs. Index 0 is the lead,
+    // which the parser renders like any other section.
     if (input.section_index != null) {
       // Section-targeted path: the section plus its subsections, rendered to plain text.
       ctx.log.info('Fetching article section', {
@@ -217,8 +230,7 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
       sectionDoc[n > 0 ? `${heading} (${n + 1})` : heading] = body;
     }
 
-    const reCallNotice =
-      'This article is large. Call wikipedia_get_sections to list its section indices, then wikipedia_get_article with a section_index to read a specific section.';
+    const reCallNotice = `This article is large. Call wikipedia_get_sections to list its section indices, then wikipedia_get_article with a section_index to read a specific section — section_index 0 reads ${LEAD_SECTION_TITLE}, the text above the first heading.`;
     const overflow = outlineOnOverflow(sectionDoc, {
       budget: getServerConfig().articleOverflowBytes,
       notice: () => reCallNotice,

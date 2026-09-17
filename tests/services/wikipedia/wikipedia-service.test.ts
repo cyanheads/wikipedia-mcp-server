@@ -18,8 +18,12 @@ import {
   htmlSectionToPlainText,
   initWikipediaService,
   isBlankTitle,
+  isInvalidTitle,
   isMalformedLanguage,
+  LEAD_SECTION_TITLE,
   parseSiteMatrix,
+  SEARCH_MAX_LIMIT,
+  SEARCH_RESULT_WINDOW,
   splitArticleIntoSections,
   WikipediaService,
 } from '@/services/wikipedia/wikipedia-service.js';
@@ -2252,6 +2256,289 @@ describe('WikipediaService.getArticleSection — rendered section reads (issue #
     ).rejects.toMatchObject({
       code: JsonRpcErrorCode.ValidationError,
       message: expect.stringContaining('does not exist'),
+    });
+  });
+});
+
+/** Lead-section HTML as `section=0` renders it: hatnote and paragraphs, no heading of its own. */
+const LEAD_SECTION_HTML = `<div class="mw-content-ltr mw-parser-output" lang="en" dir="ltr">
+<div role="note" class="hatnote navigation-not-searchable">For other uses, see <a href="/wiki/Quokka_(disambiguation)" title="Quokka (disambiguation)">Quokka (disambiguation)</a>.</div>
+<table class="infobox biota"><tbody><tr><td>Conservation status</td></tr></tbody></table>
+<p>The <b>quokka</b> is a small macropod about the size of a domestic cat.
+</p>
+<p>It is the only member of the genus <i>Setonix</i>.
+</p></div>`;
+
+describe('WikipediaService.getArticleSection — lead section (issue #40)', () => {
+  beforeEach(() => {
+    initService();
+  });
+
+  it('reads the lead through section=0 and labels it Introduction, not "Section 0"', async () => {
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+    const spy = vi
+      .spyOn(svc, 'actionGet')
+      .mockResolvedValue({ parse: { title: 'Quokka', pageid: 235329, text: LEAD_SECTION_HTML } });
+
+    const result = await svc.getArticleSection('Quokka', 0, 'en', ctx);
+
+    expect(spy).toHaveBeenCalledWith('en', expect.objectContaining({ section: '0' }), ctx);
+    expect(result.sectionTitle).toBe(LEAD_SECTION_TITLE);
+    expect(result.sectionTitle).toBe('Introduction');
+    // The #7 premise — index 0 renders empty — does not hold on the parser-HTML path.
+    expect(result.content).not.toBe('');
+    expect(result.content).toContain('quokka');
+    expect(result.content).toContain('For other uses');
+    // The taxobox is a data table and goes the way every other data table does.
+    expect(result.content).not.toContain('Conservation status');
+  });
+
+  it('keeps the "Section N" fallback for a headless section other than the lead', async () => {
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
+      parse: { title: 'Article', pageid: 42, text: '<p>Body without a heading.</p>' },
+    });
+
+    const result = await svc.getArticleSection('Article', 5, 'en', ctx);
+    expect(result.sectionTitle).toBe('Section 5');
+  });
+
+  it('labels the lead Introduction even when its rendered body carries a heading', async () => {
+    // The label the outline prints is the contract; a template-emitted heading inside the lead
+    // must not rename it to something wikipedia_get_sections never reports.
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
+      parse: {
+        title: 'Odd',
+        pageid: 7,
+        text: '<p>Lead prose.</p><div class="mw-heading mw-heading2"><h2 id="X">Stray</h2></div><p>More.</p>',
+      },
+    });
+
+    const result = await svc.getArticleSection('Odd', 0, 'en', ctx);
+    expect(result.sectionTitle).toBe('Introduction');
+  });
+
+  it('agrees with the label splitArticleIntoSections prints for the lead', () => {
+    const [lead] = splitArticleIntoSections('Lead text.\n\n== History ==\n\nBody.');
+    expect(lead?.heading).toBe(LEAD_SECTION_TITLE);
+  });
+});
+
+describe('isInvalidTitle — MediaWiki page-name guard (issue #42)', () => {
+  it('rejects the illegal characters and the multi-title separator', () => {
+    for (const title of ['A<B', 'A>B', 'Foo[bar]', 'A]B', 'A{b}', 'A}b', 'Cat|Dog']) {
+      expect(isInvalidTitle(title)).toBe(true);
+    }
+  });
+
+  it('rejects percent escapes, magic tildes, and relative paths', () => {
+    for (const title of [
+      'A%41B',
+      'A~~~B',
+      './Cat',
+      '../Cat',
+      '.',
+      '..',
+      'Cat/./Dog',
+      'Cat/../Dog',
+      'Cat/.',
+      'Cat/..',
+    ]) {
+      expect(isInvalidTitle(title)).toBe(true);
+    }
+  });
+
+  it('accepts a fragment, which MediaWiki strips before resolving the title', () => {
+    for (const title of ['A#B', 'Cat#', 'Python (programming language)#History']) {
+      expect(isInvalidTitle(title)).toBe(false);
+    }
+  });
+
+  it('accepts the forms that look illegal but name real pages', () => {
+    for (const title of [
+      '100% Cat',
+      'A~~B',
+      ':Cat',
+      'A_B',
+      'A+B',
+      'AC/DC',
+      'Rock & Roll',
+      'Python (programming language)',
+    ]) {
+      expect(isInvalidTitle(title)).toBe(false);
+    }
+  });
+});
+
+describe('WikipediaService — Action API error envelopes on HTTP 200 (issue #41)', () => {
+  beforeEach(() => {
+    initService();
+  });
+
+  it('fails a search carrying an error envelope instead of returning an empty result set', async () => {
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
+      error: { code: 'missingparam', info: 'The "srsearch" parameter must be set.' },
+    });
+
+    await expect(svc.search('', 10, 'en', ctx)).rejects.toMatchObject({
+      message: expect.stringContaining('srsearch'),
+    });
+  });
+
+  it('maps the offset-too-large refusal to a typed reason naming the window', async () => {
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
+      error: {
+        code: 'cirrussearch-offset-too-large',
+        info: 'Could not retrieve results. Up to 10000 search results are supported, but results starting at 10000 were requested.',
+      },
+    });
+
+    await expect(svc.search('Python', 10, 'en', ctx, SEARCH_RESULT_WINDOW)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      message: expect.stringContaining('10,000'),
+      data: { reason: 'offset_too_large' },
+    });
+  });
+
+  it('clamps the requested page size to this server page-size cap', async () => {
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+    const spy = vi
+      .spyOn(svc, 'actionGet')
+      .mockResolvedValue({ query: { searchinfo: { totalhits: 0 }, search: [] } });
+
+    await svc.search('Python', 999, 'en', ctx);
+    expect(spy).toHaveBeenCalledWith(
+      'en',
+      expect.objectContaining({ srlimit: String(SEARCH_MAX_LIMIT) }),
+      ctx,
+    );
+  });
+
+  it('fails getArticleFull on an error envelope rather than reading past it', async () => {
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
+      error: { code: 'unknownerror', info: 'Something went wrong.' },
+    });
+
+    await expect(svc.getArticleFull('Python', 'en', ctx)).rejects.toMatchObject({
+      message: expect.stringContaining('Wikipedia API error'),
+    });
+  });
+
+  it('fails getLanguages on an error envelope rather than reporting no language editions', async () => {
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
+      error: { code: 'unknownerror', info: 'Something went wrong.' },
+    });
+
+    await expect(svc.getLanguages('Python', 'en', ctx)).rejects.toMatchObject({
+      message: expect.stringContaining('Wikipedia API error'),
+    });
+  });
+
+  it('fails searchNearby on an error envelope rather than reporting no nearby articles', async () => {
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
+      error: { code: 'invalid-coord', info: 'Invalid coordinate provided.' },
+    });
+
+    await expect(svc.searchNearby(999, 999, 1000, 10, 'en', ctx)).rejects.toMatchObject({
+      message: expect.stringContaining('Invalid coordinate'),
+    });
+  });
+
+  it('fails the edition-index build on an error envelope rather than parsing an absent matrix', async () => {
+    // The sitematrix fetch itself is under test, so it is not stubbed at the method seam here.
+    initWikipediaService(mockConfig, mockStorage, TEST_USER_AGENT);
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+    vi.spyOn(svc as unknown as PrivateApiGet, 'apiGet').mockResolvedValue({
+      error: { code: 'unknownerror', info: 'Sitematrix is unavailable.' },
+    });
+
+    await expect(svc.fetchEditionIndex(ctx)).rejects.toMatchObject({
+      message: expect.stringContaining('Sitematrix is unavailable'),
+    });
+  });
+});
+
+describe('WikipediaService — invalid page entries and titles (issue #42)', () => {
+  beforeEach(() => {
+    initService();
+  });
+
+  it('getArticleFull refuses an invalid page entry instead of claiming the article exists', async () => {
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+    // `action=query` answers an illegal title with `invalid: true` and no `missing` key.
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
+      query: {
+        pages: {
+          '-1': {
+            title: 'A<B',
+            invalid: true,
+            invalidreason: 'The requested page title contains invalid characters: "<".',
+          },
+        },
+      },
+    });
+
+    const rejection = await svc.getArticleFull('A<B', 'en', ctx).then(
+      () => undefined,
+      (err: unknown) => err as { message: string; data?: { reason?: string } },
+    );
+
+    expect(rejection?.data?.reason).toBe('invalid_title');
+    expect(rejection?.message).not.toContain('exists but has no readable content');
+  });
+
+  it('getLanguages refuses an invalid page entry instead of claiming no other editions', async () => {
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
+      query: {
+        pages: {
+          '-1': {
+            title: 'A<B',
+            invalid: true,
+            invalidreason: 'The requested page title contains invalid characters: "<".',
+          },
+        },
+      },
+    });
+
+    const rejection = await svc.getLanguages('A<B', 'en', ctx).then(
+      () => undefined,
+      (err: unknown) => err as { message: string; data?: { reason?: string } },
+    );
+
+    expect(rejection?.data?.reason).toBe('invalid_title');
+    expect(rejection?.message).not.toContain('has no other language editions');
+  });
+
+  it('maps the parse API invalidtitle code to the typed reason on both parse paths', async () => {
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+    const badTitle = { error: { code: 'invalidtitle', info: 'Bad title "A{b}".' } };
+
+    vi.spyOn(svc, 'actionGet').mockResolvedValue(badTitle);
+    await expect(svc.getSections('A{b}', 'en', ctx)).rejects.toMatchObject({
+      data: { reason: 'invalid_title' },
+    });
+    await expect(svc.getArticleSection('A{b}', 1, 'en', ctx)).rejects.toMatchObject({
+      data: { reason: 'invalid_title' },
     });
   });
 });

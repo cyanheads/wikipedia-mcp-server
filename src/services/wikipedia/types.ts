@@ -3,6 +3,26 @@
  * @module services/wikipedia/types
  */
 
+/**
+ * The Action API's top-level error envelope.
+ *
+ * It arrives on HTTP 200 — `format=json` carries a refusal in the body rather than in the status —
+ * so nothing in the transport layer intercepts it. Every raw Action API response type below
+ * declares it, and every call site reads it before trusting the payload; a response shape that
+ * omits it renders an upstream refusal as an empty success.
+ */
+export type ActionApiErrorRaw = { code?: string; info?: string };
+
+/**
+ * An `action=query` page entry for a title MediaWiki cannot name a page with (`Foo[bar]`, `A<B`).
+ * The entry carries `invalid` with no `missing` key, so a `missing !== undefined` test alone reads
+ * it as an existing page and reports it as empty rather than as unnameable.
+ */
+export type InvalidPageRaw = {
+  invalid?: boolean;
+  invalidreason?: string;
+};
+
 /** REST API summary response shape (partial — only fields we use). */
 export type RestSummaryRaw = {
   type?: string;
@@ -38,6 +58,7 @@ export type ActionSearchRaw = {
    * upstream signal rather than computing `offset + limit`.
    */
   continue?: { sroffset?: number };
+  error?: ActionApiErrorRaw;
 };
 
 /** Action API extracts response (for full article text). */
@@ -45,7 +66,7 @@ export type ActionExtractsRaw = {
   query?: {
     pages?: Record<
       string,
-      {
+      InvalidPageRaw & {
         pageid?: number;
         title?: string;
         extract?: string;
@@ -53,6 +74,7 @@ export type ActionExtractsRaw = {
       }
     >;
   };
+  error?: ActionApiErrorRaw;
 };
 
 /**
@@ -80,7 +102,7 @@ export type ActionSectionsRaw = {
       }>;
     };
   };
-  error?: { code?: string; info?: string };
+  error?: ActionApiErrorRaw;
 };
 
 /**
@@ -96,7 +118,7 @@ export type ActionParseTextRaw = {
     /** formatversion=2: plain string. formatversion=1 used `{ '*': string }` — no longer used. */
     text?: string;
   };
-  error?: { code?: string; info?: string };
+  error?: ActionApiErrorRaw;
 };
 
 /**
@@ -109,7 +131,7 @@ export type ActionLangLinksRaw = {
   query?: {
     pages?: Record<
       string,
-      {
+      InvalidPageRaw & {
         pageid?: number;
         /** Resolved article title — the redirect target when the request followed one. */
         title?: string;
@@ -124,6 +146,7 @@ export type ActionLangLinksRaw = {
       }
     >;
   };
+  error?: ActionApiErrorRaw;
 };
 
 /**
@@ -155,6 +178,7 @@ export type SiteMatrixLanguage = {
 export type SiteMatrixRaw = {
   /** Values are {@link SiteMatrixLanguage} under numeric keys and a number under `count`. */
   sitematrix?: Record<string, unknown>;
+  error?: ActionApiErrorRaw;
 };
 
 /** Action API geosearch response. */
@@ -169,4 +193,5 @@ export type ActionGeoSearchRaw = {
       dist: number;
     }>;
   };
+  error?: ActionApiErrorRaw;
 };

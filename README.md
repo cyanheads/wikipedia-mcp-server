@@ -36,7 +36,7 @@ Wikipedia content via the MediaWiki REST API and Action API. Search articles, re
 | Tool | Description |
 |:---|:---|
 | `wikipedia_search_articles` | Full-text search across Wikipedia, returning ranked results with plain-text snippets and page IDs. |
-| `wikipedia_get_summary` | Lead-section summary for any article — plain text, Wikidata QID, description, thumbnail URL, and page type. |
+| `wikipedia_get_summary` | Short summary for any article — plain text, Wikidata QID, description, thumbnail URL, and page type. |
 | `wikipedia_get_article` | Full article or a targeted section as clean plain text, with section markers preserved. |
 | `wikipedia_get_sections` | Table of contents with `section_index` values for targeted section reads. |
 | `wikipedia_search_nearby` | Geotagged Wikipedia articles within a radius of a WGS 84 coordinate, sorted by distance. |
@@ -47,7 +47,9 @@ Wikipedia content via the MediaWiki REST API and Action API. Search articles, re
 ### `wikipedia_search_articles` <sub>tool</sub>
 
 - Free-text query, ranked by relevance; returns plain-text snippets (HTML stripped), page IDs, and word counts
-- `limit` capped at 50; `offset` pages further results — enrichment `nextOffset` signals more remain and is passed back as `offset`
+- `limit` is 1–50; `offset` pages further results — enrichment `nextOffset` signals more remain and is passed back as `offset`
+- Wikipedia serves no result past the 10,000th for a query: an `offset` at or beyond it fails with `offset_too_large`, and a page ending on the window carries enrichment `truncated` naming the matches no offset reaches — narrow the query to bring them into range
+- An empty `query` fails with `empty_query`; a whitespace-only query is a real search that simply matches nothing
 - `language` selects any Wikipedia edition (default `en`)
 - Best when the exact article title is unknown, or to discover multiple articles on a topic
 
@@ -55,7 +57,8 @@ Wikipedia content via the MediaWiki REST API and Action API. Search articles, re
 
 ### `wikipedia_get_summary` <sub>tool</sub>
 
-- Returns the 2–4 paragraph lead extract, Wikidata QID (`wikibase_item`), short description, and thumbnail URL
+- Returns the REST summary extract — a truncated fragment from the start of the lead, not the whole lead — plus the Wikidata QID (`wikibase_item`), short description, and thumbnail URL
+- For the lead section in full, call `wikipedia_get_article` with `section_index: 0`
 - `page_type` discriminates `standard` / `disambiguation` / `no-extract` — on `disambiguation`, re-query with `wikipedia_search_articles` for a more specific title
 - Redirect pages are followed automatically
 - Right tool for most encyclopedic "what is X?" lookups; use `wikipedia_get_article` for full depth
@@ -66,6 +69,7 @@ Wikipedia content via the MediaWiki REST API and Action API. Search articles, re
 
 - Without `section_index`: full article with `== Section ==` markers, unless it exceeds `WIKIPEDIA_ARTICLE_OVERFLOW_BYTES` (default 80,000 bytes) — then returns a section outline (`truncated: true`) pointing to `wikipedia_get_sections` plus a targeted `section_index` read
 - With `section_index` (from `wikipedia_get_sections`): returns that section plus every nested subsection, each heading above its own body
+- `section_index: 0` is the lead section — the text above the first heading, returned under the title `Introduction`
 - Data tables are omitted from both paths — a section whose body is entirely a data table returns little beyond its heading; layout-only tables (multi-column lists, succession boxes) keep their content
 - Page furniture — maintenance banners, sister-project and library-resource boxes, portal bars, spoken-article notices — is stripped; hatnotes are kept
 - Redirect pages are followed automatically
@@ -75,6 +79,7 @@ Wikipedia content via the MediaWiki REST API and Action API. Search articles, re
 ### `wikipedia_get_sections` <sub>tool</sub>
 
 - Returns section titles, heading levels, hierarchical numbering (e.g. `"2.1"`), and `section_index` values
+- The first entry is the lead: `index: 0`, titled `Introduction` — Wikipedia's own table of contents starts at the first heading
 - `section_index` is the integer to pass to `wikipedia_get_article` for a targeted read
 - Fails with `no_sections` on a stub or very short article — read it with `wikipedia_get_article` instead
 - Redirect pages are followed automatically
@@ -113,7 +118,8 @@ Agent-friendly output:
 
 - `page_type` on summaries discriminates `standard` / `disambiguation` / `no-extract` — no string parsing needed
 - `wikibase_item` (Wikidata QID) on summaries enables direct cross-referencing with wikidata-mcp-server
-- `section_index` on table-of-contents entries links directly to the targeted-read parameter on `wikipedia_get_article`
+- `section_index` on table-of-contents entries links directly to the targeted-read parameter on `wikipedia_get_article`, index 0 included
+- Titles MediaWiki cannot name a page with — `< > [ ] { }`, the `|` multi-title separator, percent escapes, magic tildes, relative paths — are refused before any request, with `invalid_title`; a trailing `#fragment` is accepted and resolves normally
 - Recovery hints on every error type — callers get actionable next steps (e.g., "use `wikipedia_search_articles` to find the correct title")
 
 ## Getting started

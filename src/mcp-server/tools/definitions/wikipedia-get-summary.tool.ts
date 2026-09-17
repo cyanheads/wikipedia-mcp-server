@@ -8,18 +8,21 @@ import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import {
   getWikipediaService,
   isBlankTitle,
+  isInvalidTitle,
   isMalformedLanguage,
 } from '@/services/wikipedia/wikipedia-service.js';
 
 export const wikipediaGetSummary = tool('wikipedia_get_summary', {
   title: 'Get Wikipedia Summary',
   description:
-    'Fetch the lead-section summary for a Wikipedia article — the 2–4 paragraph intro that answers "what is X?". Returns plain-text extract, Wikidata QID (wikibase_item) for cross-referencing with wikidata-mcp-server, short description, and thumbnail URL. Redirect pages are followed automatically. When page_type is "disambiguation", the title matched a disambiguation page — call wikipedia_search_articles with a more specific query to find the intended article. Prefer this over wikipedia_get_article unless full article depth is needed.',
+    'Fetch the short article summary that answers "what is X?". The extract is a truncated fragment from the start of the lead section — usually a sentence or two, and as little as a tenth of the lead — alongside the Wikidata QID (wikibase_item) for cross-referencing with wikidata-mcp-server, a short description, and a thumbnail URL. For the lead section in full, call wikipedia_get_article with section_index 0. Redirect pages are followed automatically. When page_type is "disambiguation", the title matched a disambiguation page — call wikipedia_search_articles with a more specific query to find the intended article. Prefer this over wikipedia_get_article unless article depth is needed.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     title: z
       .string()
-      .describe('Article title (URL-decoded), e.g. "Python (programming language)".'),
+      .describe(
+        'Article title (URL-decoded), e.g. "Python (programming language)". A trailing #fragment is accepted and ignored; the characters < > [ ] { } and | cannot appear in a Wikipedia page name.',
+      ),
     language: z
       .string()
       .default('en')
@@ -40,7 +43,11 @@ export const wikipediaGetSummary = tool('wikipedia_get_summary', {
         'Wikidata QID (e.g. "Q28865"). Use to chain into wikidata-mcp-server without a separate lookup.',
       ),
     description: z.string().optional().describe('Short description of the article subject.'),
-    extract: z.string().describe('Plain-text lead-section extract.'),
+    extract: z
+      .string()
+      .describe(
+        'Plain-text summary extract — a truncated fragment from the start of the lead section, not the whole lead. Call wikipedia_get_article with section_index 0 for the full lead.',
+      ),
     thumbnail_url: z
       .string()
       .optional()
@@ -55,6 +62,13 @@ export const wikipediaGetSummary = tool('wikipedia_get_summary', {
       when: 'No Wikipedia article exists for the given title.',
       recovery:
         'Use wikipedia_search_articles to discover the correct article title and try again.',
+    },
+    {
+      reason: 'invalid_title',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The title contains characters MediaWiki cannot name a page with.',
+      recovery:
+        'Use wikipedia_search_articles to find the exact article title and pass it verbatim.',
     },
     {
       reason: 'invalid_language',
@@ -97,6 +111,16 @@ export const wikipediaGetSummary = tool('wikipedia_get_summary', {
             hint: 'Provide a non-empty article title, or use wikipedia_search_articles to discover one.',
           },
         },
+      );
+    }
+
+    // Reject a title MediaWiki cannot name a page with, before any fetch — the REST endpoint
+    // otherwise answers 403 or retries a 500 four times, both leaking the fetch URL.
+    if (isInvalidTitle(input.title)) {
+      throw ctx.fail(
+        'invalid_title',
+        `Article title "${input.title}" is not a valid Wikipedia page name. The characters < > [ ] { } and | are not allowed in a title, nor are percent escapes (%41), three or more tildes, or relative paths; a trailing #fragment is fine.`,
+        { title: input.title, ...ctx.recoveryFor('invalid_title') },
       );
     }
 

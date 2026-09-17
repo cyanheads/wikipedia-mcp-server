@@ -8,6 +8,7 @@ import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import {
   getWikipediaService,
   isBlankTitle,
+  isInvalidTitle,
   isMalformedLanguage,
 } from '@/services/wikipedia/wikipedia-service.js';
 
@@ -17,7 +18,11 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
     'List the language editions available for a Wikipedia article. Returns language codes, article titles in each language, and full URLs. Useful for cross-language research and for discovering the correct article title in a target language before fetching it. Redirect pages are followed automatically, and source_title reports the resolved article the links belong to. The language parameter specifies which edition to query from.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
-    title: z.string().describe('Article title in the source language edition.'),
+    title: z
+      .string()
+      .describe(
+        'Article title in the source language edition. A trailing #fragment is accepted and ignored; the characters < > [ ] { } and | cannot appear in a Wikipedia page name.',
+      ),
     language: z
       .string()
       .default('en')
@@ -70,6 +75,13 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
         'Use wikipedia_search_articles to discover the correct article title and try again.',
     },
     {
+      reason: 'invalid_title',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The title contains characters MediaWiki cannot name a page with.',
+      recovery:
+        'Use wikipedia_search_articles to find the exact article title and pass it verbatim.',
+    },
+    {
       reason: 'no_other_languages',
       code: JsonRpcErrorCode.NotFound,
       when: 'Article exists but has no other language editions.',
@@ -116,6 +128,16 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
             hint: 'Provide a non-empty article title, or use wikipedia_search_articles to discover one.',
           },
         },
+      );
+    }
+
+    // Reject a title MediaWiki cannot name a page with, before any fetch — `Cat|Dog` is two titles
+    // to the langlinks query, which answered it with the `Cat` article's 278 language links.
+    if (isInvalidTitle(input.title)) {
+      throw ctx.fail(
+        'invalid_title',
+        `Article title "${input.title}" is not a valid Wikipedia page name. The characters < > [ ] { } and | are not allowed in a title, nor are percent escapes (%41), three or more tildes, or relative paths; a trailing #fragment is fine.`,
+        { title: input.title, ...ctx.recoveryFor('invalid_title') },
       );
     }
 

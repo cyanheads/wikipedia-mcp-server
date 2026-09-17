@@ -221,6 +221,51 @@ describe('wikipediaGetSummary', () => {
     });
   });
 
+  it('refuses a title MediaWiki cannot name a page with, before any call (issue #42)', async () => {
+    const getSummaryFn = vi.fn();
+    mockWikipediaService({ getSummary: getSummaryFn });
+
+    for (const title of ['Cat|Dog', 'Foo[bar]', 'A{b}']) {
+      const ctx = createMockContext({ errors: wikipediaGetSummary.errors });
+      const rejection = await Promise.resolve(
+        wikipediaGetSummary.handler(wikipediaGetSummary.input.parse({ title }), ctx),
+      ).then(
+        () => undefined,
+        (err: unknown) => err as { message: string; data: { reason: string } },
+      );
+
+      expect(rejection?.data.reason).toBe('invalid_title');
+      // Nothing is fetched, so no retry cycle and no fetch URL in the message.
+      expect(rejection?.message).not.toMatch(/https?:\/\//);
+    }
+    expect(getSummaryFn).not.toHaveBeenCalled();
+  });
+
+  it('accepts a fragment title and titles that only look illegal (issue #42)', async () => {
+    const getSummaryFn = vi.fn().mockResolvedValue(mockSummary);
+    mockWikipediaService({ getSummary: getSummaryFn });
+
+    for (const title of [
+      'Python (programming language)#History',
+      '100% Cat',
+      'A_B',
+      'A+B',
+      ':Cat',
+    ]) {
+      const ctx = createMockContext({ errors: wikipediaGetSummary.errors });
+      await wikipediaGetSummary.handler(wikipediaGetSummary.input.parse({ title }), ctx);
+      expect(getSummaryFn).toHaveBeenCalledWith(title, 'en', ctx);
+    }
+  });
+
+  it('describes the extract as the truncated fragment it is (issue #40)', () => {
+    // The REST extract runs 7–54% of the lead across sampled articles; promising a 2–4 paragraph
+    // intro sent agents here for text this tool never returns.
+    expect(wikipediaGetSummary.description).not.toMatch(/2–4 paragraph|2-4 paragraph/);
+    // The full lead has a documented path now, and the description points at it.
+    expect(wikipediaGetSummary.description).toContain('section_index');
+  });
+
   it('passes non-default language to service', async () => {
     const getSummaryFn = vi.fn().mockResolvedValue({ ...mockSummary, title: 'Python (langage)' });
     mockWikipediaService({

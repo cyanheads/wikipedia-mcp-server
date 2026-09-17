@@ -15,6 +15,7 @@ import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import type { RequestContext } from '@cyanheads/mcp-ts-core/utils';
 import { fetchWithTimeout, logger, withExtra, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import type {
+  ActionApiErrorRaw,
   ActionExtractsRaw,
   ActionGeoSearchRaw,
   ActionLangLinksRaw,
@@ -343,10 +344,21 @@ export function htmlSectionToPlainText(html: string): string {
 }
 
 /**
+ * The lead section — the text above the first heading — under the one label every surface uses for
+ * it: the overflow outline's entry, `wikipedia_get_sections`' index-0 row, and the `section_title`
+ * a `section_index: 0` read reports. The lead carries no heading of its own upstream, so without a
+ * fixed label the read path falls back to `Section 0` and names something the outline never listed.
+ */
+export const LEAD_SECTION_TITLE = 'Introduction';
+
+/** The section index that reads {@link LEAD_SECTION_TITLE} through `action=parse&section=0`. */
+export const LEAD_SECTION_INDEX = 0;
+
+/**
  * Split a plain-text article extract into per-section parts on its preserved `== Heading ==`
  * markers (via the shared {@link HEADING_LINE}). Text before the first heading becomes the
- * `Introduction` lead; each subsequent heading opens a part whose body runs to the next heading.
- * Empty parts are dropped. Pure and exported — the overflow-outline pre-shaping in
+ * {@link LEAD_SECTION_TITLE} lead; each subsequent heading opens a part whose body runs to the next
+ * heading. Empty parts are dropped. Pure and exported — the overflow-outline pre-shaping in
  * `wikipedia_get_article` relies on it, and it is unit-tested directly.
  */
 export function splitArticleIntoSections(
@@ -357,7 +369,7 @@ export function splitArticleIntoSections(
 
   const firstStart = matches[0]?.index ?? content.length;
   const lead = content.slice(0, firstStart).trim();
-  if (lead) parts.push({ heading: 'Introduction', body: lead });
+  if (lead) parts.push({ heading: LEAD_SECTION_TITLE, body: lead });
 
   for (const [i, m] of matches.entries()) {
     const heading = m[2] ?? `Section ${i + 1}`;
@@ -713,6 +725,23 @@ export const GEOSEARCH_MAX_LIMIT = 500;
 export const GEOSEARCH_MIN_RADIUS_METERS = 10;
 export const GEOSEARCH_MAX_RADIUS_METERS = 10_000;
 
+/**
+ * This server's own page size for `list=search`. Upstream reports `limit.max: 500` for an anonymous
+ * caller, so the cap is a payload-size choice rather than an API ceiling.
+ */
+export const SEARCH_MAX_LIMIT = 50;
+
+/**
+ * The deep-paging window CirrusSearch enforces on `sroffset`. At or past it the API refuses the
+ * request outright (`cirrussearch-offset-too-large`); below it, a page that would cross the window
+ * is silently cut at the 10,000th result instead. Matches beyond it have no continuation — a
+ * narrower query is the only way to reach them.
+ */
+export const SEARCH_RESULT_WINDOW = 10_000;
+
+/** {@link SEARCH_RESULT_WINDOW} written the way every user-facing message spells it. */
+const SEARCH_RESULT_WINDOW_LABEL = SEARCH_RESULT_WINDOW.toLocaleString('en-US');
+
 function assertStructuralLanguage(language: string): void {
   if (isMalformedLanguage(language)) {
     throw validationError(
@@ -732,6 +761,67 @@ function unknownEditionError(language: string): McpError {
       },
     },
   );
+}
+
+/** The miss every read path reports the same way, whichever endpoint discovered it. */
+function articleNotFoundError(title: string, language: string): McpError {
+  return notFound(
+    `No Wikipedia article found for "${title}" in language "${language}". Use wikipedia_search_articles to find the correct title.`,
+    {
+      title,
+      language,
+      recovery: { hint: 'Use wikipedia_search_articles to find the correct article title.' },
+    },
+  );
+}
+
+/**
+ * A title MediaWiki cannot name a page with. Carries the `invalid_title` reason the four
+ * title-taking tools declare, so a refusal raised here — from an `invalid: true` page entry or an
+ * `invalidtitle` parse error — reaches the client with the same typed contract as the handler-edge
+ * guard, instead of an untyped upstream message asserting the article exists.
+ */
+function invalidTitleError(title: string, upstreamReason?: string): McpError {
+  return validationError(
+    `"${title}" is not a valid Wikipedia page name.${upstreamReason ? ` ${upstreamReason}` : ''}`,
+    {
+      title,
+      reason: 'invalid_title',
+      recovery: {
+        hint: 'Use wikipedia_search_articles to find the exact article title and pass it verbatim.',
+      },
+    },
+  );
+}
+
+/** An `offset` at or past {@link SEARCH_RESULT_WINDOW}, where no continuation exists. */
+function searchWindowError(offset: number): McpError {
+  return validationError(
+    `Offset ${offset} is at or past Wikipedia's ${SEARCH_RESULT_WINDOW_LABEL}-result search window, which has no continuation. Narrow the query instead of paging further.`,
+    {
+      offset,
+      reason: 'offset_too_large',
+      recovery: {
+        hint: `Narrow the query with more specific terms — results past ${SEARCH_RESULT_WINDOW_LABEL} are not reachable by paging.`,
+      },
+    },
+  );
+}
+
+/**
+ * Translate the Action API's top-level `error` envelope into this server's typed failures.
+ *
+ * `title` is passed by the page-addressed endpoints, whose `missingtitle` and `invalidtitle` codes
+ * map onto declared tool contracts; anything else is upstream's own refusal and surfaces as a
+ * service failure carrying the API's `info` text.
+ */
+function actionApiError(error: ActionApiErrorRaw, language: string, title?: string): McpError {
+  const code = error.code ?? '';
+  if (title !== undefined) {
+    if (code === 'missingtitle') return articleNotFoundError(title, language);
+    if (code === 'invalidtitle') return invalidTitleError(title, error.info);
+  }
+  return serviceUnavailable(`Wikipedia API error: ${error.info ?? code}`);
 }
 
 /**
@@ -962,6 +1052,7 @@ export class WikipediaService {
       ctx,
       { timeoutMs: 10_000, maxRetries: 1 },
     );
+    if (raw.error) throw actionApiError(raw.error, 'en');
     return parseSiteMatrix(raw);
   }
 
@@ -1136,8 +1227,12 @@ export class WikipediaService {
    *
    * `offset` trails `ctx` with a default so existing four-argument callers keep working — the
    * pagination change stays additive at the call level. It maps to the Action API `sroffset`
-   * (this server's own `Math.min(limit, 50)` page-size cap is orthogonal to it). `nextOffset`
+   * (this server's own {@link SEARCH_MAX_LIMIT} page-size cap is orthogonal to it). `nextOffset`
    * echoes the API's own `continue.sroffset`, present only while more results remain.
+   *
+   * The `error` envelope is read before the payload: it arrives on HTTP 200, so reading
+   * `raw.query` first renders an upstream refusal — an unset `srsearch`, an offset past the search
+   * window — as a successful empty result indistinguishable from a real answer.
    */
   async search(
     query: string,
@@ -1156,12 +1251,17 @@ export class WikipediaService {
         action: 'query',
         list: 'search',
         srsearch: query,
-        srlimit: String(Math.min(limit, 50)),
+        srlimit: String(Math.min(limit, SEARCH_MAX_LIMIT)),
         sroffset: String(offset),
         srprop: 'snippet|wordcount',
       },
       ctx,
     );
+
+    if (raw.error) {
+      if (raw.error.code === 'cirrussearch-offset-too-large') throw searchWindowError(offset);
+      throw actionApiError(raw.error, language);
+    }
 
     const results =
       raw.query?.search?.map((r) => ({
@@ -1199,23 +1299,20 @@ export class WikipediaService {
       ctx,
     );
 
+    if (raw.error) throw actionApiError(raw.error, language, title);
+
     const pages = raw.query?.pages;
     // When `pages` is absent the API received an empty or invalid title rather than a valid
     // (but missing) article. Map this to not_found — same user-visible outcome.
-    if (!pages) {
-      throw notFound(
-        `No Wikipedia article found for "${title}" in language "${language}". Use wikipedia_search_articles to find the correct title.`,
-        { title, language },
-      );
-    }
+    if (!pages) throw articleNotFoundError(title, language);
 
     const page = Object.values(pages)[0];
-    if (!page || page.missing !== undefined) {
-      throw notFound(
-        `No Wikipedia article found for "${title}" in language "${language}". Use wikipedia_search_articles to find the correct title.`,
-        { title, language },
-      );
-    }
+    if (!page) throw articleNotFoundError(title, language);
+
+    // An unnameable title arrives as `invalid` with no `missing` key, so this has to be tested
+    // separately or the entry falls through into "exists but has no readable content".
+    if (page.invalid) throw invalidTitleError(title, page.invalidreason);
+    if (page.missing !== undefined) throw articleNotFoundError(title, language);
 
     if (!page.extract) {
       throw notFound(`Article "${title}" exists but has no readable content.`, { title, language });
@@ -1266,8 +1363,7 @@ export class WikipediaService {
     );
 
     if (raw.error) {
-      const errCode = raw.error.code ?? '';
-      if (errCode === 'nosuchsection') {
+      if (raw.error.code === 'nosuchsection') {
         throw validationError(
           `Section index ${sectionIndex} does not exist in "${title}". Call wikipedia_get_sections to get valid index values.`,
           {
@@ -1277,21 +1373,21 @@ export class WikipediaService {
           },
         );
       }
-      if (errCode === 'missingtitle') {
-        throw notFound(
-          `No Wikipedia article found for "${title}" in language "${language}". Use wikipedia_search_articles to find the correct title.`,
-          { title, language },
-        );
-      }
-      throw serviceUnavailable(`Wikipedia API error: ${raw.error.info ?? errCode}`);
+      throw actionApiError(raw.error, language, title);
     }
 
     // formatversion=2: text is a plain string, not { '*': string }.
     const content = htmlSectionToPlainText(raw.parse?.text ?? '');
 
-    // The section's own heading opens its rendered text; markup inside it is already stripped, so
-    // a heading like `<i>Pax Romana</i>` reports as `Pax Romana`.
-    const sectionTitle = [...content.matchAll(HEADING_LINE)][0]?.[2] ?? `Section ${sectionIndex}`;
+    // The lead carries no heading of its own, so it takes the label every other surface prints for
+    // it rather than the positional fallback. A heading inside a lead — a template can emit one —
+    // must not rename it either, or the read reports a title the section list never offered.
+    // Every other section's own heading opens its rendered text; markup inside it is already
+    // stripped, so a heading like `<i>Pax Romana</i>` reports as `Pax Romana`.
+    const sectionTitle =
+      sectionIndex === LEAD_SECTION_INDEX
+        ? LEAD_SECTION_TITLE
+        : ([...content.matchAll(HEADING_LINE)][0]?.[2] ?? `Section ${sectionIndex}`);
 
     return {
       title: raw.parse?.title ?? title,
@@ -1319,16 +1415,7 @@ export class WikipediaService {
       ctx,
     );
 
-    if (raw.error) {
-      const errCode = raw.error.code ?? '';
-      if (errCode === 'missingtitle') {
-        throw notFound(
-          `No Wikipedia article found for "${title}" in language "${language}". Use wikipedia_search_articles to find the correct title.`,
-          { title, language },
-        );
-      }
-      throw serviceUnavailable(`Wikipedia API error: ${raw.error.info ?? errCode}`);
-    }
+    if (raw.error) throw actionApiError(raw.error, language, title);
 
     const resolvedTitle = raw.parse?.title ?? title;
     const rawSections = raw.parse?.tocdata?.sections ?? [];
@@ -1399,16 +1486,18 @@ export class WikipediaService {
       ctx,
     );
 
+    if (raw.error) throw actionApiError(raw.error, sourceLanguage, title);
+
     const pages = raw.query?.pages;
     if (!pages) throw serviceUnavailable('Unexpected response shape from Wikipedia langlinks API.');
 
     const page = Object.values(pages)[0];
-    if (!page || page.missing !== undefined) {
-      throw notFound(
-        `No Wikipedia article found for "${title}" in language "${sourceLanguage}". Use wikipedia_search_articles to find the correct title.`,
-        { title, language: sourceLanguage },
-      );
-    }
+    if (!page) throw articleNotFoundError(title, sourceLanguage);
+
+    // An unnameable title arrives as `invalid` with no `missing` key, so this has to be tested
+    // separately or the entry falls through into "has no other language editions".
+    if (page.invalid) throw invalidTitleError(title, page.invalidreason);
+    if (page.missing !== undefined) throw articleNotFoundError(title, sourceLanguage);
 
     const langlinks = page.langlinks ?? [];
     // llprop=url normally populates every url, so the registry is consulted only on the rare miss.
@@ -1480,6 +1569,8 @@ export class WikipediaService {
       ctx,
     );
 
+    if (raw.error) throw actionApiError(raw.error, language);
+
     const matches =
       raw.query?.geosearch?.map((r) => ({
         title: r.title,
@@ -1530,4 +1621,52 @@ export function getWikipediaService(): WikipediaService {
  */
 export function isBlankTitle(title: string): boolean {
   return !title.trim();
+}
+
+/**
+ * Characters MediaWiki's `$wgLegalTitleChars` excludes, minus `#`: the fragment is stripped before
+ * the title is resolved, so `Python (programming language)#History` names a real page on every
+ * read path and rejecting it would be a regression.
+ */
+const ILLEGAL_TITLE_CHARS = /[<>[\]{}]/;
+
+/**
+ * `|` separates titles in the Action API's `titles` parameter, so `Cat|Dog` is two lookups rather
+ * than one bad title: the request succeeds and the reader takes the first page, answering about
+ * `Cat` a question that was asked about neither article.
+ */
+const MULTI_TITLE_SEPARATOR = '|';
+
+/** A percent escape, which MediaWiki decodes rather than reads — a bare `%` stays legal. */
+const PERCENT_ESCAPE = /%[0-9a-f]{2}/i;
+
+/** Three or more tildes, MediaWiki's signature magic. Two are legal. */
+const MAGIC_TILDES = /~~~/;
+
+/** The relative-path segments MediaWiki refuses: a leading, embedded, or trailing `.` or `..`. */
+const RELATIVE_PATH_SEGMENT = /^\.{1,2}(?:\/|$)|\/\.{1,2}(?:\/|$)/;
+
+/**
+ * Report whether `title` names no page MediaWiki can address — the signal a tool handler uses to
+ * reject it with the typed `invalid_title` contract before any network call, alongside
+ * {@link isBlankTitle}.
+ *
+ * The guard runs at the handler edge because the upstream shapes disagree: `action=query` answers
+ * with an `invalid: true` page entry, `action=parse` with an `invalidtitle` error code, and REST
+ * with a 403 or a 500 — while `|` produces no error at all and silently returns a different
+ * article. One pre-fetch check normalizes all four.
+ *
+ * Coverage is MediaWiki's whole page-name rule, not only the characters that motivated it: percent
+ * escapes, magic tildes, and relative paths are `invalid: true` upstream exactly as `A<B` is, so
+ * excluding them would leave the same "exists but has no readable content" claim in place for
+ * `A%41B` and `./Cat`.
+ */
+export function isInvalidTitle(title: string): boolean {
+  return (
+    ILLEGAL_TITLE_CHARS.test(title) ||
+    title.includes(MULTI_TITLE_SEPARATOR) ||
+    PERCENT_ESCAPE.test(title) ||
+    MAGIC_TILDES.test(title) ||
+    RELATIVE_PATH_SEGMENT.test(title)
+  );
 }

@@ -8,7 +8,12 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import {
   getWikipediaService,
   isMalformedLanguage,
+  SEARCH_MAX_LIMIT,
+  SEARCH_RESULT_WINDOW,
 } from '@/services/wikipedia/wikipedia-service.js';
+
+/** {@link SEARCH_RESULT_WINDOW} as every caller-facing string spells it. */
+const WINDOW = SEARCH_RESULT_WINDOW.toLocaleString('en-US');
 
 export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
   title: 'Search Wikipedia',
@@ -16,14 +21,17 @@ export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
     'Search Wikipedia articles by full-text query. Returns ranked results with plain-text titles, snippets (HTML stripped), page IDs, and word counts. Best when the exact article title is unknown or when multiple articles on a topic are needed. Pass a result title to wikipedia_get_summary, wikipedia_get_article, or wikipedia_get_sections for follow-up reads. Use offset to page beyond the first result page. Supports all Wikipedia language editions.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
-    query: z.string().describe('Search query (e.g. "Python programming language").'),
+    query: z
+      .string()
+      .describe('Search query (e.g. "Python programming language"). Must not be empty.'),
     limit: z
       .number()
       .int()
       .min(1)
+      .max(SEARCH_MAX_LIMIT)
       .default(10)
       .describe(
-        'Maximum number of results to return per page (default 10, max 50). Must be a positive integer.',
+        `Maximum number of results to return per page (default 10, max ${SEARCH_MAX_LIMIT}). Must be a positive integer.`,
       ),
     offset: z
       .number()
@@ -31,7 +39,7 @@ export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
       .min(0)
       .default(0)
       .describe(
-        'Result offset for pagination (default 0). Pass the nextOffset from a previous response to fetch the next page; limit still governs the per-page size. An offset past the total match count returns an empty result array, not an error.',
+        `Result offset for pagination (default 0). Pass the nextOffset from a previous response to fetch the next page; limit still governs the per-page size. An offset past the total match count returns an empty result array, not an error. Wikipedia serves no result past ${WINDOW}, so an offset at or beyond that fails — narrow the query instead.`,
       ),
     language: z
       .string()
@@ -75,15 +83,42 @@ export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
       .describe(
         'Offset to request the next page. Present only when more results remain — pass it back as offset to continue; absent at the end of results.',
       ),
+    truncated: z
+      .boolean()
+      .optional()
+      .describe(
+        `True when this page was cut at Wikipedia's ${WINDOW}-result search window and totalCount matches remain that no offset can reach. Absent on every other page, including a genuine last page.`,
+      ),
+    cap: z
+      .number()
+      .int()
+      .optional()
+      .describe(
+        'The result ceiling that cut this page — the search window. Present only alongside truncated.',
+      ),
     notice: z
       .string()
       .optional()
       .describe(
-        'Guidance when no results matched — e.g. try different keywords, or that the end of results was reached when paging. Absent on successful result pages.',
+        'Guidance when no results matched, when the end of results was reached while paging, or when the page was cut at the search window. Absent on ordinary result pages.',
       ),
   },
 
   errors: [
+    {
+      reason: 'empty_query',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The query is an empty string, which Wikipedia reads as a missing parameter.',
+      recovery:
+        'Supply search terms describing the topic, such as a title or a descriptive phrase.',
+    },
+    {
+      reason: 'offset_too_large',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The offset is at or past the search window, which has no continuation.',
+      recovery:
+        'Narrow the query with more specific terms rather than paging further into the result set.',
+    },
     {
       reason: 'invalid_language',
       code: JsonRpcErrorCode.ValidationError,
@@ -93,9 +128,8 @@ export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
   ],
 
   async handler(input, ctx) {
-    const { language } = input;
+    const { language, limit } = input;
     const svc = getWikipediaService();
-    const limit = Math.min(input.limit, 50);
 
     if (isMalformedLanguage(language)) {
       throw ctx.fail(
@@ -112,6 +146,27 @@ export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
         'invalid_language',
         `Language edition "${language}" does not exist on Wikipedia. Use a valid Wikipedia language code such as "fr", "de", or "ja".`,
         { language, ...ctx.recoveryFor('invalid_language') },
+      );
+    }
+
+    // Reject an empty query before the fetch: upstream reads `srsearch=` as unset and answers with
+    // an error envelope on HTTP 200, which rendered as a successful "no articles found". A
+    // whitespace-only query is a different thing — a legitimate search that really matches nothing.
+    if (input.query === '') {
+      throw ctx.fail(
+        'empty_query',
+        'Search query must not be empty. Provide search terms, such as an article title or a descriptive phrase.',
+        { ...ctx.recoveryFor('empty_query') },
+      );
+    }
+
+    // Reject an offset at or past the search window before the fetch, for the same reason: upstream
+    // refuses it with `cirrussearch-offset-too-large` inside a 200 response.
+    if (input.offset >= SEARCH_RESULT_WINDOW) {
+      throw ctx.fail(
+        'offset_too_large',
+        `Offset ${input.offset} is at or past Wikipedia's ${WINDOW}-result search window, which has no continuation. Narrow the query instead of paging further.`,
+        { offset: input.offset, ...ctx.recoveryFor('offset_too_large') },
       );
     }
 
@@ -144,6 +199,18 @@ export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
           ? `No results at offset ${input.offset} for "${input.query}" in language "${language}"${totalResults ? ` (total matches: ${totalResults})` : ''}. The end of the result set was reached — lower the offset to page back.`
           : `No Wikipedia articles found for "${input.query}" in language "${language}". Try different keywords or a broader query.`,
       );
+    }
+
+    // A page that ends on the search window looks exactly like the last page of results — full
+    // page, no continuation — while matches remain that no offset reaches. Say so, because the
+    // only route to them is a narrower query.
+    const reached = input.offset + results.length;
+    if (results.length > 0 && reached >= SEARCH_RESULT_WINDOW && totalResults > reached) {
+      ctx.enrich.truncated({
+        shown: results.length,
+        cap: SEARCH_RESULT_WINDOW,
+        guidance: `Wikipedia serves at most ${WINDOW} results per query, and this page ends there. ${totalResults - reached} further matches exist but no offset reaches them — narrow the query with more specific terms to bring them into the first ${WINDOW}.`,
+      });
     }
 
     ctx.log.info('Search complete', {

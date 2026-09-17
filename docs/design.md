@@ -6,12 +6,12 @@
 
 | Name | Description | Key Inputs | Annotations | Errors |
 |:-----|:------------|:-----------|:------------|:-------|
-| `wikipedia_search_articles` | Full-text search across articles. Returns ranked results with plain-text titles, snippets, and page IDs. Use when the exact article title is unknown or to find multiple articles on a topic. | `query`, `limit`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `no_results` (NotFound), `invalid_language` (InvalidParams) |
-| `wikipedia_get_summary` | Fetch the lead section summary for an article — the 2–4 paragraph intro that answers "what is X?". Returns plain-text extract, Wikidata QID for cross-referencing, description, and thumbnail URL. Handles disambiguation pages: returns `page_type: "disambiguation"` so the agent can detect and pivot to a more specific search. | `title`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `invalid_language` (InvalidParams) |
-| `wikipedia_get_article` | Fetch article content as clean plain text. Full-article path uses `action=query&prop=extracts&explaintext=true` (40–100KB for major articles). Section-targeted path uses `action=parse&prop=text&section={index}`, rendering the parser's HTML for that section to plain text — use `section_index` (from `wikipedia_get_sections`) to retrieve a single section and its subsections. Prefer section targeting when only part of the article is needed. | `title`, `section_index`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `invalid_section` (InvalidParams), `invalid_language` (InvalidParams) |
-| `wikipedia_get_sections` | Fetch the table of contents for an article — section titles, numbers, levels, and `section_index` values. Call this before `wikipedia_get_article` when only a specific section is needed. The returned `section_index` values are the identifiers for targeted section reads. | `title`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `no_sections` (NotFound), `invalid_language` (InvalidParams) |
-| `wikipedia_search_nearby` | Find Wikipedia articles about places near a geographic coordinate. Returns articles within a radius, sorted by distance. Useful for "what's notable near X?" research. | `latitude`, `longitude`, `radius_meters`, `limit`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `no_results` (NotFound), `invalid_coordinates` (InvalidParams), `invalid_language` (InvalidParams) |
-| `wikipedia_get_languages` | List the language editions available for an article. Returns each edition's language code, tool-usable subdomain code, article title, and URL. Use for cross-language research or to find a non-English article title for a known concept. | `title`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `no_other_languages` (NotFound), `invalid_language` (InvalidParams) |
+| `wikipedia_search_articles` | Full-text search across articles. Returns ranked results with plain-text titles, snippets, and page IDs. Use when the exact article title is unknown or to find multiple articles on a topic. | `query`, `limit`, `offset`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `empty_query` (ValidationError), `offset_too_large` (ValidationError), `invalid_language` (ValidationError) |
+| `wikipedia_get_summary` | Fetch the short summary for an article — a truncated fragment from the start of the lead section, which answers "what is X?". Returns plain-text extract, Wikidata QID for cross-referencing, description, and thumbnail URL. Handles disambiguation pages: returns `page_type: "disambiguation"` so the agent can detect and pivot to a more specific search. | `title`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `invalid_title` (ValidationError), `invalid_language` (ValidationError) |
+| `wikipedia_get_article` | Fetch article content as clean plain text. Full-article path uses `action=query&prop=extracts&explaintext=true` (40–100KB for major articles). Section-targeted path uses `action=parse&prop=text&section={index}`, rendering the parser's HTML for that section to plain text — use `section_index` (from `wikipedia_get_sections`) to retrieve a single section and its subsections, or `section_index: 0` for the lead. Prefer section targeting when only part of the article is needed. | `title`, `section_index`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `invalid_title` (ValidationError), `invalid_section` (ValidationError), `invalid_language` (ValidationError) |
+| `wikipedia_get_sections` | Fetch the table of contents for an article — section titles, numbers, levels, and `section_index` values, led by the index-0 `Introduction` entry for the lead. Call this before `wikipedia_get_article` when only a specific section is needed. The returned `section_index` values are the identifiers for targeted section reads. | `title`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `invalid_title` (ValidationError), `no_sections` (NotFound), `invalid_language` (ValidationError) |
+| `wikipedia_search_nearby` | Find Wikipedia articles about places near a geographic coordinate. Returns articles within a radius, sorted by distance. Useful for "what's notable near X?" research. | `latitude`, `longitude`, `radius_meters`, `limit`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `invalid_coordinates` (ValidationError), `invalid_language` (ValidationError) |
+| `wikipedia_get_languages` | List the language editions available for an article. Returns each edition's language code, tool-usable subdomain code, article title, and URL. Use for cross-language research or to find a non-English article title for a known concept. | `title`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `invalid_title` (ValidationError), `no_other_languages` (NotFound), `invalid_language` (ValidationError) |
 
 ### Resources
 
@@ -150,6 +150,36 @@ Four rendering conventions are deliberate:
 - **Elements the page hides are dropped, judged from `display:none` in an inline style rather than a class list.** Tag stripping alone kept the text of markup MediaWiki never renders. The Math extension emits a screen-reader MathML twin behind `display:none`, so every formula rendered twice — once as a column of one glyph per source line, then again as the `{\displaystyle …}` TeX from the twin's `<annotation>`; `{{calculator}}` gadgets are hidden until their script runs, so button labels and widget state landed mid-section. The general rule was chosen over enumerating gadget class names because the hiding is what the shapes have in common and new gadgets would each need an entry. Since the TeX lived only inside the twin, the formula is recovered from `img.mwe-math-fallback-image-*`'s `alt` before anything is dropped.
 - **`<pre>` blocks keep their line breaks and indentation**, which the extract path does not — it drops code samples entirely. In a code sample indentation is syntax; an unindented Python listing reads as valid code and is not, which is worse than omitting it.
 
+### The lead section is index 0, listed and named
+
+`action=parse&prop=text&section=0` renders the lead — the text above the first heading — like any other section, so the lead is read through the same path as everything else rather than through a second mechanism. Three consequences are deliberate:
+
+- **`wikipedia_get_sections` lists it** as `{ index: 0, number: "0", title: "Introduction", level: 1 }`, ahead of the upstream table of contents, which starts at the first heading. Without the row, the section agents most often want is the one section the table of contents never names, and the two tools disagree about whether index 0 exists. The entry is added in the handler rather than the service so `no_sections` keeps meaning "no headed sections" — upstream's own table of contents is what that judges.
+- **The lead's `section_title` is fixed to `Introduction`**, the label `splitArticleIntoSections` already prints in the overflow outline. The positional `Section 0` fallback named something no other surface reports, and a template-emitted heading inside a lead must not rename it either.
+- **The overflow notice names `section_index 0`**, so an agent holding only the outline can reach the `Introduction` entry it lists.
+
+Bounds on `section_index` (`int`, `≥ 0`) live on the Zod field rather than in the handler: they advertise themselves in `inputSchema`, and a schema rejection and a handler `ctx.fail` cannot both own the same bound — the schema wins, leaving the contract entry unreachable while still reading as covered. `invalid_section` stays for the out-of-range index only upstream can judge.
+
+### Title validation at the handler edge, covering MediaWiki's whole page-name rule
+
+A title MediaWiki cannot name a page with is refused before any network call, by a shared `isInvalidTitle` guard alongside `isBlankTitle`, on all four title-taking tools. The upstream shapes disagree — `invalid: true` on `action=query`, `invalidtitle` on `action=parse`, 403 or 500 on REST — and `|` produces no error at all, because it separates titles in the `titles` parameter and silently returns a different article. One pre-fetch check normalizes all four.
+
+Three decisions inside it:
+
+- **Coverage is the whole rule, not the characters that motivated it.** `%XX`, three or more tildes, and relative paths are `invalid: true` upstream exactly as `A<B` is; excluding them would leave the same wrong answer in place for `A%41B` and `./Cat`. A bare `%`, `~~`, `_`, `+`, and a leading `:` all name real pages and are admitted.
+- **`#` is admitted.** MediaWiki strips the fragment before resolving, so `Python (programming language)#History` resolves on every read path; rejecting it would be a regression. Nothing strips it server-side — passing it through is what already works.
+- **The constraint is not on the Zod `title` field.** A regex admitting `#`, a bare `%`, `_`, `+`, and a leading `:` while rejecting `%XX`, `~~~`, and relative paths is unreadable, and a schema rejection carries no `data.reason` and no recovery hint — so the contract entry that would document it could never fire. A declared `invalid_title` reason (ValidationError) on all four tools carries both, and `.describe()` states the rule so it is still visible before the call. `invalid_title` rather than the existing `not_found` because the two need different recoveries: a search for the right title, versus the title being unnameable at all.
+
+The service also recognizes the shapes for callers that reach it directly: an `invalid: true` page entry in `getArticleFull`/`getLanguages` (the entry carries no `missing` key, so a `missing !== undefined` test read it as an existing, empty article) and the `invalidtitle` code on both parse paths.
+
+### Search: refusals are failures, and the window is disclosed
+
+`WikipediaService.search` reads the `error` envelope before the payload, so an upstream refusal fails the call instead of returning `totalCount: 0` in a success envelope. The four sibling Action API call sites (`getArticleFull`, `getLanguages`, `searchNearby`, `fetchEditionIndex`) read it the same way — the envelope is what those endpoints return, and leaving them unreconciled means the next input shape that slips past a handler guard reproduces the bug on a different tool.
+
+- **An empty `query` and an `offset` at or past the window are refused at the handler edge**, with declared `empty_query` and `offset_too_large` reasons, before the fetch that would be refused anyway. A whitespace-only query is not in that class: `srsearch=%20` is a legitimate search that matches nothing, and rejecting it would be a regression. `offset_too_large`'s recovery says to narrow the query, not to page back — paging back is what the old end-of-results notice wrongly advised, and no offset reaches past the window.
+- **A page ending at the window discloses it** through `ctx.enrich.truncated({ shown, cap: 10000 })` plus a notice naming the matches no offset reaches. The condition is `offset + shown >= 10000` with `totalCount` still higher; below the window nothing changes, so an ordinary page and a genuine last page are untouched. `truncated` and `cap` are optional enrichment fields, absent unless the window cut the page.
+- **`limit` carries `.max(50)`**, so the advertised schema matches the cap the server enforces. This turns a silent clamp into a rejection for a caller passing a larger value. 50 is this server's page size, not an upstream ceiling — `action=paraminfo` reports `limit.max: 500` for an anonymous caller.
+
 ### Disambiguation handling
 
 The REST API summary endpoint returns `"type": "disambiguation"` for disambiguation pages alongside a short extract like "Python may refer to:". This is not an error — surface it in the output schema with a `page_type` field (`"article" | "disambiguation" | "redirect"`). When the agent gets `page_type: "disambiguation"`, it should call `wikipedia_search_articles` with a more specific query. Document this in the tool description.
@@ -211,7 +241,9 @@ All requests: `format=json`
 | `action=query&titles={t}&prop=langlinks&lllimit=500` | `wikipedia_get_languages` |
 | `action=query&list=geosearch&gscoord={lat}\|{lon}&gsradius={r}&gslimit={n}` | `wikipedia_search_nearby` |
 
-Pagination: Action API uses `continue` objects in the response. Tools that paginate internally (langlinks) should set `lllimit=500` to minimize round-trips. Search and geosearch results are bounded by the `limit` parameter.
+Pagination: Action API uses `continue` objects in the response. Tools that paginate internally (langlinks) should set `lllimit=500` to minimize round-trips. Geosearch results are bounded by the `limit` parameter alone — the module has no `offset` or `continue`. Search pages with `sroffset`, bounded by CirrusSearch's 10,000-result window: `sroffset >= 10000` is refused outright, and a page crossing the window is cut at the 10,000th result rather than refused, so the window's edge is shaped exactly like the end of the result set and has to be disclosed from `totalCount` against the offset reached.
+
+Errors: the Action API returns its refusals as a top-level `error` object inside an **HTTP 200** body, so status-code mapping never sees them. Every raw response type declares `error` and every call site reads it before the payload; skipping that check renders an upstream refusal as an empty success.
 
 Snippet HTML: Search snippets include `<span class="searchmatch">` markup. Strip to plain text before returning. This is reflected in `wikipedia_search_articles`'s output design — snippets are always plain text in the tool response.
 
@@ -231,15 +263,19 @@ No enforced rate limits, but:
 **Description:** Full-text search across Wikipedia articles. Returns ranked results with plain-text titles, snippets (search match highlighted terms stripped to plain text), and page IDs. Use when the exact article title is unknown or to discover multiple articles on a topic. The `pageid` values in results can be used to resolve article titles for subsequent calls.
 
 **Input:**
-- `query: string` — search query
-- `limit?: number` — max results to return (default 10, max 50)
+- `query: string` — search query; an empty string is refused before the fetch (whitespace is a legitimate search upstream and is not)
+- `limit?: number` — max results per page (default 10, max 50 — enforced by the schema, so a larger value is rejected rather than silently clamped)
+- `offset?: number` — result offset (default 0); at or past the 10,000-result search window the call is refused, since nothing past it is retrievable
 - `language?: string` — Wikipedia language edition code (default `"en"`); constructs the correct base URL per call
 
-**Output:** Array of results, each with `title`, `pageid`, `snippet` (plain text, `<span class="searchmatch">` tags stripped), and `wordcount`. Includes `total_results` count — if the search returned zero results, the response indicates this directly.
+**Output:** Array of results, each with `title`, `pageid`, `snippet` (plain text, `<span class="searchmatch">` tags stripped), and `wordcount`. Enrichment carries `effectiveQuery`, `totalCount`, `offset`, `shown`, `nextOffset` while more results remain, and — on a page that ends at the search window — `truncated`, `cap`, and a notice naming the matches no offset reaches.
 
 **Errors:**
-- `no_results` (NotFound) — search returned zero results. Recovery: broaden the query or try different keywords.
-- `invalid_language` (InvalidParams) — unrecognized language code. Recovery: use a valid BCP 47 language code (e.g., `"fr"`, `"de"`, `"ja"`).
+- `empty_query` (ValidationError) — the query is an empty string, which Wikipedia reads as a missing parameter. Recovery: supply search terms.
+- `offset_too_large` (ValidationError) — the offset is at or past the 10,000-result search window. Recovery: narrow the query rather than paging further.
+- `invalid_language` (ValidationError) — unrecognized language code. Recovery: use a valid BCP 47 language code (e.g., `"fr"`, `"de"`, `"ja"`).
+
+A search that matches nothing is a successful empty result with a notice, not an error.
 
 **Annotations:** `readOnlyHint: true`, `openWorldHint: true`
 
@@ -247,17 +283,18 @@ No enforced rate limits, but:
 
 ### `wikipedia_get_summary`
 
-**Description:** Fetch the lead-section summary for a Wikipedia article — the 2–4 paragraph intro that answers "what is X?". Returns a clean plain-text extract, Wikidata QID (`wikibase_item`) for cross-referencing with `wikidata-mcp-server`, description, and thumbnail URL. Disamb pages return `page_type: "disambiguation"` — not an error, but a signal to call `wikipedia_search_articles` with a more specific query. Redirect pages are followed automatically; `page_type: "redirect"` is returned with the resolved title.
+**Description:** Fetch the short summary for a Wikipedia article — the REST `extract`, a truncated fragment from the start of the lead section, which answers "what is X?". Returns a clean plain-text extract, Wikidata QID (`wikibase_item`) for cross-referencing with `wikidata-mcp-server`, description, and thumbnail URL. The full lead is a different call: `wikipedia_get_article` with `section_index: 0`. Disamb pages return `page_type: "disambiguation"` — not an error, but a signal to call `wikipedia_search_articles` with a more specific query. Redirect pages are followed automatically; `page_type: "redirect"` is returned with the resolved title.
 
 **Input:**
-- `title: string` — article title (URL-decoded; e.g., `"Python (programming language)"`)
+- `title: string` — article title (URL-decoded; e.g., `"Python (programming language)"`); a trailing `#fragment` is accepted, and a title MediaWiki cannot name a page with is refused before the fetch
 - `language?: string` — language edition code (default `"en"`)
 
 **Output:** `{ title, page_type, pageid, wikibase_item, description, extract, thumbnail_url }`. `page_type` is one of `"article" | "disambiguation" | "redirect"`. `wikibase_item` is the Wikidata QID (e.g., `"Q28865"`) — use to chain into `wikidata-mcp-server` without a separate title-to-QID lookup.
 
 **Errors:**
 - `not_found` (NotFound) — no article exists for the title. Recovery: use `wikipedia_search_articles` to find the correct title.
-- `invalid_language` (InvalidParams) — unrecognized language code.
+- `invalid_title` (ValidationError) — the title contains characters MediaWiki cannot name a page with. Recovery: use `wikipedia_search_articles` to find the exact title.
+- `invalid_language` (ValidationError) — unrecognized language code.
 
 **Annotations:** `readOnlyHint: true`, `openWorldHint: true`
 
@@ -268,16 +305,17 @@ No enforced rate limits, but:
 **Description:** Fetch article content as clean plain text. Two code paths depending on whether `section_index` is provided. Without `section_index`: returns the full article via `action=query&prop=extracts&explaintext=true` — 40–100KB for major articles, with `== Section == ` markers preserved for structure. With `section_index` (from `wikipedia_get_sections`): returns that section and its subsections via `action=parse&prop=text`, with the parser's HTML rendered to plain text. Prefer section targeting when the full article exceeds what is needed.
 
 **Input:**
-- `title: string` — article title
-- `section_index?: number` — section index from `wikipedia_get_sections`. Omit for the full article.
+- `title: string` — article title; a trailing `#fragment` is accepted, and a title MediaWiki cannot name a page with is refused before the fetch
+- `section_index?: integer ≥ 0` — section index from `wikipedia_get_sections`; `0` reads the lead. Omit for the full article. A negative or fractional value is a schema rejection, so it never reaches upstream.
 - `language?: string` — language edition code (default `"en"`)
 
-**Output:** `{ title, pageid, content, section_title?, content_type }`. `content` is always plain text. `content_type` is `"full_article"` or `"section"`. For section reads, `section_title` is included. For full articles, `content` includes `== Section ==` markers.
+**Output:** `{ title, pageid, content, section_title?, content_type }`. `content` is always plain text. `content_type` is `"full_article"` or `"section"`. For section reads, `section_title` is included — `"Introduction"` for the lead, which carries no heading of its own. For full articles, `content` includes `== Section ==` markers.
 
 **Errors:**
 - `not_found` (NotFound) — no article exists for the title. Recovery: use `wikipedia_search_articles` to find the correct title.
-- `invalid_section` (InvalidParams) — `section_index` is out of range. Recovery: call `wikipedia_get_sections` first to obtain valid index values.
-- `invalid_language` (InvalidParams) — unrecognized language code.
+- `invalid_title` (ValidationError) — the title contains characters MediaWiki cannot name a page with. Recovery: use `wikipedia_search_articles` to find the exact title.
+- `invalid_section` (ValidationError) — `section_index` is out of range. Recovery: call `wikipedia_get_sections` first to obtain valid index values.
+- `invalid_language` (ValidationError) — unrecognized language code.
 
 **Annotations:** `readOnlyHint: true`, `openWorldHint: true`
 
@@ -288,15 +326,16 @@ No enforced rate limits, but:
 **Description:** Fetch the table of contents for a Wikipedia article. Returns section titles, heading levels, numbering (e.g., "2.1"), and `section_index` values. The `section_index` is the identifier for targeted section reads via `wikipedia_get_article`. Call this before `wikipedia_get_article` when the specific section to read is not known, or to enumerate article structure.
 
 **Input:**
-- `title: string` — article title
+- `title: string` — article title; a trailing `#fragment` is accepted, and a title MediaWiki cannot name a page with is refused before the fetch
 - `language?: string` — language edition code (default `"en"`)
 
-**Output:** Array of section entries: `{ index, number, title, level }`. `index` is the integer to pass as `section_index` in `wikipedia_get_article`. `level` is heading depth (2 = `==`, 3 = `===`).
+**Output:** Array of section entries: `{ index, number, title, level }`, led by the lead entry `{ index: 0, number: "0", title: "Introduction", level: 1 }`. `index` is the integer to pass as `section_index` in `wikipedia_get_article`. `level` is heading depth (2 = `==`, 3 = `===`); the lead reports 1, where the page's own title sits.
 
 **Errors:**
 - `not_found` (NotFound) — no article exists for the title. Recovery: use `wikipedia_search_articles` to find the correct title.
-- `no_sections` (NotFound) — article exists but has no sections (stub or very short article). Recovery: use `wikipedia_get_article` without `section_index` to read the full content.
-- `invalid_language` (InvalidParams) — unrecognized language code.
+- `invalid_title` (ValidationError) — the title contains characters MediaWiki cannot name a page with. Recovery: use `wikipedia_search_articles` to find the exact title.
+- `no_sections` (NotFound) — article exists but has no headed sections (stub or very short article). Recovery: use `wikipedia_get_article` without `section_index` to read the full content.
+- `invalid_language` (ValidationError) — unrecognized language code.
 
 **Annotations:** `readOnlyHint: true`, `openWorldHint: true`
 
@@ -316,9 +355,10 @@ No enforced rate limits, but:
 **Output:** Array of results: `{ title, pageid, latitude, longitude, distance_meters }`, sorted ascending by `distance_meters`. Includes `total_results` count.
 
 **Errors:**
-- `no_results` (NotFound) — no geotagged articles within the radius. Recovery: increase `radius_meters` or check that the coordinates are correct.
-- `invalid_coordinates` (InvalidParams) — latitude or longitude out of range.
-- `invalid_language` (InvalidParams) — unrecognized language code.
+- `invalid_coordinates` (ValidationError) — latitude or longitude out of range.
+- `invalid_language` (ValidationError) — unrecognized language code.
+
+No geotagged articles within the radius is a successful empty result with a notice suggesting a wider radius, not an error.
 
 **Annotations:** `readOnlyHint: true`, `openWorldHint: true`
 
@@ -329,15 +369,16 @@ No enforced rate limits, but:
 **Description:** List the language editions available for a Wikipedia article. Returns language codes, the article title in each language, and the full URL. Use for cross-language research or to find a non-English article title before switching language editions. The source article's `language` parameter specifies which edition to query from.
 
 **Input:**
-- `title: string` — article title
+- `title: string` — article title; a trailing `#fragment` is accepted, and a title MediaWiki cannot name a page with is refused before the fetch
 - `language?: string` — language edition to query from (default `"en"`)
 
 **Output:** Array of language entries: `{ language_code, edition_code?, title, url }`. `edition_code` is the Wikipedia subdomain (derived from the article URL host) to pass as `language` to other tools — it can differ from `language_code` for some editions (e.g. `gsw` → `als`). `edition_code` and `url` are both omitted when the serving host cannot be established, rather than composed from `language_code`, which is not the subdomain for mismatch editions. Redirect titles are resolved, and `source_title` reports the resolved article. The source language is not included — only other editions. Includes `total_languages` count.
 
 **Errors:**
 - `not_found` (NotFound) — no article exists for the title in the specified language. Recovery: use `wikipedia_search_articles` to find the correct title.
+- `invalid_title` (ValidationError) — the title contains characters MediaWiki cannot name a page with. Recovery: use `wikipedia_search_articles` to find the exact title.
 - `no_other_languages` (NotFound) — article exists but has no other language editions. Recovery: the article may be too new or too regional to have been translated yet.
-- `invalid_language` (InvalidParams) — unrecognized language code.
+- `invalid_language` (ValidationError) — unrecognized language code.
 
 **Annotations:** `readOnlyHint: true`, `openWorldHint: true`
 
@@ -349,3 +390,5 @@ No enforced rate limits, but:
 - **`prop=sections` deprecation**: The service reads its replacement, `prop=tocdata`; the fallback (parsing `== Title ==` headers from full-article text) covers an article whose `tocdata` comes back empty.
 - **REST `related` endpoint**: The `/api/rest_v1/page/related/{title}` endpoint returned empty results during testing. Not used.
 - **Disambiguation**: The agent must handle `page_type: "disambiguation"` as a signal to refine the query, not as an error. Surfaced via `page_type` field in `wikipedia_get_summary` output.
+- **Search depth**: CirrusSearch serves no result past the 10,000th for a query, and offers no continuation past it. `wikipedia_search_articles` refuses an offset at or beyond the window and discloses a page that ends on it; matches beyond are reachable only by narrowing the query.
+- **Summary extract length**: the REST `extract` is a truncated fragment of the lead, not the lead — between a tenth and a half of it across sampled articles, and a single sentence on some. `wikipedia_get_article` with `section_index: 0` returns the lead in full.

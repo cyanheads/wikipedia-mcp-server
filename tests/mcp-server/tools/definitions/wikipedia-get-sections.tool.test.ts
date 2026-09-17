@@ -35,10 +35,65 @@ describe('wikipediaGetSections', () => {
     const input = wikipediaGetSections.input.parse({ title: 'Python (programming language)' });
     const result = await wikipediaGetSections.handler(input, ctx);
 
-    expect(result.sections).toHaveLength(3);
-    expect(result.sections[0]).toEqual({ index: 1, number: '1', title: 'History', level: 2 });
-    expect(result.total_sections).toBe(3);
+    // The upstream table of contents, unchanged, behind the lead entry.
+    expect(result.sections.slice(1)).toEqual(mockSections.sections);
+    expect(result.total_sections).toBe(4);
     expect(result.pageid).toBe(23862);
+  });
+
+  it('lists the lead as index 0 so wikipedia_get_article can reach it (issue #40)', async () => {
+    mockWikipediaService({
+      getSections: vi.fn().mockResolvedValue(mockSections),
+    });
+
+    const ctx = createMockContext({ errors: wikipediaGetSections.errors });
+    const input = wikipediaGetSections.input.parse({ title: 'Python (programming language)' });
+    const result = await wikipediaGetSections.handler(input, ctx);
+
+    // The two tools agree about the lead: the index reported here is the one the read path takes.
+    expect(result.sections[0]).toEqual({
+      index: 0,
+      number: '0',
+      title: 'Introduction',
+      level: 1,
+    });
+    expect(result.total_sections).toBe(result.sections.length);
+
+    const text = wikipediaGetSections.format!(wikipediaGetSections.output.parse(result))
+      .map((b) => (b.type === 'text' ? b.text : ''))
+      .join('');
+    expect(text).toContain('Introduction');
+    expect(text).toContain('index: 0');
+  });
+
+  it('refuses a title MediaWiki cannot name a page with, before any call (issue #42)', async () => {
+    const getSectionsFn = vi.fn();
+    mockWikipediaService({ getSections: getSectionsFn });
+
+    for (const title of ['Cat|Dog', 'Foo[bar]', 'A{b}']) {
+      const ctx = createMockContext({ errors: wikipediaGetSections.errors });
+      const rejection = await Promise.resolve(
+        wikipediaGetSections.handler(wikipediaGetSections.input.parse({ title }), ctx),
+      ).then(
+        () => undefined,
+        (err: unknown) => err as { message: string; data: { reason: string } },
+      );
+
+      expect(rejection?.data.reason).toBe('invalid_title');
+      expect(rejection?.message).not.toMatch(/https?:\/\//);
+    }
+    expect(getSectionsFn).not.toHaveBeenCalled();
+  });
+
+  it('accepts a fragment title and titles that only look illegal (issue #42)', async () => {
+    const getSectionsFn = vi.fn().mockResolvedValue(mockSections);
+    mockWikipediaService({ getSections: getSectionsFn });
+
+    for (const title of ['Python (programming language)#History', '100% Cat', 'A_B', ':Cat']) {
+      const ctx = createMockContext({ errors: wikipediaGetSections.errors });
+      await wikipediaGetSections.handler(wikipediaGetSections.input.parse({ title }), ctx);
+      expect(getSectionsFn).toHaveBeenCalledWith(title, 'en', ctx);
+    }
   });
 
   it('carries a cleaned section title into structuredContent and content[] (issue #36)', async () => {
@@ -62,7 +117,7 @@ describe('wikipediaGetSections', () => {
     const structured = wikipediaGetSections.output.parse(
       await wikipediaGetSections.handler(input, ctx),
     );
-    expect(structured.sections[0]?.title).toBe(cleaned);
+    expect(structured.sections.find((s) => s.index === 33)?.title).toBe(cleaned);
 
     const text = wikipediaGetSections.format!(structured)
       .map((b) => (b.type === 'text' ? b.text : ''))
@@ -166,7 +221,8 @@ describe('wikipediaGetSections', () => {
     const input = wikipediaGetSections.input.parse({ title: 'NYC' });
     const result = await wikipediaGetSections.handler(input, ctx);
     expect(result.title).toBe('New York City');
-    expect(result.total_sections).toBe(1);
+    // One heading upstream plus the lead entry.
+    expect(result.total_sections).toBe(2);
   });
 
   it('passes non-default language to service', async () => {

@@ -94,20 +94,148 @@ describe('wikipediaSearchArticles', () => {
     expect(searchFn).toHaveBeenCalledWith('Test', 10, 'en', ctx, 0);
   });
 
-  it('caps limit at 50', async () => {
+  it('rejects a limit above the page-size cap at schema parse time (issue #41)', () => {
+    const searchFn = vi.fn();
+    mockWikipediaService({ search: searchFn });
+
+    // The clamp was silent: `limit: 80` returned 50 results with no signal. The advertised
+    // schema now carries the bound the server enforces.
+    const parsed = wikipediaSearchArticles.input.safeParse({ query: 'Python', limit: 80 });
+    expect(parsed.success).toBe(false);
+    expect(parsed.error?.issues[0]?.path).toContain('limit');
+    expect(searchFn).not.toHaveBeenCalled();
+  });
+
+  it('still accepts a limit at the cap (issue #41)', async () => {
     const searchFn = vi.fn().mockResolvedValue({
       results: [{ title: 'T', pageid: 1, snippet: 'S', wordcount: 10 }],
       totalResults: 1,
     });
-    mockWikipediaService({
-      search: searchFn,
-    });
+    mockWikipediaService({ search: searchFn });
 
     const ctx = createMockContext({ errors: wikipediaSearchArticles.errors });
-    const input = wikipediaSearchArticles.input.parse({ query: 'Test', limit: 999 });
+    const input = wikipediaSearchArticles.input.parse({ query: 'Test', limit: 50 });
     await wikipediaSearchArticles.handler(input, ctx);
 
     expect(searchFn).toHaveBeenCalledWith('Test', 50, 'en', ctx, 0);
+  });
+
+  it('rejects an empty query before any fetch, with a typed reason (issue #41)', async () => {
+    const searchFn = vi.fn();
+    mockWikipediaService({ search: searchFn });
+
+    const ctx = createMockContext({ errors: wikipediaSearchArticles.errors });
+    const input = wikipediaSearchArticles.input.parse({ query: '' });
+    // Upstream answers `srsearch=` with an error envelope on HTTP 200, which used to render as a
+    // successful empty result.
+    await expect(wikipediaSearchArticles.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'empty_query' },
+    });
+    expect(searchFn).not.toHaveBeenCalled();
+  });
+
+  it('keeps a whitespace-only query as a normal empty search (issue #41)', async () => {
+    const searchFn = vi.fn().mockResolvedValue({ results: [], totalResults: 0 });
+    mockWikipediaService({ search: searchFn });
+
+    const ctx = createMockContext({ errors: wikipediaSearchArticles.errors });
+    const input = wikipediaSearchArticles.input.parse({ query: '   ' });
+    const result = await wikipediaSearchArticles.handler(input, ctx);
+
+    // `srsearch=%20` is a legitimate search upstream: HTTP 200, `totalhits: 0`, no error.
+    expect(searchFn).toHaveBeenCalledWith('   ', 10, 'en', ctx, 0);
+    expect(result.results).toHaveLength(0);
+    expect(getEnrichment(ctx).notice).toContain('No Wikipedia articles found');
+  });
+
+  it('rejects an offset at the search window before any fetch (issue #41)', async () => {
+    const searchFn = vi.fn();
+    mockWikipediaService({ search: searchFn });
+
+    const ctx = createMockContext({ errors: wikipediaSearchArticles.errors });
+    const input = wikipediaSearchArticles.input.parse({ query: 'Python', offset: 10000 });
+    const rejection = await Promise.resolve(wikipediaSearchArticles.handler(input, ctx)).then(
+      () => undefined,
+      (err: unknown) => err as { message: string; data: { reason: string } },
+    );
+
+    expect(rejection?.data.reason).toBe('offset_too_large');
+    expect(rejection?.message).toContain('10,000');
+    expect(searchFn).not.toHaveBeenCalled();
+  });
+
+  it('discloses a page cut by the search window, distinguishably from the last page (issue #41)', async () => {
+    // `sroffset=9990&srlimit=20` comes back with 10 results and no continue — identical in shape to
+    // a genuine end of results, while 3,441 matches remain unreachable.
+    mockWikipediaService({
+      search: vi.fn().mockResolvedValue({
+        results: Array.from({ length: 10 }, (_, i) => ({
+          title: `R${i}`,
+          pageid: i,
+          snippet: 'S',
+          wordcount: 10,
+        })),
+        totalResults: 13441,
+        nextOffset: undefined,
+      }),
+    });
+
+    const ctx = createMockContext({ errors: wikipediaSearchArticles.errors });
+    const input = wikipediaSearchArticles.input.parse({ query: 'Python', offset: 9990 });
+    const result = await wikipediaSearchArticles.handler(input, ctx);
+
+    expect(result.results).toHaveLength(10);
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.truncated).toBe(true);
+    expect(enrichment.totalCount).toBe(13441);
+    expect(enrichment.notice).toContain('10,000');
+    // Paging back is what the old notice advised; narrowing the query is the only way past it.
+    expect(enrichment.notice).toContain('narrow');
+  });
+
+  it('leaves a page short of the window undisclosed and still paging (issue #41)', async () => {
+    mockWikipediaService({
+      search: vi.fn().mockResolvedValue({
+        results: Array.from({ length: 10 }, (_, i) => ({
+          title: `R${i}`,
+          pageid: i,
+          snippet: 'S',
+          wordcount: 10,
+        })),
+        totalResults: 13441,
+        nextOffset: 9990,
+      }),
+    });
+
+    const ctx = createMockContext({ errors: wikipediaSearchArticles.errors });
+    const input = wikipediaSearchArticles.input.parse({ query: 'Python', offset: 9980 });
+    await wikipediaSearchArticles.handler(input, ctx);
+
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.nextOffset).toBe(9990);
+    expect(enrichment.truncated).toBeUndefined();
+    expect(enrichment.notice).toBeUndefined();
+  });
+
+  it('leaves a normal first page unchanged (issue #41)', async () => {
+    mockWikipediaService({
+      search: vi.fn().mockResolvedValue({
+        results: [{ title: 'T', pageid: 1, snippet: 'S', wordcount: 10 }],
+        totalResults: 13441,
+        nextOffset: 10,
+      }),
+    });
+
+    const ctx = createMockContext({ errors: wikipediaSearchArticles.errors });
+    const input = wikipediaSearchArticles.input.parse({ query: 'Python' });
+    const result = await wikipediaSearchArticles.handler(input, ctx);
+
+    expect(result.results).toHaveLength(1);
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.totalCount).toBe(13441);
+    expect(enrichment.nextOffset).toBe(10);
+    expect(enrichment.truncated).toBeUndefined();
+    expect(enrichment.notice).toBeUndefined();
   });
 
   it('format renders title, pageid, wordcount, and snippet', () => {
