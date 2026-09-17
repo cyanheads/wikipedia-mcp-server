@@ -371,4 +371,26 @@ describe('wikipediaSearchNearby', () => {
     const enrichment = getEnrichment(ctx);
     expect(enrichment.radiusMetersUsed).toBe(500);
   });
+
+  it('escapes markdown-active upstream titles in format() and leaves the structured values raw (issue #43)', () => {
+    const output = {
+      results: [
+        {
+          title: 'Champ de Mars <parc> _central_',
+          pageid: 123,
+          latitude: 48.8556,
+          longitude: 2.2986,
+          distance_meters: 210,
+        },
+      ],
+      language: 'en',
+    };
+    const text = wikipediaSearchNearby.format!(output)
+      .map((b) => (b.type === 'text' ? b.text : ''))
+      .join('');
+
+    expect(text).toContain('Champ de Mars \\<parc\\> \\_central\\_');
+    expect(text).not.toContain('<parc>');
+    expect(output.results[0]?.title).toBe('Champ de Mars <parc> _central_');
+  });
 });

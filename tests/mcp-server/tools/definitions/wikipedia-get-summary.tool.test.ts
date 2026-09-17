@@ -309,6 +309,138 @@ describe('wikipediaGetSummary', () => {
     expect(result.title).toBe('Tōkyō Tawā');
   });
 
+  describe('coordinates, URL, and revision passthrough (issue #44)', () => {
+    const geotagged = {
+      title: 'Eiffel Tower',
+      pageType: 'standard',
+      pageid: 9232,
+      wikidataQid: 'Q243',
+      description: 'Tower in Paris, France',
+      extract: 'The Eiffel Tower is a wrought-iron lattice tower in Paris.',
+      thumbnailUrl: undefined,
+      latitude: 48.85822222,
+      longitude: 2.2945,
+      url: 'https://en.wikipedia.org/wiki/Eiffel_Tower',
+      revisionId: '1374916289',
+      lastModified: '2026-09-14T20:37:52Z',
+    };
+
+    it('surfaces all five fields on the structured result', async () => {
+      mockWikipediaService({ getSummary: vi.fn().mockResolvedValue(geotagged) });
+
+      const ctx = createMockContext({ errors: wikipediaGetSummary.errors });
+      const input = wikipediaGetSummary.input.parse({ title: 'Eiffel Tower' });
+      const result = wikipediaGetSummary.output.parse(
+        await wikipediaGetSummary.handler(input, ctx),
+      );
+
+      expect(result.latitude).toBe(48.85822222);
+      expect(result.longitude).toBe(2.2945);
+      expect(result.url).toBe('https://en.wikipedia.org/wiki/Eiffel_Tower');
+      expect(result.revision_id).toBe('1374916289');
+      expect(result.last_modified).toBe('2026-09-14T20:37:52Z');
+    });
+
+    it('omits latitude and longitude for an article that is not geotagged', async () => {
+      mockWikipediaService({
+        getSummary: vi.fn().mockResolvedValue({
+          ...geotagged,
+          title: 'Vantablack',
+          latitude: undefined,
+          longitude: undefined,
+        }),
+      });
+
+      const ctx = createMockContext({ errors: wikipediaGetSummary.errors });
+      const input = wikipediaGetSummary.input.parse({ title: 'Vantablack' });
+      const result = wikipediaGetSummary.output.parse(
+        await wikipediaGetSummary.handler(input, ctx),
+      );
+
+      expect(result.latitude).toBeUndefined();
+      expect(result.longitude).toBeUndefined();
+      // The citation fields do not depend on the coordinate.
+      expect(result.url).toBe('https://en.wikipedia.org/wiki/Eiffel_Tower');
+      expect(result.revision_id).toBe('1374916289');
+    });
+
+    it('format renders all five and names the nearby chain', () => {
+      const text = wikipediaGetSummary.format!({
+        title: 'Eiffel Tower',
+        page_type: 'standard',
+        pageid: 9232,
+        extract: 'A tower in Paris.',
+        latitude: 48.85822222,
+        longitude: 2.2945,
+        url: 'https://en.wikipedia.org/wiki/Eiffel_Tower',
+        revision_id: '1374916289',
+        last_modified: '2026-09-14T20:37:52Z',
+        language: 'en',
+      })
+        .map((b) => (b.type === 'text' ? b.text : ''))
+        .join('');
+
+      expect(text).toContain('48.85822222');
+      expect(text).toContain('2.2945');
+      expect(text).toContain('https://en.wikipedia.org/wiki/Eiffel_Tower');
+      expect(text).toContain('1374916289');
+      expect(text).toContain('2026-09-14T20:37:52Z');
+      expect(text).toContain('wikipedia_search_nearby');
+    });
+
+    it('format omits the coordinate lines when the article is not geotagged', () => {
+      const text = wikipediaGetSummary.format!({
+        title: 'Vantablack',
+        page_type: 'standard',
+        extract: 'A class of super-black coatings.',
+        url: 'https://en.wikipedia.org/wiki/Vantablack',
+        revision_id: '1372000000',
+        last_modified: '2026-08-01T00:00:00Z',
+        language: 'en',
+      })
+        .map((b) => (b.type === 'text' ? b.text : ''))
+        .join('');
+
+      expect(text).not.toContain('Latitude');
+      expect(text).not.toContain('Longitude');
+      expect(text).not.toContain('wikipedia_search_nearby');
+      expect(text).toContain('https://en.wikipedia.org/wiki/Vantablack');
+    });
+
+    it('names wikipedia_search_nearby in both coordinate descriptions', () => {
+      const shape = wikipediaGetSummary.output.shape;
+      expect(shape.latitude.description).toContain('wikipedia_search_nearby');
+      expect(shape.longitude.description).toContain('wikipedia_search_nearby');
+      expect(wikipediaGetSummary.description).toContain('wikipedia_search_nearby');
+    });
+  });
+
+  it('escapes markdown-active upstream text in format() and leaves the structured value raw (issue #43)', () => {
+    const extract =
+      'The markup text <title>This is a title</title> defines the browser page title.\nItalic text may be implemented by _underscores_ or *single-asterisks*.\n# Not a heading';
+    const output = {
+      title: 'HTML <element>',
+      page_type: 'standard',
+      pageid: 13782,
+      description: 'markup *language*',
+      extract,
+      language: 'en',
+    };
+    const text = wikipediaGetSummary.format!(output)
+      .map((b) => (b.type === 'text' ? b.text : ''))
+      .join('');
+
+    expect(text).toContain('\\<title\\>');
+    expect(text).toContain('\\_underscores\\_');
+    expect(text).toContain('\\*single-asterisks\\*');
+    expect(text).toContain('\\# Not a heading');
+    expect(text).toContain('HTML \\<element\\>');
+    expect(text).toContain('markup \\*language\\*');
+    expect(text).not.toContain('<title>');
+    expect(output.extract).toBe(extract);
+    expect(output.title).toBe('HTML <element>');
+  });
+
   it('non-McpError from service propagates without wrapping', async () => {
     mockWikipediaService({
       getSummary: vi.fn().mockRejectedValue(new TypeError('Unexpected upstream shape')),

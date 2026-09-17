@@ -974,6 +974,87 @@ describe('WikipediaService.getSummary — REST API mapping', () => {
     });
   });
 
+  it('maps coordinates, canonical URL, and revision from the REST payload (issue #44)', async () => {
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+
+    vi.spyOn(svc, 'restGet').mockResolvedValue({
+      type: 'standard',
+      title: 'Eiffel Tower',
+      pageid: 9232,
+      extract: 'The Eiffel Tower is a tower in Paris.',
+      coordinates: { lat: 48.85822222, lon: 2.2945 },
+      content_urls: { desktop: { page: 'https://en.wikipedia.org/wiki/Eiffel_Tower' } },
+      revision: '1374916289',
+      timestamp: '2026-09-14T20:37:52Z',
+    });
+
+    const result = await svc.getSummary('Eiffel Tower', 'en', ctx);
+    expect(result.latitude).toBe(48.85822222);
+    expect(result.longitude).toBe(2.2945);
+    expect(result.url).toBe('https://en.wikipedia.org/wiki/Eiffel_Tower');
+    expect(result.revisionId).toBe('1374916289');
+    expect(result.lastModified).toBe('2026-09-14T20:37:52Z');
+  });
+
+  it('reads an explicit null coordinates the same as an absent one (issue #44)', async () => {
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+
+    // A non-geotagged article carries the key with a null value rather than omitting it.
+    vi.spyOn(svc, 'restGet').mockResolvedValue({
+      type: 'standard',
+      title: 'Vantablack',
+      pageid: 46654049,
+      extract: 'Vantablack is a class of super-black coatings.',
+      coordinates: null,
+      content_urls: { desktop: { page: 'https://en.wikipedia.org/wiki/Vantablack' } },
+      revision: '1372000000',
+      timestamp: '2026-08-01T00:00:00Z',
+    });
+
+    const result = await svc.getSummary('Vantablack', 'en', ctx);
+    expect(result.latitude).toBeUndefined();
+    expect(result.longitude).toBeUndefined();
+    // The rest of the passthrough is unaffected by the absent coordinate.
+    expect(result.url).toBe('https://en.wikipedia.org/wiki/Vantablack');
+    expect(result.revisionId).toBe('1372000000');
+  });
+
+  it('leaves every added field undefined when the payload omits them (issue #44)', async () => {
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+
+    vi.spyOn(svc, 'restGet').mockResolvedValue({
+      type: 'standard',
+      title: 'Sparse',
+      extract: 'Sparse payload.',
+    });
+
+    const result = await svc.getSummary('Sparse', 'en', ctx);
+    expect(result.latitude).toBeUndefined();
+    expect(result.longitude).toBeUndefined();
+    expect(result.url).toBeUndefined();
+    expect(result.revisionId).toBeUndefined();
+    expect(result.lastModified).toBeUndefined();
+  });
+
+  it('drops a half-populated coordinate rather than reporting one axis (issue #44)', async () => {
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+
+    vi.spyOn(svc, 'restGet').mockResolvedValue({
+      type: 'standard',
+      title: 'Half Coordinate',
+      extract: 'Only one axis.',
+      coordinates: { lat: 48.8 },
+    });
+
+    const result = await svc.getSummary('Half Coordinate', 'en', ctx);
+    expect(result.latitude).toBeUndefined();
+    expect(result.longitude).toBeUndefined();
+  });
+
   it('wraps NotFound from restGet into a user-friendly message', async () => {
     const { McpError, JsonRpcErrorCode } = await import('@cyanheads/mcp-ts-core/errors');
     const svc = getWikipediaService();

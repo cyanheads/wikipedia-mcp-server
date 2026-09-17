@@ -453,4 +453,32 @@ describe('wikipediaGetArticle', () => {
     expect(text).toContain('Truncated');
     expect(text).toContain('wikipedia_get_sections');
   });
+
+  it('escapes markdown-active upstream text in format() and leaves the structured value raw (issue #43)', () => {
+    const content =
+      'The markup text <title>This is a title</title> defines the browser page title.\nItalic text may be implemented by _underscores_ or *single-asterisks*.\n# Not a heading';
+    const output = {
+      title: 'HTML <element>',
+      pageid: 13782,
+      content,
+      section_title: 'Markup *basics*',
+      content_type: 'section',
+      truncated: false,
+      language: 'en',
+    };
+    const text = wikipediaGetArticle.format!(output)
+      .map((b) => (b.type === 'text' ? b.text : ''))
+      .join('');
+
+    expect(text).toContain('\\<title\\>');
+    expect(text).toContain('\\_underscores\\_');
+    expect(text).toContain('\\*single-asterisks\\*');
+    expect(text).toContain('\\# Not a heading');
+    expect(text).toContain('HTML \\<element\\>');
+    expect(text).toContain('Markup \\*basics\\*');
+    expect(text).not.toContain('<title>');
+    // The structured value the handler returned is untouched — only the render path escapes.
+    expect(output.content).toBe(content);
+    expect(output.title).toBe('HTML <element>');
+  });
 });

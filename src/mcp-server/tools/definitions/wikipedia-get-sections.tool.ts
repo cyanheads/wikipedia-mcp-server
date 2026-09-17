@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdown } from '@/mcp-server/tools/utils/escape-markdown.js';
 import {
   getWikipediaService,
   isBlankTitle,
@@ -199,16 +200,19 @@ export const wikipediaGetSections = tool('wikipedia_get_sections', {
     };
   },
 
+  // Upstream titles are escaped on the way into the markdown; structuredContent keeps them raw.
   format: (result) => {
     const lines: string[] = [
-      `## Table of Contents — ${result.title} (${result.language})`,
+      `## Table of Contents — ${escapeMarkdown(result.title)} (${result.language})`,
       `${result.total_sections} sections` +
         (result.pageid != null ? ` | Page ID: ${result.pageid}` : ''),
       '',
     ];
     for (const s of result.sections) {
       const indent = '  '.repeat(Math.max(0, s.level - 2));
-      lines.push(`${indent}${s.number}. **${s.title}** (index: ${s.index}, level: ${s.level})`);
+      lines.push(
+        `${indent}${s.number}. **${escapeMarkdown(s.title)}** (index: ${s.index}, level: ${s.level})`,
+      );
     }
     return [{ type: 'text', text: lines.join('\n') }];
   },

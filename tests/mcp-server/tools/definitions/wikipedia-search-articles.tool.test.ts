@@ -480,4 +480,23 @@ describe('wikipediaSearchArticles', () => {
   it('rejects float offset at schema parse time (issue #22)', () => {
     expect(() => wikipediaSearchArticles.input.parse({ query: 'Python', offset: 2.5 })).toThrow();
   });
+
+  it('escapes markdown-active upstream text in format() and leaves the structured value raw (issue #43)', () => {
+    const snippet =
+      'deployments of JSONP are subject to CSRF attacks. Because the HTML <script> element does not respect the same-origin _policy_';
+    const output = {
+      results: [{ title: 'JSONP <script>', pageid: 123, snippet, wordcount: 4200 }],
+      language: 'en',
+    };
+    const text = wikipediaSearchArticles.format!(output)
+      .map((b) => (b.type === 'text' ? b.text : ''))
+      .join('');
+
+    expect(text).toContain('\\<script\\>');
+    expect(text).toContain('\\_policy\\_');
+    expect(text).toContain('JSONP \\<script\\>');
+    expect(text).not.toContain('<script>');
+    expect(output.results[0]?.snippet).toBe(snippet);
+    expect(output.results[0]?.title).toBe('JSONP <script>');
+  });
 });

@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdown } from '@/mcp-server/tools/utils/escape-markdown.js';
 import {
   getWikipediaService,
   isMalformedLanguage,
@@ -224,12 +225,13 @@ export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
     return { results, language };
   },
 
+  // Upstream text is escaped on the way into the markdown; structuredContent keeps it raw.
   format: (result) => {
     const lines: string[] = [`**${result.results.length} results** (${result.language})\n`];
     for (const item of result.results) {
-      lines.push(`### ${item.title}`);
+      lines.push(`### ${escapeMarkdown(item.title)}`);
       lines.push(`**Page ID:** ${item.pageid} | **Words:** ${item.wordcount}`);
-      if (item.snippet) lines.push(item.snippet);
+      if (item.snippet) lines.push(escapeMarkdown(item.snippet));
     }
     return [{ type: 'text', text: lines.join('\n') }];
   },

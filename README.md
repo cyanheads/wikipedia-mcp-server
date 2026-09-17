@@ -36,11 +36,11 @@ Wikipedia content via the MediaWiki REST API and Action API. Search articles, re
 | Tool | Description |
 |:---|:---|
 | `wikipedia_search_articles` | Full-text search across Wikipedia, returning ranked results with plain-text snippets and page IDs. |
-| `wikipedia_get_summary` | Short summary for any article — plain text, Wikidata QID, description, thumbnail URL, and page type. |
+| `wikipedia_get_summary` | Short summary for any article — plain text, Wikidata QID, description, thumbnail URL, page type, canonical URL, revision, and coordinates. |
 | `wikipedia_get_article` | Full article or a targeted section as clean plain text, with section markers preserved. |
 | `wikipedia_get_sections` | Table of contents with `section_index` values for targeted section reads. |
 | `wikipedia_search_nearby` | Geotagged Wikipedia articles within a radius of a WGS 84 coordinate, sorted by distance. |
-| `wikipedia_get_languages` | All language editions available for an article, with titles and URLs. |
+| `wikipedia_get_languages` | All language editions available for an article, with titles and URLs, or just the editions you ask for. |
 
 ## Capability reference
 
@@ -58,6 +58,8 @@ Wikipedia content via the MediaWiki REST API and Action API. Search articles, re
 ### `wikipedia_get_summary` <sub>tool</sub>
 
 - Returns the REST summary extract — a truncated fragment from the start of the lead, not the whole lead — plus the Wikidata QID (`wikibase_item`), short description, and thumbnail URL
+- `url` is the canonical article URL, and `revision_id` / `last_modified` name the revision the extract was read from — `?oldid=<revision_id>` is a permanent link to it
+- `latitude` / `longitude` are present for a geotagged article and pass straight to `wikipedia_search_nearby`, whose inputs carry those names; both are absent otherwise
 - For the lead section in full, call `wikipedia_get_article` with `section_index: 0`
 - `page_type` discriminates `standard` / `disambiguation` / `no-extract` — on `disambiguation`, re-query with `wikipedia_search_articles` for a more specific title
 - Redirect pages are followed automatically
@@ -99,7 +101,8 @@ Wikipedia content via the MediaWiki REST API and Action API. Search articles, re
 
 - Returns each edition's `language_code`, tool-usable `edition_code` (can differ, e.g. `gsw` vs `als`), article title, and URL
 - Pass `edition_code` — not `language_code` — as the `language` parameter on other tools
-- Fails with `no_other_languages` when the article has no translations
+- `editions` narrows the answer to the codes asked for, matched against both `edition_code` and `language_code`; requested codes with no article come back under `missing`, and `total_languages` stays the unfiltered count. A popular article lists hundreds of editions, so the filter is the difference between a 40 KB reply and a 1 KB one
+- Fails with `no_other_languages` when the article has no translations — a filter that matches nothing is a normal response with an empty list, not a failure
 - Redirect pages are followed automatically; `source_title` reports the resolved title
 
 ## Features
@@ -118,6 +121,7 @@ Agent-friendly output:
 
 - `page_type` on summaries discriminates `standard` / `disambiguation` / `no-extract` — no string parsing needed
 - `wikibase_item` (Wikidata QID) on summaries enables direct cross-referencing with wikidata-mcp-server
+- Article text, snippets, and titles are backslash-escaped on the way into the markdown `content[]` render, so an article that writes about markup or markdown syntax reads as itself instead of being interpreted by the client; `structuredContent` carries the same text unescaped
 - `section_index` on table-of-contents entries links directly to the targeted-read parameter on `wikipedia_get_article`, index 0 included
 - Titles MediaWiki cannot name a page with — `< > [ ] { }`, the `|` multi-title separator, percent escapes, magic tildes, relative paths — are refused before any request, with `invalid_title`; a trailing `#fragment` is accepted and resolves normally
 - Recovery hints on every error type — callers get actionable next steps (e.g., "use `wikipedia_search_articles` to find the correct title")

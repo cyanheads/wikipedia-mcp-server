@@ -1,6 +1,6 @@
 # wikipedia-mcp-server - Directory Structure
 
-Generated on: 2026-09-17 13:43:52
+Generated on: 2026-09-17 17:00:52
 
 ```text
 wikipedia-mcp-server/
@@ -142,14 +142,16 @@ wikipedia-mcp-server/
 │   │   ├── resources/
 │   │   │   └── definitions/
 │   │   └── tools/
-│   │       └── definitions/
-│   │           ├── index.ts
-│   │           ├── wikipedia-get-article.tool.ts
-│   │           ├── wikipedia-get-languages.tool.ts
-│   │           ├── wikipedia-get-sections.tool.ts
-│   │           ├── wikipedia-get-summary.tool.ts
-│   │           ├── wikipedia-search-articles.tool.ts
-│   │           └── wikipedia-search-nearby.tool.ts
+│   │       ├── definitions/
+│   │       │   ├── index.ts
+│   │       │   ├── wikipedia-get-article.tool.ts
+│   │       │   ├── wikipedia-get-languages.tool.ts
+│   │       │   ├── wikipedia-get-sections.tool.ts
+│   │       │   ├── wikipedia-get-summary.tool.ts
+│   │       │   ├── wikipedia-search-articles.tool.ts
+│   │       │   └── wikipedia-search-nearby.tool.ts
+│   │       └── utils/
+│   │           └── escape-markdown.ts
 │   ├── services/
 │   │   └── wikipedia/
 │   │       ├── types.ts
@@ -160,13 +162,15 @@ wikipedia-mcp-server/
 │   │   └── wikipedia-service-mock.ts
 │   ├── mcp-server/
 │   │   └── tools/
-│   │       └── definitions/
-│   │           ├── wikipedia-get-article.tool.test.ts
-│   │           ├── wikipedia-get-languages.tool.test.ts
-│   │           ├── wikipedia-get-sections.tool.test.ts
-│   │           ├── wikipedia-get-summary.tool.test.ts
-│   │           ├── wikipedia-search-articles.tool.test.ts
-│   │           └── wikipedia-search-nearby.tool.test.ts
+│   │       ├── definitions/
+│   │       │   ├── wikipedia-get-article.tool.test.ts
+│   │       │   ├── wikipedia-get-languages.tool.test.ts
+│   │       │   ├── wikipedia-get-sections.tool.test.ts
+│   │       │   ├── wikipedia-get-summary.tool.test.ts
+│   │       │   ├── wikipedia-search-articles.tool.test.ts
+│   │       │   └── wikipedia-search-nearby.tool.test.ts
+│   │       └── utils/
+│   │           └── escape-markdown.test.ts
 │   ├── prompts/
 │   ├── resources/
 │   ├── services/

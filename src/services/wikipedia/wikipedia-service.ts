@@ -1168,7 +1168,13 @@ export class WikipediaService {
   // Domain methods
   // ---------------------------------------------------------------------------
 
-  /** Fetch the REST summary for an article. */
+  /**
+   * Fetch the REST summary for an article.
+   *
+   * `latitude`/`longitude` come from the response's `coordinates`, which a non-geotagged article
+   * carries as an explicit `null` rather than omitting — both are left undefined for that, for an
+   * absent key, and for a partial pair, so a caller never reads half a coordinate as a location.
+   */
   async getSummary(
     title: string,
     language: string,
@@ -1181,6 +1187,11 @@ export class WikipediaService {
     description: string | undefined;
     extract: string;
     thumbnailUrl: string | undefined;
+    latitude: number | undefined;
+    longitude: number | undefined;
+    url: string | undefined;
+    revisionId: string | undefined;
+    lastModified: string | undefined;
   }> {
     const encodedTitle = encodeURIComponent(title.replace(/ /g, '_'));
 
@@ -1211,6 +1222,9 @@ export class WikipediaService {
       throw notFound(`Article "${title}" exists but has no readable content.`, { title, language });
     }
 
+    const { lat, lon } = raw.coordinates ?? {};
+    const geotagged = typeof lat === 'number' && typeof lon === 'number';
+
     return {
       title: raw.title ?? title,
       pageType: raw.type ?? 'article',
@@ -1219,6 +1233,11 @@ export class WikipediaService {
       description: raw.description,
       extract: raw.extract,
       thumbnailUrl: raw.thumbnail?.source,
+      latitude: geotagged ? lat : undefined,
+      longitude: geotagged ? lon : undefined,
+      url: raw.content_urls?.desktop?.page,
+      revisionId: raw.revision,
+      lastModified: raw.timestamp,
     };
   }
 

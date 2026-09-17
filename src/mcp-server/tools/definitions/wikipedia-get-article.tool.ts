@@ -7,6 +7,7 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { outlineOnOverflow } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
+import { escapeMarkdown } from '@/mcp-server/tools/utils/escape-markdown.js';
 import {
   getWikipediaService,
   isBlankTitle,
@@ -272,14 +273,15 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
     };
   },
 
+  // Upstream text is escaped on the way into the markdown; structuredContent keeps it raw.
   format: (result) => {
     const lines: string[] = [];
-    lines.push(`# ${result.title}`);
+    lines.push(`# ${escapeMarkdown(result.title)}`);
     lines.push(
       `**Type:** ${result.content_type} | **Language:** ${result.language}` +
         (result.pageid != null ? ` | **Page ID:** ${result.pageid}` : ''),
     );
-    if (result.section_title) lines.push(`**Section:** ${result.section_title}`);
+    if (result.section_title) lines.push(`**Section:** ${escapeMarkdown(result.section_title)}`);
     // Overflow disclosure — render each field on its own presence, never as mutually-exclusive
     // branches, so format-parity's all-fields-populated sample renders every field.
     if (result.truncated) {
@@ -294,7 +296,9 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
       );
     }
     lines.push('');
-    lines.push(result.content);
+    // The outline the overflow path writes rides in `content` too, so its own bullets escape with
+    // the section names they carry — one rule, and no path where upstream text reaches raw.
+    lines.push(escapeMarkdown(result.content));
     return [{ type: 'text', text: lines.join('\n') }];
   },
 });

@@ -98,7 +98,8 @@ describe('wikipediaGetSections', () => {
 
   it('carries a cleaned section title into structuredContent and content[] (issue #36)', async () => {
     // The service normalizes the tocdata `line` before the handler sees it; what this pins is that
-    // neither the output schema nor format() re-escapes or mangles the cleaned bytes on the way out.
+    // the output schema passes the cleaned bytes through untouched and format() renders them as
+    // themselves — markdown-escaped per issue #43, never re-encoded as an HTML entity.
     const cleaned = 'Siglo XVIII & pasos';
     mockWikipediaService({
       getSections: vi.fn().mockResolvedValue({
@@ -122,7 +123,8 @@ describe('wikipediaGetSections', () => {
     const text = wikipediaGetSections.format!(structured)
       .map((b) => (b.type === 'text' ? b.text : ''))
       .join('');
-    expect(text).toContain(cleaned);
+    expect(text).toContain('Siglo XVIII \\& pasos');
+    expect(text).not.toContain('&amp;');
     expect(text).not.toMatch(/[<> ]/);
   });
 
@@ -296,5 +298,26 @@ describe('wikipediaGetSections', () => {
     const ctx = createMockContext({ errors: wikipediaGetSections.errors });
     const input = wikipediaGetSections.input.parse({ title: 'Python' });
     await expect(wikipediaGetSections.handler(input, ctx)).rejects.toThrow('Network failure');
+  });
+
+  it('escapes markdown-active upstream titles in format() and leaves the structured values raw (issue #43)', () => {
+    const output = {
+      title: 'HTML <element>',
+      pageid: 13782,
+      sections: [
+        { index: 0, number: '0', title: 'Introduction', level: 1 },
+        { index: 1, number: '1', title: 'The <script> tag and _emphasis_', level: 2 },
+      ],
+      total_sections: 2,
+      language: 'en',
+    };
+    const text = wikipediaGetSections.format!(output)
+      .map((b) => (b.type === 'text' ? b.text : ''))
+      .join('');
+
+    expect(text).toContain('HTML \\<element\\>');
+    expect(text).toContain('The \\<script\\> tag and \\_emphasis\\_');
+    expect(text).not.toContain('<script>');
+    expect(output.sections[1]?.title).toBe('The <script> tag and _emphasis_');
   });
 });

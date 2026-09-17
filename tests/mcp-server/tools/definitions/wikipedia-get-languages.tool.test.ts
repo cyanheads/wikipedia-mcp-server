@@ -305,6 +305,211 @@ describe('wikipediaGetLanguages', () => {
     expect(text).not.toMatch(/Bearer\s+\S+|Authorization:/i);
   });
 
+  describe('editions filter (issue #45)', () => {
+    /** Three of Zürich's langlinks, including the gsw/als code-vs-subdomain mismatch. */
+    const zurichLanguages = [
+      {
+        languageCode: 'fr',
+        editionCode: 'fr',
+        title: 'Zurich',
+        url: 'https://fr.wikipedia.org/wiki/Zurich',
+      },
+      {
+        languageCode: 'de',
+        editionCode: 'de',
+        title: 'Zürich',
+        url: 'https://de.wikipedia.org/wiki/Z%C3%BCrich',
+      },
+      {
+        languageCode: 'gsw',
+        editionCode: 'als',
+        title: 'Züri',
+        url: 'https://als.wikipedia.org/wiki/Z%C3%BCri',
+      },
+      {
+        languageCode: 'ja',
+        editionCode: 'ja',
+        title: 'チューリッヒ',
+        url: 'https://ja.wikipedia.org/wiki/%E3%83%81%E3%83%A5%E3%83%BC%E3%83%AA%E3%83%83%E3%83%92',
+      },
+    ];
+
+    function mockZurich() {
+      mockWikipediaService({
+        getLanguages: vi.fn().mockResolvedValue({ title: 'Zürich', languages: zurichLanguages }),
+      });
+    }
+
+    it('keeps only the requested editions and reports the codes with no article', async () => {
+      mockZurich();
+
+      const ctx = createMockContext({ errors: wikipediaGetLanguages.errors });
+      const input = wikipediaGetLanguages.input.parse({
+        title: 'Zürich',
+        editions: ['fr', 'de', 'gsw', 'xx'],
+      });
+      const result = await wikipediaGetLanguages.handler(input, ctx);
+
+      expect(result.languages.map((l) => l.language_code)).toEqual(['fr', 'de', 'gsw']);
+      // "gsw" is the langlinks code; the edition it names lives on the "als" subdomain.
+      expect(result.languages[2]?.edition_code).toBe('als');
+      expect(result.missing).toEqual(['xx']);
+      // The filter narrows what comes back, not what exists.
+      expect(result.total_languages).toBe(4);
+    });
+
+    it('matches an edition by its subdomain as well as its language code, case-insensitively', async () => {
+      mockZurich();
+
+      const ctx = createMockContext({ errors: wikipediaGetLanguages.errors });
+      const input = wikipediaGetLanguages.input.parse({
+        title: 'Zürich',
+        editions: ['ALS', ' Fr '],
+      });
+      const result = await wikipediaGetLanguages.handler(input, ctx);
+
+      expect(result.languages.map((l) => l.edition_code)).toEqual(['fr', 'als']);
+      expect(result.missing).toEqual([]);
+    });
+
+    it('returns an empty list rather than an error when every requested code misses', async () => {
+      mockZurich();
+
+      const ctx = createMockContext({ errors: wikipediaGetLanguages.errors });
+      const input = wikipediaGetLanguages.input.parse({
+        title: 'Zürich',
+        editions: ['xx', 'qqq'],
+      });
+      const result = await wikipediaGetLanguages.handler(input, ctx);
+
+      expect(result.languages).toEqual([]);
+      expect(result.missing).toEqual(['xx', 'qqq']);
+      expect(result.total_languages).toBe(4);
+    });
+
+    it('still fails with no_other_languages when the article itself has no other editions', async () => {
+      mockWikipediaService({
+        getLanguages: vi.fn().mockResolvedValue({ title: 'Very Local Article', languages: [] }),
+      });
+
+      const ctx = createMockContext({ errors: wikipediaGetLanguages.errors });
+      const input = wikipediaGetLanguages.input.parse({
+        title: 'Very Local Article',
+        editions: ['fr'],
+      });
+      // The gate reads the unfiltered count, so a filter never turns a bare article into a match.
+      await expect(wikipediaGetLanguages.handler(input, ctx)).rejects.toMatchObject({
+        data: { reason: 'no_other_languages' },
+      });
+    });
+
+    it('omits missing entirely and lists every edition when the filter is not passed', async () => {
+      mockZurich();
+
+      const ctx = createMockContext({ errors: wikipediaGetLanguages.errors });
+      const input = wikipediaGetLanguages.input.parse({ title: 'Zürich' });
+      const result = await wikipediaGetLanguages.handler(input, ctx);
+
+      expect(result.languages).toHaveLength(4);
+      expect(result.total_languages).toBe(4);
+      expect(result.missing).toBeUndefined();
+    });
+
+    it('rejects an empty editions array at the schema, naming the field', () => {
+      const rejection = (() => {
+        try {
+          wikipediaGetLanguages.input.parse({ title: 'Zürich', editions: [] });
+          return;
+        } catch (err) {
+          return err as { issues?: Array<{ path: PropertyKey[] }> };
+        }
+      })();
+
+      expect(rejection?.issues?.[0]?.path).toContain('editions');
+    });
+
+    it('format renders the narrowed count and the codes with no article', () => {
+      const blocks = wikipediaGetLanguages.format!({
+        source_title: 'Zürich',
+        source_language: 'en',
+        languages: [
+          {
+            language_code: 'gsw',
+            edition_code: 'als',
+            title: 'Züri',
+            url: 'https://als.wikipedia.org/wiki/Z%C3%BCri',
+          },
+        ],
+        total_languages: 165,
+        missing: ['xx'],
+      });
+      const text = blocks.map((b) => (b.type === 'text' ? b.text : '')).join('');
+
+      expect(text).toContain('1 of 165 languages available');
+      expect(text).toContain('No article in:');
+      expect(text).toContain('xx');
+      expect(text).toContain('Züri');
+    });
+
+    it('format says so when every requested edition matched', () => {
+      const blocks = wikipediaGetLanguages.format!({
+        source_title: 'Zürich',
+        source_language: 'en',
+        languages: [
+          { language_code: 'fr', edition_code: 'fr', title: 'Zurich', url: 'https://fr.example' },
+        ],
+        total_languages: 165,
+        missing: [],
+      });
+      const text = blocks.map((b) => (b.type === 'text' ? b.text : '')).join('');
+
+      expect(text).toContain('Every requested edition matched');
+      expect(text).not.toContain('No article in:');
+    });
+
+    it('format keeps the unfiltered heading when no filter was applied', () => {
+      const blocks = wikipediaGetLanguages.format!({
+        source_title: 'Zürich',
+        source_language: 'en',
+        languages: [
+          { language_code: 'fr', edition_code: 'fr', title: 'Zurich', url: 'https://fr.example' },
+        ],
+        total_languages: 165,
+      });
+      const text = blocks.map((b) => (b.type === 'text' ? b.text : '')).join('');
+
+      expect(text).toContain('165 languages available');
+      expect(text).not.toContain('narrowed to the requested editions');
+      expect(text).not.toContain('Every requested edition matched');
+    });
+  });
+
+  it('escapes markdown-active upstream titles in format() and leaves the structured values raw (issue #43)', () => {
+    const output = {
+      source_title: 'HTML <element>',
+      source_language: 'en',
+      languages: [
+        {
+          language_code: 'fr',
+          edition_code: 'fr',
+          title: 'Balise <script> et _emphase_',
+          url: 'https://fr.wikipedia.org/wiki/HTML',
+        },
+      ],
+      total_languages: 1,
+    };
+    const text = wikipediaGetLanguages.format!(output)
+      .map((b) => (b.type === 'text' ? b.text : ''))
+      .join('');
+
+    expect(text).toContain('HTML \\<element\\>');
+    expect(text).toContain('Balise \\<script\\> et \\_emphase\\_');
+    expect(text).not.toContain('<script>');
+    // The URL is not prose and is left intact so the link stays followable.
+    expect(text).toContain('https://fr.wikipedia.org/wiki/HTML');
+    expect(output.languages[0]?.title).toBe('Balise <script> et _emphase_');
+  });
+
   it('non-McpError from service propagates without wrapping', async () => {
     mockWikipediaService({
       getLanguages: vi.fn().mockRejectedValue(new Error('Upstream timeout')),

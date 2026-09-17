@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdown } from '@/mcp-server/tools/utils/escape-markdown.js';
 import {
   getWikipediaService,
   isBlankTitle,
@@ -15,7 +16,7 @@ import {
 export const wikipediaGetSummary = tool('wikipedia_get_summary', {
   title: 'Get Wikipedia Summary',
   description:
-    'Fetch the short article summary that answers "what is X?". The extract is a truncated fragment from the start of the lead section — usually a sentence or two, and as little as a tenth of the lead — alongside the Wikidata QID (wikibase_item) for cross-referencing with wikidata-mcp-server, a short description, and a thumbnail URL. For the lead section in full, call wikipedia_get_article with section_index 0. Redirect pages are followed automatically. When page_type is "disambiguation", the title matched a disambiguation page — call wikipedia_search_articles with a more specific query to find the intended article. Prefer this over wikipedia_get_article unless article depth is needed.',
+    'Fetch the short article summary that answers "what is X?". The extract is a truncated fragment from the start of the lead section — usually a sentence or two, and as little as a tenth of the lead — alongside the Wikidata QID (wikibase_item) for cross-referencing with wikidata-mcp-server, a short description, a thumbnail URL, the canonical article URL, the revision the extract was read from, and, for a geotagged article, latitude and longitude that pass straight to wikipedia_search_nearby to answer "what else is notable near this". For the lead section in full, call wikipedia_get_article with section_index 0. Redirect pages are followed automatically. When page_type is "disambiguation", the title matched a disambiguation page — call wikipedia_search_articles with a more specific query to find the intended article. Prefer this over wikipedia_get_article unless article depth is needed.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     title: z
@@ -52,6 +53,34 @@ export const wikipediaGetSummary = tool('wikipedia_get_summary', {
       .string()
       .optional()
       .describe('URL of the article thumbnail image, if available.'),
+    latitude: z
+      .number()
+      .optional()
+      .describe(
+        'WGS 84 latitude of the article subject in decimal degrees. Pass with longitude to wikipedia_search_nearby, whose inputs carry these names, to find other notable articles around the same point. Absent for an article that is not geotagged.',
+      ),
+    longitude: z
+      .number()
+      .optional()
+      .describe(
+        'WGS 84 longitude of the article subject in decimal degrees. Pass with latitude to wikipedia_search_nearby, whose inputs carry these names, to find other notable articles around the same point. Absent for an article that is not geotagged.',
+      ),
+    url: z
+      .string()
+      .optional()
+      .describe(
+        'Canonical desktop URL of the article (e.g. "https://en.wikipedia.org/wiki/Eiffel_Tower"), for citing the page rather than composing a URL from the title.',
+      ),
+    revision_id: z
+      .string()
+      .optional()
+      .describe(
+        'ID of the revision the extract was read from. "https://<edition>.wikipedia.org/w/index.php?oldid=<revision_id>" is a permanent link to exactly that version.',
+      ),
+    last_modified: z
+      .string()
+      .optional()
+      .describe('ISO 8601 timestamp of that revision, for dating the content.'),
     language: z.string().describe('Language edition queried.'),
   }),
 
@@ -154,20 +183,38 @@ export const wikipediaGetSummary = tool('wikipedia_get_summary', {
       description: result.description,
       extract: result.extract,
       thumbnail_url: result.thumbnailUrl,
+      latitude: result.latitude,
+      longitude: result.longitude,
+      url: result.url,
+      revision_id: result.revisionId,
+      last_modified: result.lastModified,
       language,
     };
   },
 
+  // Upstream text is escaped on the way into the markdown; structuredContent keeps it raw.
   format: (result) => {
     const lines: string[] = [];
-    lines.push(`# ${result.title}`);
-    if (result.description) lines.push(`*${result.description}*`);
+    lines.push(`# ${escapeMarkdown(result.title)}`);
+    if (result.description) lines.push(`*${escapeMarkdown(result.description)}*`);
     lines.push(`**Type:** ${result.page_type} | **Language:** ${result.language}`);
     if (result.pageid != null) lines.push(`**Page ID:** ${result.pageid}`);
     if (result.wikibase_item) lines.push(`**Wikidata QID:** ${result.wikibase_item}`);
     if (result.thumbnail_url) lines.push(`**Thumbnail:** ${result.thumbnail_url}`);
+    if (result.url) lines.push(`**URL:** ${result.url}`);
+    // Each coordinate renders on its own presence rather than as a pair, so format-parity's
+    // all-fields-populated sample renders both and a half-populated result cannot go silent.
+    if (result.latitude != null) lines.push(`**Latitude:** ${result.latitude}`);
+    if (result.longitude != null) lines.push(`**Longitude:** ${result.longitude}`);
+    if (result.latitude != null && result.longitude != null) {
+      lines.push(
+        '**Nearby:** pass latitude and longitude to wikipedia_search_nearby for other notable articles around this point.',
+      );
+    }
+    if (result.revision_id) lines.push(`**Revision ID:** ${result.revision_id}`);
+    if (result.last_modified) lines.push(`**Last modified:** ${result.last_modified}`);
     lines.push('');
-    lines.push(result.extract);
+    lines.push(escapeMarkdown(result.extract));
     return [{ type: 'text', text: lines.join('\n') }];
   },
 });

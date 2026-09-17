@@ -36,6 +36,19 @@ export type RestSummaryRaw = {
     width?: number;
     height?: number;
   };
+  /**
+   * Geographic coordinate of the article subject, present only for a geotagged article.
+   *
+   * A non-geotagged article carries the key with an explicit `null` rather than omitting it, so
+   * the type is nullable and the mapping treats `null` the same as absent.
+   */
+  coordinates?: { lat?: number; lon?: number } | null;
+  /** Canonical article URLs per rendering; `desktop.page` is the citable article URL. */
+  content_urls?: { desktop?: { page?: string } };
+  /** Revision ID the extract was taken from, serialized as a string. */
+  revision?: string;
+  /** ISO 8601 timestamp of that revision. */
+  timestamp?: string;
 };
 
 /** Action API search result entry. */

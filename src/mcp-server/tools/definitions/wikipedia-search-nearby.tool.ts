@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdown } from '@/mcp-server/tools/utils/escape-markdown.js';
 import {
   GEOSEARCH_MAX_LIMIT,
   GEOSEARCH_MAX_RADIUS_METERS,
@@ -189,10 +190,11 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
     return { results, language };
   },
 
+  // Upstream titles are escaped on the way into the markdown; structuredContent keeps them raw.
   format: (result) => {
     const lines: string[] = [`**${result.results.length} articles** (${result.language})\n`];
     for (const item of result.results) {
-      lines.push(`### ${item.title}`);
+      lines.push(`### ${escapeMarkdown(item.title)}`);
       lines.push(
         `**Page ID:** ${item.pageid} | **Distance:** ${item.distance_meters}m | **Coords:** (${item.latitude}, ${item.longitude})`,
       );
