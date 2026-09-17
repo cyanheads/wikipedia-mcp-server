@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.17-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/wikipedia-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/wikipedia-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/wikipedia-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.2.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/wikipedia-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/wikipedia-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/wikipedia-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -19,94 +19,87 @@
 
 </div>
 
+<div align="center">
+
+**Public Hosted Server:** [https://wikipedia.caseyjhand.com/mcp](https://wikipedia.caseyjhand.com/mcp)
+
+</div>
+
 ---
 
-## Tools
+## Overview
 
-Six tools for working with Wikipedia across all language editions:
+Wikipedia content via the MediaWiki REST API and Action API. Search articles, read summaries or targeted sections, find geotagged pages near a coordinate, and list language editions from any MCP client. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
+
+### Tools
 
 | Tool | Description |
 |:---|:---|
-| `wikipedia_search` | Full-text search across Wikipedia, returning ranked results with plain-text snippets and page IDs. |
+| `wikipedia_search_articles` | Full-text search across Wikipedia, returning ranked results with plain-text snippets and page IDs. |
 | `wikipedia_get_summary` | Lead-section summary for any article — plain text, Wikidata QID, description, thumbnail URL, and page type. |
 | `wikipedia_get_article` | Full article or a targeted section as clean plain text, with section markers preserved. |
 | `wikipedia_get_sections` | Table of contents with `section_index` values for targeted section reads. |
 | `wikipedia_search_nearby` | Geotagged Wikipedia articles within a radius of a WGS 84 coordinate, sorted by distance. |
 | `wikipedia_get_languages` | All language editions available for an article, with titles and URLs. |
 
-### `wikipedia_search`
+## Capability reference
 
-Search Wikipedia articles by full-text query.
+### `wikipedia_search_articles` <sub>tool</sub>
 
-- Returns ranked results with plain-text snippets (HTML stripped), page IDs, and word counts
-- Use when the exact article title is unknown or to discover multiple articles on a topic
-- Page beyond the first result page with `offset`; the enrichment `nextOffset` signals more results remain (pass it back as `offset`)
-- Supports all Wikipedia language editions via the `language` parameter
-
----
-
-### `wikipedia_get_summary`
-
-Fetch the lead-section summary for a Wikipedia article.
-
-- Returns the 2–4 paragraph intro, Wikidata QID for cross-referencing, short description, and thumbnail URL
-- Surfaces `page_type: "disambiguation"` — a signal to follow up with `wikipedia_search` using a more specific query
-- Redirect pages followed automatically
-- Right tool for 90% of encyclopedic lookups
+- Free-text query, ranked by relevance; returns plain-text snippets (HTML stripped), page IDs, and word counts
+- `limit` capped at 50; `offset` pages further results — enrichment `nextOffset` signals more remain and is passed back as `offset`
+- `language` selects any Wikipedia edition (default `en`)
+- Best when the exact article title is unknown, or to discover multiple articles on a topic
 
 ---
 
-### `wikipedia_get_article`
+### `wikipedia_get_summary` <sub>tool</sub>
 
-Fetch article content as clean plain text.
-
-- Without `section_index`: returns the full article with `== Section ==` markers — unless it exceeds `WIKIPEDIA_ARTICLE_OVERFLOW_BYTES` (default 80 KB), in which case it returns a compact section outline (`truncated: true`) pointing to `wikipedia_get_sections` plus a `section_index` read
-- With `section_index` (from `wikipedia_get_sections`): returns that section together with every subsection nested under it, each heading above its own body
-- Data tables and figures are omitted from both paths, so a section whose body is entirely a data table returns its heading and little else. Tables used only for layout — multi-column lists, succession boxes — keep their content
-- Page furniture is omitted too: maintenance banners, sister-project and library-resource boxes, portal bars, and spoken-article notices. Hatnotes are kept — they name the article to read next
-- Redirect pages followed automatically
+- Returns the 2–4 paragraph lead extract, Wikidata QID (`wikibase_item`), short description, and thumbnail URL
+- `page_type` discriminates `standard` / `disambiguation` / `no-extract` — on `disambiguation`, re-query with `wikipedia_search_articles` for a more specific title
+- Redirect pages are followed automatically
+- Right tool for most encyclopedic "what is X?" lookups; use `wikipedia_get_article` for full depth
 
 ---
 
-### `wikipedia_get_sections`
+### `wikipedia_get_article` <sub>tool</sub>
 
-Fetch the table of contents for a Wikipedia article.
-
-- Returns section titles, heading levels, section numbering (e.g. "2.1"), and `section_index` values
-- `section_index` is the integer to pass to `wikipedia_get_article` for targeted reads
-- Call this before `wikipedia_get_article` when only a specific section is needed
-- Redirect pages followed automatically
-
----
-
-### `wikipedia_search_nearby`
-
-Find Wikipedia articles about places near a geographic coordinate.
-
-- Results sorted ascending by distance in meters
-- Only articles with geographic coordinates in their Wikidata record are returned
-- Radius capped at 10,000 meters; up to 50 results per call
+- Without `section_index`: full article with `== Section ==` markers, unless it exceeds `WIKIPEDIA_ARTICLE_OVERFLOW_BYTES` (default 80,000 bytes) — then returns a section outline (`truncated: true`) pointing to `wikipedia_get_sections` plus a targeted `section_index` read
+- With `section_index` (from `wikipedia_get_sections`): returns that section plus every nested subsection, each heading above its own body
+- Data tables are omitted from both paths — a section whose body is entirely a data table returns little beyond its heading; layout-only tables (multi-column lists, succession boxes) keep their content
+- Page furniture — maintenance banners, sister-project and library-resource boxes, portal bars, spoken-article notices — is stripped; hatnotes are kept
+- Redirect pages are followed automatically
 
 ---
 
-### `wikipedia_get_languages`
+### `wikipedia_get_sections` <sub>tool</sub>
 
-List language editions available for a Wikipedia article.
+- Returns section titles, heading levels, hierarchical numbering (e.g. `"2.1"`), and `section_index` values
+- `section_index` is the integer to pass to `wikipedia_get_article` for a targeted read
+- Fails with `no_sections` on a stub or very short article — read it with `wikipedia_get_article` instead
+- Redirect pages are followed automatically
 
-- Returns each edition's language code, tool-usable subdomain code (`edition_code`), article title, and URL
-- Pass `edition_code` as the `language` parameter on other tools — it can differ from `language_code` (e.g. `gsw` vs `als`)
-- Use for cross-language research or to discover a non-English title before switching editions
+---
+
+### `wikipedia_search_nearby` <sub>tool</sub>
+
+- Returns geotagged articles sorted ascending by distance, with coordinates and `distance_meters`
+- `radius_meters`: 10–10,000 (default 1000); `limit`: 1–500 (default 10) — no pagination past `limit`, so raise it or sweep narrower radii for full coverage
+- Only articles with a geographic coordinate in their Wikidata record are returned
+- Enrichment `truncated` flags when more articles matched than `limit` allowed
+
+---
+
+### `wikipedia_get_languages` <sub>tool</sub>
+
+- Returns each edition's `language_code`, tool-usable `edition_code` (can differ, e.g. `gsw` vs `als`), article title, and URL
+- Pass `edition_code` — not `language_code` — as the `language` parameter on other tools
+- Fails with `no_other_languages` when the article has no translations
+- Redirect pages are followed automatically; `source_title` reports the resolved title
 
 ## Features
 
-Built on [`@cyanheads/mcp-ts-core`](https://www.npmjs.com/package/@cyanheads/mcp-ts-core):
-
-- Declarative tool definitions — single file per tool, framework handles registration and validation
-- Unified error handling — handlers throw, framework catches, classifies, and formats
-- Pluggable auth: `none`, `jwt`, `oauth`
-- Swappable storage backends: `in-memory`, `filesystem`, `Supabase`, `Cloudflare KV/R2/D1`
-- Structured logging with optional OpenTelemetry tracing
-- STDIO and Streamable HTTP transports
+Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): stdio and Streamable HTTP transports, pluggable auth (`none` / `jwt` / `oauth`), swappable storage (`in-memory`, `filesystem`, `Supabase`, `Cloudflare KV/R2/D1`), structured logging with optional OpenTelemetry tracing.
 
 Wikipedia-specific:
 
@@ -118,12 +111,29 @@ Wikipedia-specific:
 
 Agent-friendly output:
 
-- `page_type` field on summaries discriminates article / disambiguation / redirect — no string parsing needed
+- `page_type` on summaries discriminates `standard` / `disambiguation` / `no-extract` — no string parsing needed
 - `wikibase_item` (Wikidata QID) on summaries enables direct cross-referencing with wikidata-mcp-server
 - `section_index` on table-of-contents entries links directly to the targeted-read parameter on `wikipedia_get_article`
-- Recovery hints on every error type — callers get actionable next steps (e.g., "use `wikipedia_search` to find the correct title")
+- Recovery hints on every error type — callers get actionable next steps (e.g., "use `wikipedia_search_articles` to find the correct title")
 
 ## Getting started
+
+### Public Hosted Instance
+
+A public instance is available at `https://wikipedia.caseyjhand.com/mcp` — no installation required. Point any MCP client at it via Streamable HTTP:
+
+```json
+{
+  "mcpServers": {
+    "wikipedia-mcp-server": {
+      "type": "streamable-http",
+      "url": "https://wikipedia.caseyjhand.com/mcp"
+    }
+  }
+}
+```
+
+### Self-Hosted / Local
 
 Add the following to your MCP client configuration file.
 
@@ -222,7 +232,7 @@ cp .env.example .env
 
 | Variable | Description | Default |
 |:---------|:------------|:--------|
-| `WIKIPEDIA_USER_AGENT` | User-Agent header sent with every Wikimedia API request. Customize for your deployment. | `wikipedia-mcp-server/0.1.17 (https://github.com/cyanheads/wikipedia-mcp-server)` |
+| `WIKIPEDIA_USER_AGENT` | User-Agent header sent with every Wikimedia API request. Customize for your deployment. | `wikipedia-mcp-server/0.2.0 (https://github.com/cyanheads/wikipedia-mcp-server)` |
 | `WIKIPEDIA_BASE_URL` | Optional single-instance override. Unset (default): compose per-language hosts, `language` selects the edition per call. Set to a full base URL (e.g. a private MediaWiki mirror): route every call at that one fixed host — `language` no longer varies it. | *(unset)* |
 | `WIKIPEDIA_ARTICLE_OVERFLOW_BYTES` | Byte budget above which a full-article read (`wikipedia_get_article` without `section_index`) returns a section outline instead of the full text. Tuned for this domain — ordinary articles stay whole; only genuine mega-articles (World War II ~86 KB, United States ~94 KB) outline. Section-targeted reads are never affected. | `80000` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
@@ -289,7 +299,7 @@ See [`CLAUDE.md`](./CLAUDE.md) for development guidelines and architectural rule
 
 ## Contributing
 
-Issues and pull requests are welcome. Run checks and tests before submitting:
+Issues are welcome. Run checks and tests before submitting:
 
 ```sh
 bun run devcheck

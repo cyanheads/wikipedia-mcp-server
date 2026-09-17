@@ -1,6 +1,6 @@
 # wikipedia-mcp-server - Directory Structure
 
-Generated on: 2026-08-25 06:55:42
+Generated on: 2026-09-17 13:43:52
 
 ```text
 wikipedia-mcp-server/
@@ -14,6 +14,8 @@ wikipedia-mcp-server/
 │   │   ├── bug_report.yml
 │   │   ├── config.yml
 │   │   └── feature_request.yml
+│   ├── workflows/
+│   │   └── codeql.yml
 │   ├── CODE_OF_CONDUCT.md
 │   ├── CONTRIBUTING.md
 │   ├── FUNDING.yml
@@ -23,27 +25,12 @@ wikipedia-mcp-server/
 │   └── settings.json
 ├── changelog/
 │   ├── 0.1.x/
+│   ├── 0.2.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
 │   └── idea.md
-├── scripts/
-│   ├── build-changelog.ts
-│   ├── build.ts
-│   ├── check-dependency-specifiers.ts
-│   ├── check-docs-sync.ts
-│   ├── check-framework-antipatterns.ts
-│   ├── check-skill-versions.ts
-│   ├── check-skills-sync.ts
-│   ├── clean-mcpb.ts
-│   ├── clean.ts
-│   ├── devcheck.ts
-│   ├── lint-mcp.ts
-│   ├── lint-packaging.ts
-│   ├── list-skills.ts
-│   ├── release-github.ts
-│   └── tree.ts
-├── skills/
+├── framework-skills/
 │   ├── add-app-tool/
 │   │   └── SKILL.md
 │   ├── add-prompt/
@@ -114,6 +101,8 @@ wikipedia-mcp-server/
 │   │   └── SKILL.md
 │   ├── release-and-publish/
 │   │   └── SKILL.md
+│   ├── release-pr-review/
+│   │   └── SKILL.md
 │   ├── report-issue-framework/
 │   │   └── SKILL.md
 │   ├── report-issue-local/
@@ -128,6 +117,22 @@ wikipedia-mcp-server/
 │   │   └── SKILL.md
 │   └── tool-defs-analysis/
 │       └── SKILL.md
+├── scripts/
+│   ├── build-changelog.ts
+│   ├── build.ts
+│   ├── check-dependency-specifiers.ts
+│   ├── check-docs-sync.ts
+│   ├── check-framework-antipatterns.ts
+│   ├── check-skill-versions.ts
+│   ├── check-skills-sync.ts
+│   ├── clean-mcpb.ts
+│   ├── clean.ts
+│   ├── devcheck.ts
+│   ├── lint-mcp.ts
+│   ├── lint-packaging.ts
+│   ├── list-skills.ts
+│   ├── release-github.ts
+│   └── tree.ts
 ├── src/
 │   ├── config/
 │   │   └── server-config.ts
@@ -143,8 +148,8 @@ wikipedia-mcp-server/
 │   │           ├── wikipedia-get-languages.tool.ts
 │   │           ├── wikipedia-get-sections.tool.ts
 │   │           ├── wikipedia-get-summary.tool.ts
-│   │           ├── wikipedia-search-nearby.tool.ts
-│   │           └── wikipedia-search.tool.ts
+│   │           ├── wikipedia-search-articles.tool.ts
+│   │           └── wikipedia-search-nearby.tool.ts
 │   ├── services/
 │   │   └── wikipedia/
 │   │       ├── types.ts
@@ -160,8 +165,8 @@ wikipedia-mcp-server/
 │   │           ├── wikipedia-get-languages.tool.test.ts
 │   │           ├── wikipedia-get-sections.tool.test.ts
 │   │           ├── wikipedia-get-summary.tool.test.ts
-│   │           ├── wikipedia-search-nearby.tool.test.ts
-│   │           └── wikipedia-search.tool.test.ts
+│   │           ├── wikipedia-search-articles.tool.test.ts
+│   │           └── wikipedia-search-nearby.tool.test.ts
 │   ├── prompts/
 │   ├── resources/
 │   ├── services/
