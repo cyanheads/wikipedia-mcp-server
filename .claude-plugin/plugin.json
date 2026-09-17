@@ -1,13 +1,17 @@
 {
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "wikipedia-mcp-server",
   "version": "0.1.17",
   "description": "Search Wikipedia articles, read summaries and full text, target sections, find nearby pages, and list language editions via MCP. STDIO or Streamable HTTP.",
   "author": {
-    "name": "cyanheads"
+    "name": "cyanheads",
+    "email": "casey@caseyjhand.com",
+    "url": "https://github.com/cyanheads"
   },
   "homepage": "https://github.com/cyanheads/wikipedia-mcp-server#readme",
   "repository": "https://github.com/cyanheads/wikipedia-mcp-server",
   "license": "Apache-2.0",
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "wikipedia", "mediawiki"],
   "mcpServers": {
     "wikipedia-mcp-server": {
       "command": "npx",

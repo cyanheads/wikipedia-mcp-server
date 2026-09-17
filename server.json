@@ -7,6 +7,12 @@
     "source": "github"
   },
   "version": "0.1.17",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://wikipedia.caseyjhand.com/mcp"
+    }
+  ],
   "packages": [
     {
       "registryType": "npm",
