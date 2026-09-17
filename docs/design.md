@@ -58,11 +58,11 @@ No API key needed. By default, language is a per-call parameter on every tool (d
 ## Implementation Order
 
 1. `WikipediaService` — `restGet` + `actionGet` with retry/backoff, User-Agent header
-2. Wikitext stripping utility — `wtf-wikipedia` integration + post-pass for heading markers and blank-line normalization; verify against real article wikitext before proceeding
+2. HTML-to-plain-text utility (`htmlSectionToPlainText`) — renders the parser's section HTML to plain text with headings kept inline; verify against real section HTML before proceeding
 3. `wikipedia_get_summary` — REST API `/page/summary/{title}`, core "what is X?" tool
 4. `wikipedia_search_articles` — Action API `action=query&list=search`, strip snippet HTML before returning
 5. `wikipedia_get_sections` — Action API `action=parse&prop=tocdata` (`line` rendered to plain text) with `== Title ==` fallback
-6. `wikipedia_get_article` — full-article path (`action=query&prop=extracts`) and section path (`action=parse&prop=wikitext` + stripping)
+6. `wikipedia_get_article` — full-article path (`action=query&prop=extracts`) and section path (`action=parse&prop=text` rendered to plain text)
 7. `wikipedia_get_languages` — Action API `action=query&prop=langlinks`
 8. `wikipedia_search_nearby` — Action API `action=query&list=geosearch`
 
@@ -81,7 +81,7 @@ The idea doc proposed `wikipedia_random`. Deferred — random article retrieval 
 The core tension is granularity. Most "what is X?" queries need 2–4 paragraphs, not 30–100KB. Two tools with distinct contracts:
 
 - `wikipedia_get_summary` — REST API `/page/summary/{title}`. Returns the lead section as a clean plain-text extract (already stripped of markup), plus description, thumbnail URL, and Wikidata QID. This is the right tool for 90% of agent lookups. The REST API's summary endpoint is purpose-built for this and returns consistent, clean data.
-- `wikipedia_get_article` — Action API `action=query&prop=extracts&explaintext=true`. Returns the full article as plain text (40–100KB for major articles). With `section_index` provided, uses `action=parse&prop=wikitext&section={index}` to return just that section. The full article path exists for agents that genuinely need depth; the section path exists for targeted reads.
+- `wikipedia_get_article` — Action API `action=query&prop=extracts&explaintext=true`. Returns the full article as plain text (40–100KB for major articles). With `section_index` provided, uses `action=parse&prop=text&section={index}` and renders the parser's HTML for that section to plain text. The full article path exists for agents that genuinely need depth; the section path exists for targeted reads.
 
 This is cleaner than a single `wikipedia_get_article` tool with a `mode` switch — the two tools have meaningfully different call patterns, output sizes, and use cases.
 
@@ -96,7 +96,7 @@ For `wikipedia_get_article`, the Action API's `exsectionformat=wiki` with `expla
 The idea doc proposed `wikipedia_get_sections` + section ID parameter on `wikipedia_get_article`. This is confirmed correct by the API. The flow:
 
 1. `wikipedia_get_sections` — Action API `action=parse&prop=tocdata` returns `index`, `number` (e.g. "2.1"), `line` (the heading as rendered HTML), and `hLevel` (heading depth) for every section; `line` is stripped to plain text and whitespace-folded so it matches the `section_title` the article path reports for the same index
-2. `wikipedia_get_article` with `section_index` — Action API `action=parse&prop=wikitext&section={index}` returns wikitext for just that section; wikitext stripping is then applied (see below)
+2. `wikipedia_get_article` with `section_index` — Action API `action=parse&prop=text&section={index}` returns the parser's HTML for just that section and its subsections; it is rendered to plain text before returning (see [Section reads render parser HTML, not wikitext](#section-reads-render-parser-html-not-wikitext))
 
 **`prop=tocdata` and the fallback:** `prop=sections` is deprecated in favor of `prop=tocdata`, which the service reads (same data, renamed and re-nested fields). A fallback parses section headers (`== Title ==`) out of the full `action=query&prop=extracts` response whenever `tocdata` returns no sections, so `wikipedia_get_sections` keeps working for an article the parser reports no table of contents for.
 
