@@ -1123,6 +1123,99 @@ describe('WikipediaService.getSections — error codes and fallback', () => {
   });
 });
 
+describe('WikipediaService.getSections — tocdata line is rendered HTML (issue #36)', () => {
+  beforeEach(() => {
+    initService();
+  });
+
+  it('strips tags, decodes entities once, and folds no-break spaces in section titles', async () => {
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+
+    // `line` is rendered HTML, not plain text. The first two entries are verbatim from
+    // es:Semana Santa en Sevilla, whose Roman-numeral century template wraps its numeral in a
+    // <span> and whose heading wikitext used `&nbsp;`, reaching the API as a literal U+00A0. The
+    // last three cover the two entity cases and a line that is already plain.
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
+      parse: {
+        title: 'Semana Santa en Sevilla',
+        pageid: 1174639,
+        tocdata: {
+          sections: [
+            {
+              tocLevel: 2,
+              hLevel: 3,
+              line: 'Siglos <span>XVI</span> y <span>XVII</span>',
+              number: '5.1',
+              index: '32',
+            },
+            {
+              tocLevel: 2,
+              hLevel: 3,
+              line: 'Siglo <span>XVIII</span>',
+              number: '5.2',
+              index: '33',
+            },
+            { tocLevel: 1, hLevel: 2, line: 'Pasos &amp; palios', number: '6', index: '36' },
+            {
+              tocLevel: 1,
+              hLevel: 2,
+              line: 'El tag &amp;lt;ref&amp;gt;',
+              number: '7',
+              index: '37',
+            },
+            { tocLevel: 1, hLevel: 2, line: 'Historia', number: '8', index: '38' },
+          ],
+        },
+      },
+    });
+
+    const result = await svc.getSections('Semana Santa en Sevilla', 'es', ctx);
+
+    expect(result.sections.map((s) => s.title)).toEqual([
+      'Siglos XVI y XVII',
+      'Siglo XVIII',
+      // One decode pass: `&amp;` becomes `&` …
+      'Pasos & palios',
+      // … and the same pass leaves `&amp;lt;` as the literal text `&lt;` rather than re-reading it
+      // as a tag delimiter (issue #3's single-pass rule).
+      'El tag &lt;ref&gt;',
+      // A line that is already plain text comes back unchanged.
+      'Historia',
+    ]);
+    for (const section of result.sections) {
+      expect(section.title).not.toMatch(/[<> ]/);
+    }
+  });
+
+  it('leaves the empty-tocdata fallback deriving headings from the article text', async () => {
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+
+    vi.spyOn(svc, 'actionGet')
+      .mockResolvedValueOnce({
+        parse: { title: 'Stubby', pageid: 42, tocdata: { sections: [] } },
+      })
+      .mockResolvedValueOnce({
+        query: {
+          pages: {
+            '42': {
+              pageid: 42,
+              title: 'Stubby',
+              extract: 'Lead text.\n\n== First ==\nBody.\n\n=== Nested ===\nMore.',
+            },
+          },
+        },
+      });
+
+    const result = await svc.getSections('Stubby', 'en', ctx);
+    expect(result.sections).toEqual([
+      { index: 1, number: '1', title: 'First', level: 2 },
+      { index: 2, number: '2', title: 'Nested', level: 3 },
+    ]);
+  });
+});
+
 describe('WikipediaService.getLanguages — missing page handling', () => {
   beforeEach(() => {
     initService();

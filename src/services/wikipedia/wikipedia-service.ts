@@ -371,12 +371,34 @@ export function splitArticleIntoSections(
 }
 
 // ---------------------------------------------------------------------------
-// Strip HTML snippet markup from Action API search results
+// Strip HTML markup from Action API text fields
 // ---------------------------------------------------------------------------
 
-/** Drop the `<span class="searchmatch">` highlight markup a snippet carries, then unescape it. */
-function stripSnippetHtml(html: string): string {
+/**
+ * Drop the markup an Action API text field carries, then unescape it.
+ *
+ * Tags go before entities are decoded, which is what keeps a decoded `<` from being read as the
+ * start of a tag: an article writing about markup reaches here as `&amp;lt;ref&amp;gt;` and must
+ * come out as the literal text `&lt;ref&gt;`. {@link decodeEntities} makes that one left-to-right
+ * pass; a chained per-name replace would decode it twice.
+ */
+function stripMarkup(html: string): string {
   return decodeEntities(html.replace(/<[^>]+>/g, '')).trim();
+}
+
+/**
+ * Render a `prop=tocdata` section `line` — rendered HTML, not plain text — as the same plain text
+ * the article read path reports for that section.
+ *
+ * Headings built from inline templates arrive wrapped (`Siglo<span>XVIII</span>` from the Spanish
+ * edition's Roman-numeral templates), and a heading whose wikitext used `&nbsp;` arrives carrying a
+ * literal U+00A0. {@link htmlSectionToPlainText} folds both away on the article path — its
+ * whitespace pass matches `\s`, which includes U+00A0 — so the same fold here is what makes
+ * `wikipedia_get_sections`' `title` and `wikipedia_get_article`'s `section_title` byte-identical for
+ * one index. `stripMarkup` has already trimmed, so the collapse cannot leave an edge space behind.
+ */
+function tocLineToPlainText(line: string): string {
+  return stripMarkup(line).replace(/\s+/g, ' ');
 }
 
 // ---------------------------------------------------------------------------
@@ -1083,11 +1105,11 @@ export class WikipediaService {
       // Match by error code (reliable) rather than message text (fragile).
       if (err instanceof McpError && err.code === JsonRpcErrorCode.NotFound) {
         throw notFound(
-          `No Wikipedia article found for "${title}" in language "${language}". Use wikipedia_search to find the correct title.`,
+          `No Wikipedia article found for "${title}" in language "${language}". Use wikipedia_search_articles to find the correct title.`,
           {
             title,
             language,
-            recovery: { hint: 'Use wikipedia_search to find the correct article title.' },
+            recovery: { hint: 'Use wikipedia_search_articles to find the correct article title.' },
           },
         );
       }
@@ -1145,7 +1167,7 @@ export class WikipediaService {
       raw.query?.search?.map((r) => ({
         title: r.title,
         pageid: r.pageid,
-        snippet: stripSnippetHtml(r.snippet),
+        snippet: stripMarkup(r.snippet),
         wordcount: r.wordcount ?? 0,
       })) ?? [];
 
@@ -1182,7 +1204,7 @@ export class WikipediaService {
     // (but missing) article. Map this to not_found — same user-visible outcome.
     if (!pages) {
       throw notFound(
-        `No Wikipedia article found for "${title}" in language "${language}". Use wikipedia_search to find the correct title.`,
+        `No Wikipedia article found for "${title}" in language "${language}". Use wikipedia_search_articles to find the correct title.`,
         { title, language },
       );
     }
@@ -1190,7 +1212,7 @@ export class WikipediaService {
     const page = Object.values(pages)[0];
     if (!page || page.missing !== undefined) {
       throw notFound(
-        `No Wikipedia article found for "${title}" in language "${language}". Use wikipedia_search to find the correct title.`,
+        `No Wikipedia article found for "${title}" in language "${language}". Use wikipedia_search_articles to find the correct title.`,
         { title, language },
       );
     }
@@ -1257,7 +1279,7 @@ export class WikipediaService {
       }
       if (errCode === 'missingtitle') {
         throw notFound(
-          `No Wikipedia article found for "${title}" in language "${language}". Use wikipedia_search to find the correct title.`,
+          `No Wikipedia article found for "${title}" in language "${language}". Use wikipedia_search_articles to find the correct title.`,
           { title, language },
         );
       }
@@ -1301,7 +1323,7 @@ export class WikipediaService {
       const errCode = raw.error.code ?? '';
       if (errCode === 'missingtitle') {
         throw notFound(
-          `No Wikipedia article found for "${title}" in language "${language}". Use wikipedia_search to find the correct title.`,
+          `No Wikipedia article found for "${title}" in language "${language}". Use wikipedia_search_articles to find the correct title.`,
           { title, language },
         );
       }
@@ -1330,7 +1352,8 @@ export class WikipediaService {
       .map((s) => ({
         index: parseInt(s.index ?? '0', 10),
         number: s.number ?? '',
-        title: s.line ?? '',
+        // `line` is rendered HTML — see tocLineToPlainText for why it is normalized here.
+        title: tocLineToPlainText(s.line ?? ''),
         // hLevel is a number under tocdata (prop=sections' level was a string).
         level: s.hLevel ?? 2,
       }));
@@ -1382,7 +1405,7 @@ export class WikipediaService {
     const page = Object.values(pages)[0];
     if (!page || page.missing !== undefined) {
       throw notFound(
-        `No Wikipedia article found for "${title}" in language "${sourceLanguage}". Use wikipedia_search to find the correct title.`,
+        `No Wikipedia article found for "${title}" in language "${sourceLanguage}". Use wikipedia_search_articles to find the correct title.`,
         { title, language: sourceLanguage },
       );
     }

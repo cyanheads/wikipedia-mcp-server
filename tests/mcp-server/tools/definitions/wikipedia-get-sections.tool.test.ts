@@ -41,6 +41,36 @@ describe('wikipediaGetSections', () => {
     expect(result.pageid).toBe(23862);
   });
 
+  it('carries a cleaned section title into structuredContent and content[] (issue #36)', async () => {
+    // The service normalizes the tocdata `line` before the handler sees it; what this pins is that
+    // neither the output schema nor format() re-escapes or mangles the cleaned bytes on the way out.
+    const cleaned = 'Siglo XVIII & pasos';
+    mockWikipediaService({
+      getSections: vi.fn().mockResolvedValue({
+        title: 'Semana Santa en Sevilla',
+        pageid: 1174639,
+        sections: [{ index: 33, number: '5.2', title: cleaned, level: 3 }],
+      }),
+    });
+
+    const ctx = createMockContext({ errors: wikipediaGetSections.errors });
+    const input = wikipediaGetSections.input.parse({
+      title: 'Semana Santa en Sevilla',
+      language: 'es',
+    });
+    // structuredContent is the parsed output, not the raw handler return.
+    const structured = wikipediaGetSections.output.parse(
+      await wikipediaGetSections.handler(input, ctx),
+    );
+    expect(structured.sections[0]?.title).toBe(cleaned);
+
+    const text = wikipediaGetSections.format!(structured)
+      .map((b) => (b.type === 'text' ? b.text : ''))
+      .join('');
+    expect(text).toContain(cleaned);
+    expect(text).not.toMatch(/[<> ]/);
+  });
+
   it('throws no_sections when article has no sections', async () => {
     mockWikipediaService({
       getSections: vi.fn().mockResolvedValue({ title: 'Stub Article', pageid: 1, sections: [] }),
