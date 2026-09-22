@@ -12,8 +12,9 @@
     "ignorePatterns": []
   },
   "outdated": {
-    "allowlist": ["typescript"]
+    "allowlist": []
   },
+  "lint": {},
   "packaging": {
     "pluginManifests": true
   }
