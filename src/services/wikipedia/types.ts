@@ -62,7 +62,14 @@ export type ActionSearchResult = {
 /** Action API search query response. */
 export type ActionSearchRaw = {
   query?: {
-    searchinfo?: { totalhits?: number };
+    searchinfo?: {
+      totalhits?: number;
+      /**
+       * CirrusSearch's spelling correction for the query (`srinfo` defaults to include it). Arrives
+       * on non-empty pages too, and is absent when the query has no near-miss.
+       */
+      suggestion?: string;
+    };
     search?: ActionSearchResult[];
   };
   /**
@@ -194,7 +201,35 @@ export type SiteMatrixRaw = {
   error?: ActionApiErrorRaw;
 };
 
-/** Action API geosearch response. */
+/**
+ * One page's `prop=description|pageprops&ppprop=wikibase_item` entry (formatversion=2).
+ *
+ * `description` is the local short description, falling back to Wikidata's. A page whose short
+ * description is explicitly "none" carries it as an empty string, and a page with no Wikidata item
+ * has no `pageprops` at all. A requested page that no longer exists arrives as `missing: true` with
+ * neither.
+ */
+export type ActionPageMetaRaw = {
+  pageid?: number;
+  title?: string;
+  missing?: boolean;
+  description?: string;
+  pageprops?: { wikibase_item?: string };
+};
+
+/** `action=query&pageids=…&prop=description|pageprops` response — the search follow-up lookup. */
+export type ActionPageMetaQueryRaw = {
+  query?: { pages?: ActionPageMetaRaw[] };
+  error?: ActionApiErrorRaw;
+};
+
+/**
+ * Action API geosearch response.
+ *
+ * `geosearch` is `list=geosearch`: the distance-ordered result set, with each article's own
+ * GeoData coordinate and its distance. `pages` is the same geosearch run as a generator in the
+ * same request, carrying each page's description and Wikidata QID in pageid order.
+ */
 export type ActionGeoSearchRaw = {
   query?: {
     geosearch?: Array<{
@@ -205,6 +240,7 @@ export type ActionGeoSearchRaw = {
       lon: number;
       dist: number;
     }>;
+    pages?: ActionPageMetaRaw[];
   };
   error?: ActionApiErrorRaw;
 };

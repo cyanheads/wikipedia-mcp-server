@@ -6,11 +6,11 @@
 
 | Name | Description | Key Inputs | Annotations | Errors |
 |:-----|:------------|:-----------|:------------|:-------|
-| `wikipedia_search_articles` | Full-text search across articles. Returns ranked results with plain-text titles, snippets, and page IDs. Use when the exact article title is unknown or to find multiple articles on a topic. | `query`, `limit`, `offset`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `empty_query` (ValidationError), `offset_too_large` (ValidationError), `invalid_language` (ValidationError) |
+| `wikipedia_search_articles` | Full-text search across articles. Returns ranked results with plain-text titles, short descriptions, Wikidata QIDs, snippets, and page IDs, plus Wikipedia's spelling suggestion when it has one. Use when the exact article title is unknown or to find multiple articles on a topic. | `query`, `limit`, `offset`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `empty_query` (ValidationError), `offset_too_large` (ValidationError), `invalid_language` (ValidationError) |
 | `wikipedia_get_summary` | Fetch the short summary for an article — a truncated fragment from the start of the lead section, which answers "what is X?". Returns plain-text extract, Wikidata QID for cross-referencing, description, thumbnail URL, canonical article URL, the revision the extract was read from, and — for a geotagged article — coordinates that feed `wikipedia_search_nearby`. Handles disambiguation pages: returns `page_type: "disambiguation"` so the agent can detect and pivot to a more specific search. | `title`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `invalid_title` (ValidationError), `invalid_language` (ValidationError) |
 | `wikipedia_get_article` | Fetch article content as clean plain text. Full-article path uses `action=query&prop=extracts&explaintext=true` (40–100KB for major articles). Section-targeted path uses `action=parse&prop=text&section={index}`, rendering the parser's HTML for that section to plain text — use `section_index` (from `wikipedia_get_sections`) to retrieve a single section and its subsections, or `section_index: 0` for the lead. Prefer section targeting when only part of the article is needed. | `title`, `section_index`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `invalid_title` (ValidationError), `invalid_section` (ValidationError), `invalid_language` (ValidationError) |
 | `wikipedia_get_sections` | Fetch the table of contents for an article — section titles, numbers, levels, and `section_index` values, led by the index-0 `Introduction` entry for the lead. Call this before `wikipedia_get_article` when only a specific section is needed. The returned `section_index` values are the identifiers for targeted section reads. | `title`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `invalid_title` (ValidationError), `no_sections` (NotFound), `invalid_language` (ValidationError) |
-| `wikipedia_search_nearby` | Find Wikipedia articles about places near a geographic coordinate. Returns articles within a radius, sorted by distance. Useful for "what's notable near X?" research. | `latitude`, `longitude`, `radius_meters`, `limit`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `invalid_coordinates` (ValidationError), `invalid_language` (ValidationError) |
+| `wikipedia_search_nearby` | Find Wikipedia articles about places near a geographic coordinate. Returns articles within a radius, sorted by distance, with short descriptions and Wikidata QIDs. Useful for "what's notable near X?" research. | `latitude`, `longitude`, `radius_meters`, `limit`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `invalid_coordinates` (ValidationError), `invalid_language` (ValidationError) |
 | `wikipedia_get_languages` | List the language editions available for an article. Returns each edition's language code, tool-usable subdomain code, article title, and URL. Pass `editions` to narrow the list to specific codes; unmatched ones come back under `missing`. Use for cross-language research or to find a non-English article title for a known concept. | `title`, `language`, `editions` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `invalid_title` (ValidationError), `no_other_languages` (NotFound), `invalid_language` (ValidationError) |
 
 ### Resources
@@ -60,11 +60,11 @@ No API key needed. By default, language is a per-call parameter on every tool (d
 1. `WikipediaService` — `restGet` + `actionGet` with retry/backoff, User-Agent header
 2. HTML-to-plain-text utility (`htmlSectionToPlainText`) — renders the parser's section HTML to plain text with headings kept inline; verify against real section HTML before proceeding
 3. `wikipedia_get_summary` — REST API `/page/summary/{title}`, core "what is X?" tool
-4. `wikipedia_search_articles` — Action API `action=query&list=search`, strip snippet HTML before returning
+4. `wikipedia_search_articles` — Action API `action=query&list=search`, strip snippet HTML before returning; a best-effort `pageids=` follow-up adds each result's description and QID
 5. `wikipedia_get_sections` — Action API `action=parse&prop=tocdata` (`line` rendered to plain text) with `== Title ==` fallback
 6. `wikipedia_get_article` — full-article path (`action=query&prop=extracts`) and section path (`action=parse&prop=text` rendered to plain text)
 7. `wikipedia_get_languages` — Action API `action=query&prop=langlinks`
-8. `wikipedia_search_nearby` — Action API `action=query&list=geosearch`
+8. `wikipedia_search_nearby` — Action API `action=query&list=geosearch`, with the same geosearch as a generator in the same request for descriptions and QIDs
 
 Each step is independently testable.
 
@@ -191,6 +191,17 @@ The service also recognizes the shapes for callers that reach it directly: an `i
 - **An empty `query` and an `offset` at or past the window are refused at the handler edge**, with declared `empty_query` and `offset_too_large` reasons, before the fetch that would be refused anyway. A whitespace-only query is not in that class: `srsearch=%20` is a legitimate search that matches nothing, and rejecting it would be a regression. `offset_too_large`'s recovery says to narrow the query, not to page back — paging back is what the old end-of-results notice wrongly advised, and no offset reaches past the window.
 - **A page ending at the window discloses it** through `ctx.enrich.truncated({ shown, cap: 10000 })` plus a notice naming the matches no offset reaches. The condition is `offset + shown >= 10000` with `totalCount` still higher; below the window nothing changes, so an ordinary page and a genuine last page are untouched. `truncated` and `cap` are optional enrichment fields, absent unless the window cut the page.
 - **`limit` carries `.max(50)`**, so the advertised schema matches the cap the server enforces. This turns a silent clamp into a rejection for a caller passing a larger value. 50 is this server's page size, not an upstream ceiling — `action=paraminfo` reports `limit.max: 500` for an anonymous caller.
+- **The spelling suggestion is surfaced, never applied.** `srinfo` already requests CirrusSearch's `suggestion` on every page, so it rides as optional enrichment whenever upstream sends one, and a zero-hit first page names it in the notice. Re-running with it server-side was rejected: it swaps the caller's query without asking, and the suggestion is sometimes partial.
+
+### Search and nearby results carry a description and a Wikidata QID
+
+A bare title list forced a `wikipedia_get_summary` call per result to tell same-named articles apart; each result now carries the short `description` and `wikibase_item`, the field names `wikipedia_get_summary` already uses. Both are absent when upstream has none — including an explicitly-empty short description, which the API returns as `""`.
+
+- **Search uses a best-effort `pageids=` follow-up.** `list=search` cannot return page props, and `generator=search` drops `snippet` and `wordcount`. Running `list=search` and `generator=search` together in one request was measured and rejected: CirrusSearch runs the query twice, costing about what the follow-up does, and the two runs can rank different page sets, leaving some results bare (at 50 results, `python` and `river delta` each differ by a page). The follow-up is one request per page (`pageids` takes 50 values anonymously, matching the page cap), merged by pageid so the search ranking survives, skipped on an empty page, and given one 5 s attempt with no retries; it adds ≈200 ms to a search. A failure returns the results without the two fields and a notice segment — never a failed search — while a caller cancellation during it propagates like any other.
+- **Nearby runs the same geosearch as a generator in the same request.** `list=geosearch` stays the source of the result set, its order, coordinates, and distances; `generator=geosearch` with identical parameters adds each page's props, merged by pageid. The generator alone was measured as the one-query alternative and rejected: it answers in pageid order, its `coordinates` prop rounds to eight decimals and needs `colimit=max` to report distances past the tenth page, and re-sorting by distance reorders equal-distance ties — near the Eiffel Tower at `limit: 10`, three articles tie at 365.7 m on the cap boundary, and the re-sorted generator keeps a different one than the list does. The price is the geosearch running twice upstream: ≈150 ms more at `limit: 10`, ≈300 ms more at 500.
+- **Coordinates come from the article's own GeoData tag**, not Wikidata's P625, and the tool description says so. The description is what exposes a wrong tag: `Palazzo Bernardo Nani`, a Venice palace, appears 161 m from the Eiffel Tower.
+
+At `limit: 500` — the ceiling — nearby's truncation notice drops the "raise limit" advice and points only to narrower sweeps; `truncated` is still `true` on a full page there, because no probe past the cap is possible.
 
 ### Disambiguation handling
 
@@ -202,7 +213,7 @@ Multi-language support is one parameter (`language`, default `"en"`) on every to
 
 ### Relationship to wikidata-mcp-server
 
-Wikipedia provides prose; Wikidata provides structured facts. The `wikibase_item` field in `wikipedia_get_summary` returns the Wikidata QID (e.g., `Q28865` for Python). This is the bridge — an agent can look up the summary for prose context, then use the QID to query `wikidata-mcp-server` for structured properties without a separate title-to-QID lookup.
+Wikipedia provides prose; Wikidata provides structured facts. The `wikibase_item` field in `wikipedia_get_summary`, and on each `wikipedia_search_articles` and `wikipedia_search_nearby` result, returns the Wikidata QID (e.g., `Q28865` for Python). This is the bridge — an agent can look up the summary for prose context, then use the QID to query `wikidata-mcp-server` for structured properties without a separate title-to-QID lookup.
 
 ### What was cut
 
@@ -245,13 +256,14 @@ All requests: `format=json`
 
 | Action + params | Used by |
 |:----------------|:--------|
-| `action=query&list=search&srsearch={q}&srlimit={n}&srprop=snippet` | `wikipedia_search_articles` |
+| `action=query&list=search&srsearch={q}&srlimit={n}&sroffset={o}&srprop=snippet\|wordcount` | `wikipedia_search_articles` |
+| `action=query&pageids={id\|…}&prop=description\|pageprops&ppprop=wikibase_item` | `wikipedia_search_articles` (best-effort description + QID follow-up) |
 | `action=query&titles={t}&prop=extracts&explaintext=true&exintro=true` | `wikipedia_get_article` (intro) |
 | `action=query&titles={t}&prop=extracts&explaintext=true&exsectionformat=wiki` | `wikipedia_get_article` (full) |
 | `action=parse&page={t}&prop=tocdata` | `wikipedia_get_sections` |
 | `action=parse&page={t}&prop=text&section={index}` | `wikipedia_get_article` (section) |
 | `action=query&titles={t}&prop=langlinks&lllimit=500` | `wikipedia_get_languages` |
-| `action=query&list=geosearch&gscoord={lat}\|{lon}&gsradius={r}&gslimit={n}` | `wikipedia_search_nearby` |
+| `action=query&list=geosearch&gscoord={lat}\|{lon}&gsradius={r}&gslimit={n}&generator=geosearch&ggscoord={lat}\|{lon}&ggsradius={r}&ggslimit={n}&prop=description\|pageprops&ppprop=wikibase_item` | `wikipedia_search_nearby` |
 
 Pagination: Action API uses `continue` objects in the response. Tools that paginate internally (langlinks) should set `lllimit=500` to minimize round-trips. Geosearch results are bounded by the `limit` parameter alone — the module has no `offset` or `continue`. Search pages with `sroffset`, bounded by CirrusSearch's 10,000-result window: `sroffset >= 10000` is refused outright, and a page crossing the window is cut at the 10,000th result rather than refused, so the window's edge is shaped exactly like the end of the result set and has to be disclosed from `totalCount` against the offset reached.
 
@@ -264,6 +276,7 @@ Snippet HTML: Search snippets include `<span class="searchmatch">` markup. Strip
 No enforced rate limits, but:
 - Retry on 429 with backoff (1s base, 2 retries max)
 - Retry on 503 (Wikimedia occasionally returns 503 under load)
+- The search description lookup is the exception: best-effort, one attempt with a 5 s timeout
 - User-Agent is required — requests without it are deprioritized
 
 ---
@@ -272,7 +285,7 @@ No enforced rate limits, but:
 
 ### `wikipedia_search_articles`
 
-**Description:** Full-text search across Wikipedia articles. Returns ranked results with plain-text titles, snippets (search match highlighted terms stripped to plain text), and page IDs. Use when the exact article title is unknown or to discover multiple articles on a topic. The `pageid` values in results can be used to resolve article titles for subsequent calls.
+**Description:** Full-text search across Wikipedia articles. Returns ranked results with plain-text titles, short descriptions, Wikidata QIDs, snippets (search match highlighted terms stripped to plain text), and page IDs, plus Wikipedia's spelling suggestion when it has one. Use when the exact article title is unknown or to discover multiple articles on a topic. The `pageid` values in results can be used to resolve article titles for subsequent calls.
 
 **Input:**
 - `query: string` — search query; an empty string is refused before the fetch (whitespace is a legitimate search upstream and is not)
@@ -280,7 +293,7 @@ No enforced rate limits, but:
 - `offset?: number` — result offset (default 0); at or past the 10,000-result search window the call is refused, since nothing past it is retrievable
 - `language?: string` — Wikipedia language edition code (default `"en"`); constructs the correct base URL per call
 
-**Output:** Array of results, each with `title`, `pageid`, `snippet` (plain text, `<span class="searchmatch">` tags stripped), and `wordcount`. Enrichment carries `effectiveQuery`, `totalCount`, `offset`, `shown`, `nextOffset` while more results remain, and — on a page that ends at the search window — `truncated`, `cap`, and a notice naming the matches no offset reaches.
+**Output:** Array of results, each with `title`, `pageid`, `snippet` (plain text, `<span class="searchmatch">` tags stripped), `wordcount`, and — when the article has them — `description` and `wikibase_item`. Enrichment carries `effectiveQuery`, `totalCount`, `offset`, `shown`, `nextOffset` while more results remain, `suggestion` whenever upstream has a spelling correction, and — on a page that ends at the search window — `truncated`, `cap`, and a notice naming the matches no offset reaches. The notice is one string built from every applicable segment: the zero-hit first page (naming the suggestion), the end of results past offset 0, the window cut, and a failed description lookup.
 
 **Errors:**
 - `empty_query` (ValidationError) — the query is an empty string, which Wikipedia reads as a missing parameter. Recovery: supply search terms.
@@ -355,7 +368,7 @@ A search that matches nothing is a successful empty result with a notice, not an
 
 ### `wikipedia_search_nearby`
 
-**Description:** Find Wikipedia articles about places near a geographic coordinate. Returns articles sorted by distance from the query point, with titles, page IDs, coordinates, and distance in meters. Useful for "what's notable near X?" research workflows. Only articles with geographic coordinates in their Wikidata record are returned.
+**Description:** Find Wikipedia articles about places near a geographic coordinate. Returns articles sorted by distance from the query point, with titles, short descriptions, Wikidata QIDs, page IDs, coordinates, and distance in meters. Useful for "what's notable near X?" research workflows. Only articles carrying their own GeoData coordinate tag are returned, and that tag — not the Wikidata item's P625 — places and measures each result.
 
 **Input:**
 - `latitude: number` — WGS 84 latitude (−90 to 90)
@@ -364,7 +377,7 @@ A search that matches nothing is a successful empty result with a notice, not an
 - `limit?: number` — max results (default 10, max 500 — the `gslimit` ceiling an anonymous caller gets). Geosearch has no `offset`/`continue`, so this is the whole reachable set
 - `language?: string` — language edition code (default `"en"`)
 
-**Output:** Array of results: `{ title, pageid, latitude, longitude, distance_meters }`, sorted ascending by `distance_meters`. Includes `total_results` count.
+**Output:** Array of results: `{ title, pageid, latitude, longitude, distance_meters, description?, wikibase_item? }`, sorted ascending by `distance_meters`. Enrichment echoes the query point and effective radius, and carries `truncated`, `shown`, and `cap`. A truncation notice advises a higher `limit` below the 500 ceiling and only narrower sweeps at it.
 
 **Errors:**
 - `invalid_coordinates` (ValidationError) — latitude or longitude out of range.

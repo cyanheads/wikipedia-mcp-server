@@ -35,11 +35,11 @@ Wikipedia content via the MediaWiki REST API and Action API. Search articles, re
 
 | Tool | Description |
 |:---|:---|
-| `wikipedia_search_articles` | Full-text search across Wikipedia, returning ranked results with plain-text snippets and page IDs. |
+| `wikipedia_search_articles` | Full-text search across Wikipedia, returning ranked results with short descriptions, Wikidata QIDs, plain-text snippets, and page IDs, plus Wikipedia's spelling suggestion. |
 | `wikipedia_get_summary` | Short summary for any article — plain text, Wikidata QID, description, thumbnail URL, page type, canonical URL, revision, and coordinates. |
 | `wikipedia_get_article` | Full article or a targeted section as clean plain text, with section markers preserved. |
 | `wikipedia_get_sections` | Table of contents with `section_index` values for targeted section reads. |
-| `wikipedia_search_nearby` | Geotagged Wikipedia articles within a radius of a WGS 84 coordinate, sorted by distance. |
+| `wikipedia_search_nearby` | Geotagged Wikipedia articles within a radius of a WGS 84 coordinate, sorted by distance, with short descriptions and Wikidata QIDs. |
 | `wikipedia_get_languages` | All language editions available for an article, with titles and URLs, or just the editions you ask for. |
 
 ## Capability reference
@@ -47,6 +47,8 @@ Wikipedia content via the MediaWiki REST API and Action API. Search articles, re
 ### `wikipedia_search_articles` <sub>tool</sub>
 
 - Free-text query, ranked by relevance; returns plain-text snippets (HTML stripped), page IDs, and word counts
+- Each result carries the article's short `description` and Wikidata QID (`wikibase_item`) when it has them, from one follow-up lookup per page of results. That lookup is best-effort: if it fails, the results still come back without the two fields and the `notice` says so
+- Enrichment `suggestion` carries Wikipedia's spelling correction whenever it has one (`einstien` → `einstein`), and a zero-hit first page names it in the `notice` — re-run with it as `query`
 - `limit` is 1–50; `offset` pages further results — enrichment `nextOffset` signals more remain and is passed back as `offset`
 - Wikipedia serves no result past the 10,000th for a query: an `offset` at or beyond it fails with `offset_too_large`, and a page ending on the window carries enrichment `truncated` naming the matches no offset reaches — narrow the query to bring them into range
 - An empty `query` fails with `empty_query`; a whitespace-only query is a real search that simply matches nothing
@@ -90,10 +92,10 @@ Wikipedia content via the MediaWiki REST API and Action API. Search articles, re
 
 ### `wikipedia_search_nearby` <sub>tool</sub>
 
-- Returns geotagged articles sorted ascending by distance, with coordinates and `distance_meters`
+- Returns geotagged articles sorted ascending by distance, with coordinates, `distance_meters`, and each article's short `description` and Wikidata QID (`wikibase_item`) when it has them
 - `radius_meters`: 10–10,000 (default 1000); `limit`: 1–500 (default 10) — no pagination past `limit`, so raise it or sweep narrower radii for full coverage
-- Only articles with a geographic coordinate in their Wikidata record are returned
-- Enrichment `truncated` flags when more articles matched than `limit` allowed
+- Only articles carrying their own coordinate tag (GeoData, set on the article — not the Wikidata item's coordinate) are returned, and that tag places and measures each result. An article with a wrong tag appears where the tag puts it; its `description` usually gives it away (`Palazzo Bernardo Nani` — "Palace on the Grand Canal, Venice" — 161 m from the Eiffel Tower)
+- Enrichment `truncated` flags when more articles matched than `limit` allowed; at `limit: 500`, Wikipedia's ceiling, a full page reports `truncated` and the notice points to narrower sweeps rather than a higher limit
 
 ---
 
@@ -112,7 +114,7 @@ Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): s
 Wikipedia-specific:
 
 - Dual API integration — MediaWiki REST API (`/api/rest_v1/`) for summaries, Action API (`/w/api.php`) for search, full text, sections, geo search, and language links
-- Retry and backoff on all requests; `User-Agent` header per Wikimedia API policy
+- Retry and backoff on every required request (the best-effort description lookup on search results gets one short attempt); `User-Agent` header per Wikimedia API policy
 - Both read paths render to the same plain-text shape — `== Heading ==` markers, one list item per line — the full article from Action API extracts, a section from the parser's own HTML for that section. A section read additionally keeps code-sample indentation and the lists inside layout tables, neither of which the extract carries
 - Per-call `language` parameter on every tool — all Wikipedia language editions accessible in a single session
 - Language validation against a live edition registry built from the MediaWiki `action=sitematrix` endpoint (cached 24h) — catches structurally valid but nonexistent editions before they cause timeouts
@@ -120,7 +122,7 @@ Wikipedia-specific:
 Agent-friendly output:
 
 - `page_type` on summaries discriminates `standard` / `disambiguation` / `no-extract` — no string parsing needed
-- `wikibase_item` (Wikidata QID) on summaries enables direct cross-referencing with wikidata-mcp-server
+- `wikibase_item` (Wikidata QID) on summaries and on search and nearby results enables direct cross-referencing with wikidata-mcp-server
 - Article text, snippets, and titles are backslash-escaped on the way into the markdown `content[]` render, so an article that writes about markup or markdown syntax reads as itself instead of being interpreted by the client; `structuredContent` carries the same text unescaped
 - `section_index` on table-of-contents entries links directly to the targeted-read parameter on `wikipedia_get_article`, index 0 included
 - Titles MediaWiki cannot name a page with — `< > [ ] { }`, the `|` multi-title separator, percent escapes, magic tildes, relative paths — are refused before any request, with `invalid_title`; a trailing `#fragment` is accepted and resolves normally

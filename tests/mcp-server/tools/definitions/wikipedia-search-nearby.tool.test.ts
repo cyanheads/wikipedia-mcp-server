@@ -3,7 +3,7 @@
  * @module tests/mcp-server/tools/definitions/wikipedia-search-nearby.tool.test
  */
 
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { wikipediaSearchNearby } from '@/mcp-server/tools/definitions/wikipedia-search-nearby.tool.js';
 import { mockWikipediaService } from '../../../helpers/wikipedia-service-mock.js';
@@ -392,5 +392,198 @@ describe('wikipediaSearchNearby', () => {
     expect(text).toContain('Champ de Mars \\<parc\\> \\_central\\_');
     expect(text).not.toContain('<parc>');
     expect(output.results[0]?.title).toBe('Champ de Mars <parc> _central_');
+  });
+});
+
+/** Every text block of a tool result, joined — the domain render plus the enrichment trailer. */
+function contentText(result: { content: Array<{ type: string; text?: string }> }): string {
+  return result.content
+    .map((block) => (block.type === 'text' ? (block.text ?? '') : ''))
+    .join('\n');
+}
+
+/** `n` nearby results in ascending distance order. */
+const places = (n: number) =>
+  Array.from({ length: n }, (_, i) => ({
+    title: `Place ${i + 1}`,
+    pageid: i + 1,
+    latitude: 0,
+    longitude: 0,
+    distance_meters: i * 10,
+  }));
+
+describe('wikipediaSearchNearby — contract path', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    mockWikipediaService();
+  });
+
+  it('renders a result on both surfaces (characterization)', async () => {
+    mockWikipediaService({
+      searchNearby: vi.fn().mockResolvedValue({
+        truncated: false,
+        results: [
+          {
+            title: 'Eiffel Tower',
+            pageid: 9232,
+            latitude: 48.85822222,
+            longitude: 2.2945,
+            distance_meters: 0,
+          },
+        ],
+      }),
+    });
+
+    const result = await runToolContract(wikipediaSearchNearby, {
+      latitude: 48.85822222,
+      longitude: 2.2945,
+      radius_meters: 500,
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      results: [
+        {
+          title: 'Eiffel Tower',
+          pageid: 9232,
+          latitude: 48.85822222,
+          longitude: 2.2945,
+          distance_meters: 0,
+        },
+      ],
+      language: 'en',
+      queryLatitude: 48.85822222,
+      queryLongitude: 2.2945,
+      radiusMetersUsed: 500,
+      truncated: false,
+      shown: 1,
+      cap: 10,
+    });
+    expect(contentText(result)).toContain(
+      '**Page ID:** 9232 | **Distance:** 0m | **Coords:** (48.85822222, 2.2945)',
+    );
+  });
+});
+
+describe('wikipediaSearchNearby — cap notice at the 500 ceiling (issue #54)', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    mockWikipediaService();
+  });
+
+  it('drops the raise-limit advice when the limit is already the ceiling, keeping truncated true', async () => {
+    mockWikipediaService({
+      searchNearby: vi.fn().mockResolvedValue({ truncated: true, results: places(500) }),
+    });
+
+    const result = await runToolContract(wikipediaSearchNearby, {
+      latitude: 47.6,
+      longitude: -122.3,
+      radius_meters: 10_000,
+      limit: 500,
+    });
+
+    const structured = result.structuredContent as Record<string, unknown>;
+    expect(structured.truncated).toBe(true);
+    expect(structured.shown).toBe(500);
+    expect(structured.cap).toBe(500);
+    expect(structured.notice).not.toMatch(/raise limit/i);
+    expect(structured.notice).toContain("Wikipedia's 500-result ceiling");
+    expect(structured.notice).toContain('radius_meters');
+  });
+
+  it('keeps the existing raise-limit notice for a below-ceiling truncation (characterization)', async () => {
+    mockWikipediaService({
+      searchNearby: vi.fn().mockResolvedValue({ truncated: true, results: places(50) }),
+    });
+
+    const result = await runToolContract(wikipediaSearchNearby, {
+      latitude: 47.6,
+      longitude: -122.3,
+      radius_meters: 10_000,
+      limit: 50,
+    });
+
+    const structured = result.structuredContent as Record<string, unknown>;
+    expect(structured.truncated).toBe(true);
+    expect(structured.notice).toBe(
+      'Results were capped. Raise limit (max 500) to retrieve more, or reduce radius_meters and sweep adjacent sub-areas for exhaustive coverage — geosearch offers no pagination past the limit.',
+    );
+  });
+
+  it("names the article's own GeoData coordinates, not Wikidata, in the tool description", () => {
+    expect(wikipediaSearchNearby.description).not.toMatch(/Wikidata record/i);
+    expect(wikipediaSearchNearby.description).toMatch(/GeoData/);
+  });
+});
+
+describe('wikipediaSearchNearby — description and Wikidata QID (issue #52)', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    mockWikipediaService();
+  });
+
+  it('declares and renders description and wikibase_item per result, omitting them when absent', async () => {
+    mockWikipediaService({
+      searchNearby: vi.fn().mockResolvedValue({
+        truncated: false,
+        results: [
+          {
+            title: 'Eiffel Tower',
+            pageid: 9232,
+            latitude: 48.8583,
+            longitude: 2.2945,
+            distance_meters: 0,
+            description: 'Tower in Paris, France',
+            wikibase_item: 'Q243',
+          },
+          // An article whose GeoData tag places it in Paris though it is about a Venice palace —
+          // the description is what exposes the bad coordinate.
+          {
+            title: 'Palazzo Bernardo Nani',
+            pageid: 48435351,
+            latitude: 48.8583,
+            longitude: 2.2923,
+            distance_meters: 161.2,
+            description: 'Palace on the Grand Canal, Venice',
+            wikibase_item: 'Q16585996',
+          },
+          {
+            title: 'Globe Céleste',
+            pageid: 16201796,
+            latitude: 48.8594,
+            longitude: 2.2955,
+            distance_meters: 149.4,
+            wikibase_item: 'Q1468897',
+          },
+          { title: 'Untagged', pageid: 1, latitude: 0, longitude: 0, distance_meters: 400 },
+        ],
+      }),
+    });
+
+    const result = await runToolContract(wikipediaSearchNearby, {
+      latitude: 48.85822222,
+      longitude: 2.2945,
+      radius_meters: 500,
+    });
+
+    expect(result.isError).toBeFalsy();
+    const results = (result.structuredContent as { results: Array<Record<string, unknown>> })
+      .results;
+    expect(results[0]).toMatchObject({
+      description: 'Tower in Paris, France',
+      wikibase_item: 'Q243',
+    });
+    expect(results[1]?.description).toBe('Palace on the Grand Canal, Venice');
+    expect(results[2]).not.toHaveProperty('description');
+    expect(results[2]?.wikibase_item).toBe('Q1468897');
+    expect(results[3]).not.toHaveProperty('description');
+    expect(results[3]).not.toHaveProperty('wikibase_item');
+
+    const text = contentText(result);
+    expect(text).toContain('*Palace on the Grand Canal, Venice*');
+    expect(text).toContain('**Wikidata QID:** Q243');
+    expect(text).toContain('**Wikidata QID:** Q1468897');
+    expect(text).not.toContain('undefined');
   });
 });

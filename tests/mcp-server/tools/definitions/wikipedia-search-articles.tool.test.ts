@@ -3,7 +3,7 @@
  * @module tests/mcp-server/tools/definitions/wikipedia-search-articles.tool.test
  */
 
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { allToolDefinitions } from '@/mcp-server/tools/definitions/index.js';
 import { wikipediaSearchArticles } from '@/mcp-server/tools/definitions/wikipedia-search-articles.tool.js';
@@ -498,5 +498,232 @@ describe('wikipediaSearchArticles', () => {
     expect(text).not.toContain('<script>');
     expect(output.results[0]?.snippet).toBe(snippet);
     expect(output.results[0]?.title).toBe('JSONP <script>');
+  });
+});
+
+/** Every text block of a tool result, joined — the domain render plus the enrichment trailer. */
+function contentText(result: { content: Array<{ type: string; text?: string }> }): string {
+  return result.content
+    .map((block) => (block.type === 'text' ? (block.text ?? '') : ''))
+    .join('\n');
+}
+
+describe('wikipediaSearchArticles — contract path', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    mockWikipediaService();
+  });
+
+  it('renders a result on both surfaces (characterization)', async () => {
+    mockWikipediaService({
+      search: vi.fn().mockResolvedValue({
+        results: [{ title: 'Python', pageid: 24, snippet: 'A genus of snakes.', wordcount: 1200 }],
+        totalResults: 40,
+        nextOffset: 1,
+      }),
+    });
+
+    const result = await runToolContract(wikipediaSearchArticles, { query: 'Python', limit: 1 });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      results: [{ title: 'Python', pageid: 24, snippet: 'A genus of snakes.', wordcount: 1200 }],
+      language: 'en',
+      effectiveQuery: 'Python',
+      totalCount: 40,
+      offset: 0,
+      shown: 1,
+      nextOffset: 1,
+    });
+    const text = contentText(result);
+    expect(text).toContain('### Python');
+    expect(text).toContain('**Page ID:** 24 | **Words:** 1200');
+    expect(text).toContain('A genus of snakes.');
+  });
+});
+
+describe('wikipediaSearchArticles — spelling suggestion (issue #51)', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    mockWikipediaService();
+  });
+
+  it('names the suggestion in the zero-hit notice and carries it as enrichment', async () => {
+    mockWikipediaService({
+      search: vi.fn().mockResolvedValue({
+        results: [],
+        totalResults: 0,
+        suggestion: 'albert einstein relativity',
+      }),
+    });
+
+    const result = await runToolContract(wikipediaSearchArticles, {
+      query: 'albert einstien relativty',
+    });
+
+    const structured = result.structuredContent as Record<string, unknown>;
+    expect(structured.suggestion).toBe('albert einstein relativity');
+    expect(structured.notice).toBe(
+      'No Wikipedia articles found for "albert einstien relativty" in language "en". Try different keywords or a broader query. Did you mean "albert einstein relativity"? Re-run with that query.',
+    );
+    const text = contentText(result);
+    expect(text).toContain('**Did you mean:** albert einstein relativity');
+    expect(text).toContain('Did you mean "albert einstein relativity"?');
+  });
+
+  it('carries the suggestion on a non-empty page without adding a notice', async () => {
+    mockWikipediaService({
+      search: vi.fn().mockResolvedValue({
+        results: [
+          { title: 'Albert Einstein', pageid: 736, snippet: 'Physicist.', wordcount: 20000 },
+        ],
+        totalResults: 8,
+        suggestion: 'einstein',
+      }),
+    });
+
+    const result = await runToolContract(wikipediaSearchArticles, { query: 'einstien' });
+
+    const structured = result.structuredContent as Record<string, unknown>;
+    expect(structured.suggestion).toBe('einstein');
+    expect(structured.notice).toBeUndefined();
+    expect(contentText(result)).toContain('**Did you mean:** einstein');
+  });
+
+  it('leaves the end-of-results notice alone past offset 0 even when a suggestion arrives', async () => {
+    mockWikipediaService({
+      search: vi.fn().mockResolvedValue({
+        results: [],
+        totalResults: 8,
+        suggestion: 'einstein',
+      }),
+    });
+
+    const result = await runToolContract(wikipediaSearchArticles, {
+      query: 'einstien',
+      offset: 20,
+    });
+
+    const structured = result.structuredContent as Record<string, unknown>;
+    expect(structured.notice).toContain('end of the result set');
+    expect(structured.notice).not.toContain('Did you mean');
+    // The field itself still rides along — only the notice ignores it past offset 0.
+    expect(structured.suggestion).toBe('einstein');
+  });
+
+  it('adds no suggestion field and keeps the zero-hit notice unchanged when upstream sends none', async () => {
+    mockWikipediaService({
+      search: vi.fn().mockResolvedValue({ results: [], totalResults: 0 }),
+    });
+
+    const result = await runToolContract(wikipediaSearchArticles, { query: 'xyzzy' });
+
+    const structured = result.structuredContent as Record<string, unknown>;
+    expect(structured).not.toHaveProperty('suggestion');
+    expect(structured.notice).toBe(
+      'No Wikipedia articles found for "xyzzy" in language "en". Try different keywords or a broader query.',
+    );
+  });
+});
+
+describe('wikipediaSearchArticles — description and Wikidata QID (issue #52)', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    mockWikipediaService();
+  });
+
+  it('declares and renders description and wikibase_item per result, omitting them when absent', async () => {
+    mockWikipediaService({
+      search: vi.fn().mockResolvedValue({
+        results: [
+          {
+            title: 'Python (programming language)',
+            pageid: 23862,
+            snippet: 'A high-level language.',
+            wordcount: 5000,
+            description: 'General-purpose programming language',
+            wikibase_item: 'Q28865',
+          },
+          // Sparse: a QID but no short description (the service maps upstream's empty one to absent).
+          {
+            title: 'List of Python software',
+            pageid: 3673376,
+            snippet: 'Software written in Python.',
+            wordcount: 900,
+            wikibase_item: 'Q6595251',
+          },
+          // Sparsest: neither field.
+          { title: 'Pythonidae', pageid: 99, snippet: 'Snakes.', wordcount: 800 },
+        ],
+        totalResults: 3,
+      }),
+    });
+
+    const result = await runToolContract(wikipediaSearchArticles, { query: 'Python' });
+
+    expect(result.isError).toBeFalsy();
+    const results = (result.structuredContent as { results: Array<Record<string, unknown>> })
+      .results;
+    expect(results[0]).toMatchObject({
+      description: 'General-purpose programming language',
+      wikibase_item: 'Q28865',
+    });
+    expect(results[1]).not.toHaveProperty('description');
+    expect(results[1]?.wikibase_item).toBe('Q6595251');
+    expect(results[2]).not.toHaveProperty('description');
+    expect(results[2]).not.toHaveProperty('wikibase_item');
+
+    const text = contentText(result);
+    expect(text).toContain('*General-purpose programming language*');
+    expect(text).toContain('**Wikidata QID:** Q28865');
+    expect(text).toContain('**Wikidata QID:** Q6595251');
+    expect(text).not.toContain('undefined');
+    // No notice: the lookup succeeded, and a missing description is upstream's own absence.
+    expect((result.structuredContent as Record<string, unknown>).notice).toBeUndefined();
+  });
+
+  it('keeps the results and says descriptions could not be loaded when the lookup failed', async () => {
+    mockWikipediaService({
+      search: vi.fn().mockResolvedValue({
+        results: [{ title: 'Python', pageid: 24, snippet: 'Snakes.', wordcount: 1200 }],
+        totalResults: 40,
+        nextOffset: 1,
+        descriptionsUnavailable: true,
+      }),
+    });
+
+    const result = await runToolContract(wikipediaSearchArticles, { query: 'Python', limit: 1 });
+
+    expect(result.isError).toBeFalsy();
+    const structured = result.structuredContent as Record<string, unknown>;
+    expect((structured.results as unknown[]).length).toBe(1);
+    expect(structured.notice).toContain('Descriptions and Wikidata QIDs could not be loaded');
+    expect(contentText(result)).toContain('Descriptions and Wikidata QIDs could not be loaded');
+  });
+
+  it('emits one notice carrying both the window cut and the failed lookup', async () => {
+    mockWikipediaService({
+      search: vi.fn().mockResolvedValue({
+        results: Array.from({ length: 10 }, (_, i) => ({
+          title: `R${i}`,
+          pageid: i,
+          snippet: 'S',
+          wordcount: 10,
+        })),
+        totalResults: 13441,
+        nextOffset: undefined,
+        descriptionsUnavailable: true,
+      }),
+    });
+
+    const result = await runToolContract(wikipediaSearchArticles, {
+      query: 'Python',
+      offset: 9990,
+    });
+
+    const structured = result.structuredContent as Record<string, unknown>;
+    expect(structured.truncated).toBe(true);
+    expect(structured.notice).toContain('10,000');
+    expect(structured.notice).toContain('Descriptions and Wikidata QIDs could not be loaded');
   });
 });

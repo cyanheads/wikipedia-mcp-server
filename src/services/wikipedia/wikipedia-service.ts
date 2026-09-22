@@ -19,6 +19,8 @@ import type {
   ActionExtractsRaw,
   ActionGeoSearchRaw,
   ActionLangLinksRaw,
+  ActionPageMetaQueryRaw,
+  ActionPageMetaRaw,
   ActionParseTextRaw,
   ActionSearchRaw,
   ActionSectionsRaw,
@@ -742,6 +744,35 @@ export const SEARCH_RESULT_WINDOW = 10_000;
 /** {@link SEARCH_RESULT_WINDOW} written the way every user-facing message spells it. */
 const SEARCH_RESULT_WINDOW_LABEL = SEARCH_RESULT_WINDOW.toLocaleString('en-US');
 
+/**
+ * Per-request timeout for the search results' description lookup. The lookup is best-effort and
+ * runs after the search has already succeeded, so it gets one short attempt rather than the default
+ * 15 s with retries — a stalled lookup must not hold back results that are ready.
+ */
+const PAGE_META_TIMEOUT_MS = 5_000;
+
+/** A result's short description and Wikidata QID, each present only when upstream has one. */
+type PageMeta = { description?: string; wikibase_item?: string };
+
+/**
+ * Index `prop=description|pageprops` entries by pageid.
+ *
+ * An empty `description` is how upstream reports a short description explicitly set to "none"
+ * (`List of Python software`), so it maps to an absent field rather than an empty one.
+ */
+function pageMetaById(pages: ActionPageMetaRaw[] | undefined): Map<number, PageMeta> {
+  const byId = new Map<number, PageMeta>();
+  for (const page of pages ?? []) {
+    if (page.pageid === undefined) continue;
+    const qid = page.pageprops?.wikibase_item;
+    byId.set(page.pageid, {
+      ...(page.description && { description: page.description }),
+      ...(qid && { wikibase_item: qid }),
+    });
+  }
+  return byId;
+}
+
 function assertStructuralLanguage(language: string): void {
   if (isMalformedLanguage(language)) {
     throw validationError(
@@ -1007,11 +1038,15 @@ export class WikipediaService {
     );
   }
 
-  /** GET from the Action API (`/w/api.php`). */
+  /**
+   * GET from the Action API (`/w/api.php`). `options` narrows the per-attempt timeout and retry
+   * count for a best-effort call; omitted, the request gets the defaults every other call uses.
+   */
   async actionGet<T>(
     language: string,
     params: Record<string, string>,
     ctx: ServiceContext,
+    options: { timeoutMs?: number; maxRetries?: number } = {},
   ): Promise<T> {
     const base = await this.resolveBaseUrl(language, ctx);
     const qs = new URLSearchParams({ format: 'json', formatversion: '2', ...params }).toString();
@@ -1020,6 +1055,7 @@ export class WikipediaService {
       'WikipediaService.actionGet',
       'Action API',
       ctx,
+      options,
     );
   }
 
@@ -1252,6 +1288,12 @@ export class WikipediaService {
    * The `error` envelope is read before the payload: it arrives on HTTP 200, so reading
    * `raw.query` first renders an upstream refusal — an unset `srsearch`, an offset past the search
    * window — as a successful empty result indistinguishable from a real answer.
+   *
+   * `suggestion` is CirrusSearch's spelling correction, which `srinfo`'s default already requests
+   * on every page — empty or not. Each result's `description` and `wikibase_item` come from a
+   * separate {@link lookupPageMeta} call, because `list=search` cannot return page props and
+   * `generator=search` drops `snippet` and `wordcount`. `descriptionsUnavailable` is true only when
+   * that lookup was attempted and failed; the results are returned either way.
    */
   async search(
     query: string,
@@ -1260,9 +1302,13 @@ export class WikipediaService {
     ctx: ServiceContext,
     offset = 0,
   ): Promise<{
-    results: Array<{ title: string; pageid: number; snippet: string; wordcount: number }>;
+    results: Array<
+      { title: string; pageid: number; snippet: string; wordcount: number } & PageMeta
+    >;
     totalResults: number;
     nextOffset: number | undefined;
+    suggestion?: string;
+    descriptionsUnavailable: boolean;
   }> {
     const raw = await this.actionGet<ActionSearchRaw>(
       language,
@@ -1290,11 +1336,67 @@ export class WikipediaService {
         wordcount: r.wordcount ?? 0,
       })) ?? [];
 
+    const meta =
+      results.length > 0
+        ? await this.lookupPageMeta(
+            results.map((r) => r.pageid),
+            language,
+            ctx,
+          )
+        : new Map<number, PageMeta>();
+    const suggestion = raw.query?.searchinfo?.suggestion;
+
     return {
-      results,
+      // Merged by pageid: the lookup answers in pageid order, and the search ranking must survive.
+      results: meta ? results.map((r) => ({ ...r, ...meta.get(r.pageid) })) : results,
       totalResults: raw.query?.searchinfo?.totalhits ?? results.length,
       nextOffset: raw.continue?.sroffset,
+      ...(suggestion && { suggestion }),
+      descriptionsUnavailable: meta === undefined,
     };
+  }
+
+  /**
+   * Best-effort short description and Wikidata QID for a page of search results, keyed by pageid.
+   *
+   * One request covers a full page: `pageids` accepts 50 values from an anonymous caller, which is
+   * {@link SEARCH_MAX_LIMIT}. It runs once with a short timeout and no retries, and returns
+   * `undefined` on any failure — a transport error or an Action API `error` envelope — so a
+   * degraded lookup costs the caller the two fields, never the search. A caller cancellation is
+   * not a lookup failure: it propagates, as it would from the search request itself.
+   */
+  private async lookupPageMeta(
+    pageids: number[],
+    language: string,
+    ctx: ServiceContext,
+  ): Promise<Map<number, PageMeta> | undefined> {
+    const degrade = (detail: string): undefined => {
+      logger.warning(
+        'Wikipedia description lookup failed; returning search results without descriptions.',
+        withExtra(ctx, { error: detail }),
+      );
+      return;
+    };
+
+    let raw: ActionPageMetaQueryRaw;
+    try {
+      raw = await this.actionGet<ActionPageMetaQueryRaw>(
+        language,
+        {
+          action: 'query',
+          pageids: pageids.join('|'),
+          prop: 'description|pageprops',
+          ppprop: 'wikibase_item',
+        },
+        ctx,
+        { timeoutMs: PAGE_META_TIMEOUT_MS, maxRetries: 0 },
+      );
+    } catch (err) {
+      if (ctx.signal?.aborted) throw err;
+      return degrade(err instanceof Error ? err.message : String(err));
+    }
+    if (raw.error) return degrade(raw.error.info ?? raw.error.code ?? 'unknown API error');
+    return pageMetaById(raw.query?.pages);
   }
 
   /** Fetch full article plain text via Action API extracts. */
@@ -1555,6 +1657,14 @@ export class WikipediaService {
    * so a match count landing exactly on `limit` is not misreported as truncated. At the upstream
    * ceiling there is no room to probe, and a full page is reported as truncated — nothing further
    * is retrievable there either way.
+   *
+   * Coordinates and distances are the GeoData tag set on each article itself, not Wikidata's
+   * coordinate. Each result's `description` and `wikibase_item` come from the same geosearch run
+   * again as a generator in this one request, merged by pageid. The list stays the source of the
+   * result set: the generator alone answers in pageid order, and its `coordinates` prop rounds to
+   * eight decimals and needs `colimit=max` to report a distance past the tenth page — re-sorting it
+   * reproduces the distances but reorders equal-distance ties, which changes which tied article
+   * survives the cap.
    */
   async searchNearby(
     latitude: number,
@@ -1564,32 +1674,45 @@ export class WikipediaService {
     language: string,
     ctx: ServiceContext,
   ): Promise<{
-    results: Array<{
-      title: string;
-      pageid: number;
-      latitude: number;
-      longitude: number;
-      distance_meters: number;
-    }>;
+    results: Array<
+      {
+        title: string;
+        pageid: number;
+        latitude: number;
+        longitude: number;
+        distance_meters: number;
+      } & PageMeta
+    >;
     truncated: boolean;
   }> {
     const cap = Math.min(Math.max(limit, 1), GEOSEARCH_MAX_LIMIT);
     const probe = Math.min(cap + 1, GEOSEARCH_MAX_LIMIT);
+    const coord = `${latitude}|${longitude}`;
+    const radius = String(Math.min(radiusMeters, GEOSEARCH_MAX_RADIUS_METERS));
 
     const raw = await this.actionGet<ActionGeoSearchRaw>(
       language,
       {
         action: 'query',
         list: 'geosearch',
-        gscoord: `${latitude}|${longitude}`,
-        gsradius: String(Math.min(radiusMeters, GEOSEARCH_MAX_RADIUS_METERS)),
+        gscoord: coord,
+        gsradius: radius,
         gslimit: String(probe),
+        // The same search again as a generator, selecting the list's page set with its props. A
+        // page the generator does not return simply carries neither field.
+        generator: 'geosearch',
+        ggscoord: coord,
+        ggsradius: radius,
+        ggslimit: String(probe),
+        prop: 'description|pageprops',
+        ppprop: 'wikibase_item',
       },
       ctx,
     );
 
     if (raw.error) throw actionApiError(raw.error, language);
 
+    const meta = pageMetaById(raw.query?.pages);
     const matches =
       raw.query?.geosearch?.map((r) => ({
         title: r.title,
@@ -1597,6 +1720,7 @@ export class WikipediaService {
         latitude: r.lat,
         longitude: r.lon,
         distance_meters: r.dist,
+        ...meta.get(r.pageid),
       })) ?? [];
 
     return {

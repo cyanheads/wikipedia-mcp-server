@@ -17,14 +17,20 @@ import {
 /**
  * Truncation guidance for a list with no pagination behind it. MediaWiki's geosearch module has no
  * `offset` or `continue`, and this tool has no filter parameters, so the only routes to the omitted
- * articles are a higher `limit` or several narrower searches.
+ * articles are a higher `limit` or several narrower searches — and at the ceiling, only the latter.
+ * `truncated` itself is reported the same either way: at the ceiling there is no room to probe past
+ * the cap, so a full page is reported as capped.
  */
-const TRUNCATION_GUIDANCE = `Results were capped. Raise limit (max ${GEOSEARCH_MAX_LIMIT}) to retrieve more, or reduce radius_meters and sweep adjacent sub-areas for exhaustive coverage — geosearch offers no pagination past the limit.`;
+function truncationGuidance(limit: number): string {
+  return limit >= GEOSEARCH_MAX_LIMIT
+    ? `Results were capped at Wikipedia's ${GEOSEARCH_MAX_LIMIT}-result ceiling; more matches may exist. Reduce radius_meters and sweep adjacent sub-areas for exhaustive coverage — geosearch offers no pagination past the limit.`
+    : `Results were capped. Raise limit (max ${GEOSEARCH_MAX_LIMIT}) to retrieve more, or reduce radius_meters and sweep adjacent sub-areas for exhaustive coverage — geosearch offers no pagination past the limit.`;
+}
 
 export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
   title: 'Search Wikipedia Nearby',
   description:
-    'Find Wikipedia articles about places near a geographic coordinate. Returns articles sorted by distance from the query point, with titles, page IDs, coordinates, and distance in meters. Useful for "what is notable near X?" research workflows. Only articles with geographic coordinates in their Wikidata record are returned — not all articles about locations are geotagged.',
+    'Find Wikipedia articles about places near a geographic coordinate. Returns articles sorted by distance from the query point, with titles, short descriptions, Wikidata QIDs, page IDs, coordinates, and distance in meters. Useful for "what is notable near X?" research workflows. Only articles carrying their own coordinate tag (GeoData, set on the article itself — not the Wikidata item\'s coordinate) are returned, and that tag is what places and measures each result; not all articles about locations are geotagged, and an article whose tag is wrong appears where the tag puts it, which its description usually makes plain.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     latitude: z.number().describe('WGS 84 latitude in decimal degrees (range: −90 to 90).'),
@@ -62,9 +68,25 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
               .describe(
                 'Stable numeric Wikipedia page ID — a durable reference for cross-referencing or de-duplication. Not a tool input; pass the title to follow-up tools.',
               ),
-            latitude: z.number().describe('Article subject latitude in decimal degrees.'),
-            longitude: z.number().describe('Article subject longitude in decimal degrees.'),
+            latitude: z
+              .number()
+              .describe("Latitude of the article's own coordinate tag, in decimal degrees."),
+            longitude: z
+              .number()
+              .describe("Longitude of the article's own coordinate tag, in decimal degrees."),
             distance_meters: z.number().describe('Distance from the query coordinate in meters.'),
+            description: z
+              .string()
+              .optional()
+              .describe(
+                'Short description of the article subject (e.g. "Tower in Paris, France"). Absent when the article has none.',
+              ),
+            wikibase_item: z
+              .string()
+              .optional()
+              .describe(
+                'Wikidata QID (e.g. "Q243") for chaining into wikidata-mcp-server. Absent when the article has no Wikidata item.',
+              ),
           })
           .describe('A single geotagged article result.'),
       )
@@ -81,7 +103,7 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
     truncated: z
       .boolean()
       .describe(
-        'True when more articles matched than the limit allowed. Established by probing one result past the limit, so a match count landing exactly on the limit reports false.',
+        'True when more articles matched than the limit allowed. Established by probing one result past the limit, so a match count landing exactly on the limit reports false — except at the 500 ceiling, where no probe is possible and any full page reports true.',
       ),
     shown: z.number().describe('Number of results returned.'),
     cap: z.number().describe('The limit that was applied.'),
@@ -89,7 +111,7 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
       .string()
       .optional()
       .describe(
-        'Guidance when results were capped (raise limit or sweep narrower radii) or when no geotagged articles were found (increase radius). Absent when neither applies.',
+        'Guidance when results were capped (raise limit, or — at the 500 ceiling — sweep narrower radii) or when no geotagged articles were found (increase radius). Absent when neither applies.',
       ),
   },
 
@@ -174,7 +196,11 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
       radiusMetersUsed: radiusMeters,
     });
     if (truncated) {
-      ctx.enrich.truncated({ shown: results.length, cap: limit, guidance: TRUNCATION_GUIDANCE });
+      ctx.enrich.truncated({
+        shown: results.length,
+        cap: limit,
+        guidance: truncationGuidance(limit),
+      });
     } else {
       ctx.enrich({ shown: results.length, cap: limit, truncated: false });
     }
@@ -195,8 +221,9 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
     const lines: string[] = [`**${result.results.length} articles** (${result.language})\n`];
     for (const item of result.results) {
       lines.push(`### ${escapeMarkdown(item.title)}`);
+      if (item.description) lines.push(`*${escapeMarkdown(item.description)}*`);
       lines.push(
-        `**Page ID:** ${item.pageid} | **Distance:** ${item.distance_meters}m | **Coords:** (${item.latitude}, ${item.longitude})`,
+        `**Page ID:** ${item.pageid} | **Distance:** ${item.distance_meters}m | **Coords:** (${item.latitude}, ${item.longitude})${item.wikibase_item ? ` | **Wikidata QID:** ${item.wikibase_item}` : ''}`,
       );
     }
     return [{ type: 'text', text: lines.join('\n') }];

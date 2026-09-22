@@ -19,7 +19,7 @@ const WINDOW = SEARCH_RESULT_WINDOW.toLocaleString('en-US');
 export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
   title: 'Search Wikipedia',
   description:
-    'Search Wikipedia articles by full-text query. Returns ranked results with plain-text titles, snippets (HTML stripped), page IDs, and word counts. Best when the exact article title is unknown or when multiple articles on a topic are needed. Pass a result title to wikipedia_get_summary, wikipedia_get_article, or wikipedia_get_sections for follow-up reads. Use offset to page beyond the first result page. Supports all Wikipedia language editions.',
+    'Search Wikipedia articles by full-text query. Returns ranked results with plain-text titles, short descriptions, Wikidata QIDs, snippets (HTML stripped), page IDs, and word counts — the description is usually enough to tell same-named articles apart without a summary call per result. When Wikipedia has a spelling correction for the query, it is returned as suggestion. Best when the exact article title is unknown or when multiple articles on a topic are needed. Pass a result title to wikipedia_get_summary, wikipedia_get_article, or wikipedia_get_sections for follow-up reads. Use offset to page beyond the first result page. Supports all Wikipedia language editions.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     query: z
@@ -60,6 +60,18 @@ export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
               ),
             snippet: z.string().describe('Plain-text search snippet with matched terms.'),
             wordcount: z.number().describe('Article word count.'),
+            description: z
+              .string()
+              .optional()
+              .describe(
+                'Short description of the article subject (e.g. "General-purpose programming language"). Absent when the article has none, or when descriptions could not be loaded for the page (see notice).',
+              ),
+            wikibase_item: z
+              .string()
+              .optional()
+              .describe(
+                'Wikidata QID (e.g. "Q28865") for chaining into wikidata-mcp-server. Absent when the article has no Wikidata item, or when it could not be loaded for the page (see notice).',
+              ),
           })
           .describe('A single search result entry.'),
       )
@@ -97,12 +109,21 @@ export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
       .describe(
         'The result ceiling that cut this page — the search window. Present only alongside truncated.',
       ),
+    suggestion: z
+      .string()
+      .optional()
+      .describe(
+        'Wikipedia\'s spelling correction for the query, when it has one (e.g. "einstein" for "einstien"). Re-run with it as query to search the corrected spelling. Absent when the query has no likely misspelling.',
+      ),
     notice: z
       .string()
       .optional()
       .describe(
-        'Guidance when no results matched, when the end of results was reached while paging, or when the page was cut at the search window. Absent on ordinary result pages.',
+        'Guidance when no results matched (naming the spelling suggestion when there is one), when the end of results was reached while paging, when the page was cut at the search window, or when descriptions and Wikidata QIDs could not be loaded for the page. Absent on ordinary result pages.',
       ),
+  },
+  enrichmentTrailer: {
+    suggestion: { label: 'Did you mean' },
   },
 
   errors: [
@@ -178,13 +199,8 @@ export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
       language,
     });
 
-    const { results, totalResults, nextOffset } = await svc.search(
-      input.query,
-      limit,
-      language,
-      ctx,
-      input.offset,
-    );
+    const { results, totalResults, nextOffset, suggestion, descriptionsUnavailable } =
+      await svc.search(input.query, limit, language, ctx, input.offset);
 
     ctx.enrich.echo(input.query);
     ctx.enrich.total(totalResults);
@@ -192,13 +208,22 @@ export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
       offset: input.offset,
       shown: results.length,
       ...(nextOffset != null ? { nextOffset } : {}),
+      ...(suggestion ? { suggestion } : {}),
     });
 
+    // `notice` is last-wins, so every condition that has something to say contributes a segment
+    // and the page carries them as one notice.
+    const notices: string[] = [];
     if (results.length === 0) {
-      ctx.enrich.notice(
+      notices.push(
         input.offset > 0
           ? `No results at offset ${input.offset} for "${input.query}" in language "${language}"${totalResults ? ` (total matches: ${totalResults})` : ''}. The end of the result set was reached — lower the offset to page back.`
-          : `No Wikipedia articles found for "${input.query}" in language "${language}". Try different keywords or a broader query.`,
+          : `No Wikipedia articles found for "${input.query}" in language "${language}". Try different keywords or a broader query.${suggestion ? ` Did you mean "${suggestion}"? Re-run with that query.` : ''}`,
+      );
+    }
+    if (descriptionsUnavailable) {
+      notices.push(
+        'Descriptions and Wikidata QIDs could not be loaded for this page, so results carry neither. wikipedia_get_summary returns both for any one title, or re-run the search to retry.',
       );
     }
 
@@ -210,8 +235,13 @@ export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
       ctx.enrich.truncated({
         shown: results.length,
         cap: SEARCH_RESULT_WINDOW,
-        guidance: `Wikipedia serves at most ${WINDOW} results per query, and this page ends there. ${totalResults - reached} further matches exist but no offset reaches them — narrow the query with more specific terms to bring them into the first ${WINDOW}.`,
+        guidance: [
+          `Wikipedia serves at most ${WINDOW} results per query, and this page ends there. ${totalResults - reached} further matches exist but no offset reaches them — narrow the query with more specific terms to bring them into the first ${WINDOW}.`,
+          ...notices,
+        ].join(' '),
       });
+    } else if (notices.length > 0) {
+      ctx.enrich.notice(notices.join(' '));
     }
 
     ctx.log.info('Search complete', {
@@ -220,6 +250,7 @@ export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
       offset: input.offset,
       nextOffset,
       language,
+      descriptionsUnavailable,
     });
 
     return { results, language };
@@ -230,7 +261,10 @@ export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
     const lines: string[] = [`**${result.results.length} results** (${result.language})\n`];
     for (const item of result.results) {
       lines.push(`### ${escapeMarkdown(item.title)}`);
-      lines.push(`**Page ID:** ${item.pageid} | **Words:** ${item.wordcount}`);
+      if (item.description) lines.push(`*${escapeMarkdown(item.description)}*`);
+      lines.push(
+        `**Page ID:** ${item.pageid} | **Words:** ${item.wordcount}${item.wikibase_item ? ` | **Wikidata QID:** ${item.wikibase_item}` : ''}`,
+      );
       if (item.snippet) lines.push(escapeMarkdown(item.snippet));
     }
     return [{ type: 'text', text: lines.join('\n') }];

@@ -7,7 +7,7 @@
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createFetchMock, createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { logger } from '@cyanheads/mcp-ts-core/utils';
 import { beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import {
@@ -2621,5 +2621,416 @@ describe('WikipediaService — invalid page entries and titles (issue #42)', () 
     await expect(svc.getArticleSection('A{b}', 1, 'en', ctx)).rejects.toMatchObject({
       data: { reason: 'invalid_title' },
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issues #51 / #52 — spelling suggestion, and description + QID per search/nearby result
+// ---------------------------------------------------------------------------
+
+const EN_ORIGIN = 'https://en.wikipedia.org';
+
+/** The Action API query parameters of a request to the English edition, or undefined otherwise. */
+function enActionParams(request: Request): URLSearchParams | undefined {
+  const url = new URL(request.url);
+  return url.origin === EN_ORIGIN && url.pathname === '/w/api.php' ? url.searchParams : undefined;
+}
+
+/**
+ * Install a strict fetch fake for one test, routing the `list=search` call and the `pageids=`
+ * follow-up separately. Both go through the real `apiGet` → `withRetry` → `fetchWithTimeout`
+ * path, so the follow-up's retry policy is what actually runs.
+ */
+function stubSearchFetch(
+  search: Record<string, unknown>,
+  followUp: () => Response,
+): ReturnType<typeof createFetchMock> {
+  const http = createFetchMock([
+    {
+      match: (request) => enActionParams(request)?.get('list') === 'search',
+      respond: () => Response.json(search),
+    },
+    {
+      match: (request) => enActionParams(request)?.has('pageids') === true,
+      respond: followUp,
+    },
+  ]);
+  http.install();
+  onTestFinished(() => {
+    http.restore();
+  });
+  return http;
+}
+
+const followUpCalls = (http: ReturnType<typeof createFetchMock>) =>
+  http.calls.filter((call) => enActionParams(call.request)?.has('pageids'));
+
+describe('WikipediaService.search — spelling suggestion (issue #51)', () => {
+  beforeEach(() => {
+    initService();
+  });
+
+  it('returns the suggestion upstream computes for a zero-hit query', async () => {
+    const svc = getWikipediaService();
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
+      query: {
+        searchinfo: {
+          totalhits: 0,
+          suggestion: 'albert einstein relativity',
+          suggestionsnippet: 'albert <em>einstein relativity</em>',
+        },
+        search: [],
+      },
+    });
+
+    const result = await svc.search('albert einstien relativty', 10, 'en', createMockContext());
+    expect(result.suggestion).toBe('albert einstein relativity');
+  });
+
+  it('returns the suggestion on a non-empty page too', async () => {
+    const svc = getWikipediaService();
+    stubSearchFetch(
+      {
+        query: {
+          searchinfo: { totalhits: 8, suggestion: 'einstein' },
+          search: [{ title: 'Albert Einstein', pageid: 736, snippet: 'S', wordcount: 10 }],
+        },
+      },
+      () => Response.json({ query: { pages: [{ pageid: 736, title: 'Albert Einstein' }] } }),
+    );
+
+    const result = await svc.search('einstien', 10, 'en', createMockContext());
+    expect(result.results).toHaveLength(1);
+    expect(result.suggestion).toBe('einstein');
+  });
+
+  it('omits the suggestion when upstream sends none', async () => {
+    const svc = getWikipediaService();
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
+      query: { searchinfo: { totalhits: 0 }, search: [] },
+    });
+
+    const result = await svc.search('Albert Einstein', 10, 'en', createMockContext());
+    expect(result).not.toHaveProperty('suggestion');
+  });
+});
+
+describe('WikipediaService.search — description and QID follow-up (issue #52)', () => {
+  beforeEach(() => {
+    initService();
+  });
+
+  /** A ranked page whose order differs from pageid order, so a merge by position would be wrong. */
+  const rankedSearch = {
+    query: {
+      searchinfo: { totalhits: 4 },
+      search: [
+        { title: 'Pythonidae', pageid: 300, snippet: 'Snakes', wordcount: 800 },
+        { title: 'Python (programming language)', pageid: 23862, snippet: 'Lang', wordcount: 5000 },
+        { title: 'List of Python software', pageid: 3673376, snippet: 'List', wordcount: 900 },
+        { title: 'Deleted since indexing', pageid: 77, snippet: 'Gone', wordcount: 1 },
+      ],
+    },
+    continue: { sroffset: 4 },
+  };
+
+  it('merges description and wikibase_item by pageid, keeping the search ranking', async () => {
+    const svc = getWikipediaService();
+    const http = stubSearchFetch(rankedSearch, () =>
+      // Upstream answers in pageid order, not ranking order, and each record varies in shape.
+      Response.json({
+        batchcomplete: true,
+        query: {
+          pages: [
+            { pageid: 77, missing: true },
+            {
+              pageid: 300,
+              title: 'Pythonidae',
+              description: 'Family of snakes',
+              descriptionsource: 'local',
+              pageprops: { wikibase_item: 'Q2717' },
+            },
+            {
+              pageid: 23862,
+              title: 'Python (programming language)',
+              description: 'General-purpose programming language',
+              descriptionsource: 'local',
+              pageprops: { wikibase_item: 'Q28865' },
+            },
+            {
+              // A page whose short description is explicitly "none" arrives as an empty string.
+              pageid: 3673376,
+              title: 'List of Python software',
+              description: '',
+              descriptionsource: 'local',
+              pageprops: { wikibase_item: 'Q6595251' },
+            },
+          ],
+        },
+      }),
+    );
+
+    const result = await svc.search('python', 4, 'en', createMockContext());
+
+    expect(result.results.map((r) => r.pageid)).toEqual([300, 23862, 3673376, 77]);
+    expect(result.results[0]).toEqual({
+      title: 'Pythonidae',
+      pageid: 300,
+      snippet: 'Snakes',
+      wordcount: 800,
+      description: 'Family of snakes',
+      wikibase_item: 'Q2717',
+    });
+    expect(result.results[1]).toMatchObject({
+      description: 'General-purpose programming language',
+      wikibase_item: 'Q28865',
+    });
+    expect(result.results[2]).not.toHaveProperty('description');
+    expect(result.results[2]?.wikibase_item).toBe('Q6595251');
+    expect(result.results[3]).toEqual({
+      title: 'Deleted since indexing',
+      pageid: 77,
+      snippet: 'Gone',
+      wordcount: 1,
+    });
+    // Existing fields are untouched by the merge.
+    expect(result.totalResults).toBe(4);
+    expect(result.nextOffset).toBe(4);
+    expect(result.descriptionsUnavailable).toBe(false);
+
+    const [lookup] = followUpCalls(http);
+    const params = lookup ? enActionParams(lookup.request) : undefined;
+    expect(params?.get('pageids')).toBe('300|23862|3673376|77');
+    expect(params?.get('prop')).toBe('description|pageprops');
+    expect(params?.get('ppprop')).toBe('wikibase_item');
+    expect(params?.get('action')).toBe('query');
+  });
+
+  it('skips the lookup on an empty page', async () => {
+    const svc = getWikipediaService();
+    const http = stubSearchFetch({ query: { searchinfo: { totalhits: 12 }, search: [] } }, () =>
+      Response.json({ query: { pages: [] } }),
+    );
+
+    const result = await svc.search('python', 10, 'en', createMockContext(), 9999);
+    expect(result.results).toHaveLength(0);
+    expect(http.calls).toHaveLength(1);
+    expect(followUpCalls(http)).toHaveLength(0);
+    expect(result.descriptionsUnavailable).toBe(false);
+  });
+
+  it('returns the results without the fields, once and without retrying, when the lookup fails', async () => {
+    const svc = getWikipediaService();
+    const warnings = captureWarnings();
+    const http = stubSearchFetch(
+      rankedSearch,
+      () => new Response('upstream overloaded', { status: 503 }),
+    );
+
+    const result = await svc.search('python', 4, 'en', createMockContext());
+
+    expect(followUpCalls(http)).toHaveLength(1);
+    expect(result.results.map((r) => r.pageid)).toEqual([300, 23862, 3673376, 77]);
+    for (const r of result.results) {
+      expect(r).not.toHaveProperty('description');
+      expect(r).not.toHaveProperty('wikibase_item');
+    }
+    expect(result.totalResults).toBe(4);
+    expect(result.descriptionsUnavailable).toBe(true);
+    expect(warnings).toHaveBeenCalled();
+  });
+
+  it('treats an Action API error envelope on the lookup as a failed lookup', async () => {
+    const svc = getWikipediaService();
+    captureWarnings();
+    const http = stubSearchFetch(rankedSearch, () =>
+      Response.json({ error: { code: 'toomanyvalues', info: 'Too many values supplied.' } }),
+    );
+
+    const result = await svc.search('python', 4, 'en', createMockContext());
+
+    expect(followUpCalls(http)).toHaveLength(1);
+    expect(result.results).toHaveLength(4);
+    expect(result.descriptionsUnavailable).toBe(true);
+  });
+
+  it('treats a malformed JSON body on the lookup as a failed lookup', async () => {
+    const svc = getWikipediaService();
+    captureWarnings();
+    const http = stubSearchFetch(
+      rankedSearch,
+      () => new Response('{"query":{"pages":[', { status: 200 }),
+    );
+
+    const result = await svc.search('python', 4, 'en', createMockContext());
+
+    expect(followUpCalls(http)).toHaveLength(1);
+    expect(result.results.map((r) => r.pageid)).toEqual([300, 23862, 3673376, 77]);
+    expect(result.descriptionsUnavailable).toBe(true);
+  });
+
+  it('propagates a caller cancellation during the lookup instead of degrading', async () => {
+    const svc = getWikipediaService();
+    const warnings = captureWarnings();
+    const controller = new AbortController();
+    stubSearchFetch(rankedSearch, () => {
+      // The caller goes away while the lookup is in flight.
+      controller.abort();
+      throw new DOMException('The operation was aborted.', 'AbortError');
+    });
+
+    await expect(
+      svc.search('python', 4, 'en', createMockContext({ signal: controller.signal })),
+    ).rejects.toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
+    expect(warnings).not.toHaveBeenCalled();
+  });
+
+  it('still fails the search itself when the primary request fails', async () => {
+    const svc = getWikipediaService();
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
+      error: { code: 'internal_api_error', info: 'boom' },
+    });
+
+    await expect(svc.search('python', 4, 'en', createMockContext())).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+    });
+  });
+});
+
+describe('WikipediaService.searchNearby — description and QID (issue #52)', () => {
+  beforeEach(() => {
+    initService();
+  });
+
+  it('queries list=geosearch with the coordinate, radius, and probe limit (characterization)', async () => {
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+    const spy = vi.spyOn(svc, 'actionGet').mockResolvedValue({ query: { geosearch: [] } });
+
+    await svc.searchNearby(48.85822222, 2.2945, 500, 10, 'en', ctx);
+    expect(spy).toHaveBeenCalledWith(
+      'en',
+      expect.objectContaining({
+        action: 'query',
+        list: 'geosearch',
+        gscoord: '48.85822222|2.2945',
+        gsradius: '500',
+        gslimit: '11',
+      }),
+      ctx,
+    );
+  });
+
+  it.each([
+    { limit: 10, probe: '11' },
+    { limit: GEOSEARCH_MAX_LIMIT, probe: String(GEOSEARCH_MAX_LIMIT) },
+  ])(
+    'runs the same geosearch as a generator for page props at limit $limit',
+    async ({ limit, probe }) => {
+      const svc = getWikipediaService();
+      const ctx = createMockContext();
+      const spy = vi.spyOn(svc, 'actionGet').mockResolvedValue({ query: { geosearch: [] } });
+
+      await svc.searchNearby(48.85822222, 2.2945, 20_000, limit, 'en', ctx);
+      const params = spy.mock.calls[0]?.[1] as Record<string, string>;
+      // The generator must select exactly the page set the list returns, or a result loses its props.
+      expect(params.generator).toBe('geosearch');
+      expect(params.ggscoord).toBe(params.gscoord);
+      expect(params.ggsradius).toBe(params.gsradius);
+      expect(params.ggsradius).toBe('10000');
+      expect(params.ggslimit).toBe(params.gslimit);
+      expect(params.ggslimit).toBe(probe);
+      expect(params.prop).toBe('description|pageprops');
+      expect(params.ppprop).toBe('wikibase_item');
+    },
+  );
+
+  it('merges props onto the distance-ordered list by pageid, trimming the probe', async () => {
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+    // Ties at the cap boundary, props in pageid order, and one record of each sparsity shape.
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
+      batchcomplete: true,
+      query: {
+        geosearch: [
+          { pageid: 9232, ns: 0, title: 'Eiffel Tower', lat: 48.8583, lon: 2.2945, dist: 0 },
+          { pageid: 16201796, ns: 0, title: 'Globe Céleste', lat: 48.859, lon: 2.295, dist: 149.4 },
+          {
+            pageid: 48435351,
+            ns: 0,
+            title: 'Palazzo Bernardo Nani',
+            lat: 48.8583,
+            lon: 2.2923,
+            dist: 161.2,
+          },
+          {
+            pageid: 27288389,
+            ns: 0,
+            title: 'Champ de Mars massacre',
+            lat: 48.85,
+            lon: 2.29,
+            dist: 365.7,
+          },
+          { pageid: 212301, ns: 0, title: 'Champ de Mars', lat: 48.85, lon: 2.29, dist: 365.7 },
+        ],
+        pages: [
+          {
+            pageid: 9232,
+            title: 'Eiffel Tower',
+            description: 'Tower in Paris, France',
+            pageprops: { wikibase_item: 'Q243' },
+          },
+          {
+            pageid: 212301,
+            title: 'Champ de Mars',
+            description: 'Public park in Paris, France',
+            pageprops: { wikibase_item: 'Q217925' },
+          },
+          { pageid: 16201796, title: 'Globe Céleste', pageprops: { wikibase_item: 'Q1468897' } },
+          { pageid: 27288389, title: 'Champ de Mars massacre', description: '', pageprops: {} },
+          {
+            pageid: 48435351,
+            title: 'Palazzo Bernardo Nani',
+            description: 'Palace on the Grand Canal, Venice',
+            pageprops: { wikibase_item: 'Q16585996' },
+          },
+        ],
+      },
+    });
+
+    const { results, truncated } = await svc.searchNearby(48.85822222, 2.2945, 500, 4, 'en', ctx);
+
+    expect(truncated).toBe(true);
+    expect(results.map((r) => r.pageid)).toEqual([9232, 16201796, 48435351, 27288389]);
+    expect(results.map((r) => r.distance_meters)).toEqual([0, 149.4, 161.2, 365.7]);
+    expect(results[0]).toEqual({
+      title: 'Eiffel Tower',
+      pageid: 9232,
+      latitude: 48.8583,
+      longitude: 2.2945,
+      distance_meters: 0,
+      description: 'Tower in Paris, France',
+      wikibase_item: 'Q243',
+    });
+    expect(results[1]).not.toHaveProperty('description');
+    expect(results[1]?.wikibase_item).toBe('Q1468897');
+    expect(results[2]?.description).toBe('Palace on the Grand Canal, Venice');
+    expect(results[3]).not.toHaveProperty('description');
+    expect(results[3]).not.toHaveProperty('wikibase_item');
+  });
+
+  it('leaves a result bare when the generator returned no page for it', async () => {
+    const svc = getWikipediaService();
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
+      query: {
+        geosearch: [{ pageid: 5, ns: 0, title: 'Only in the list', lat: 1, lon: 2, dist: 3 }],
+        pages: [{ pageid: 6, title: 'Only in the generator', description: 'Elsewhere' }],
+      },
+    });
+
+    const { results } = await svc.searchNearby(1, 2, 100, 10, 'en', createMockContext());
+    expect(results).toEqual([
+      { title: 'Only in the list', pageid: 5, latitude: 1, longitude: 2, distance_meters: 3 },
+    ]);
   });
 });
