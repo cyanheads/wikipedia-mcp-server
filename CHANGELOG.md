@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.3](changelog/0.2.x/0.2.3.md) — 2026-09-22
+
+wikipedia_search_articles and wikipedia_search_nearby results gain short descriptions and Wikidata QIDs; search surfaces spelling suggestions; nearby's cap notice and coordinate-source description are corrected at the 500 ceiling
+
 ## [0.2.2](changelog/0.2.x/0.2.2.md) — 2026-09-17 · 🛡️ Security
 
 Fix content[] rendering to escape upstream markdown/HTML (security); wikipedia_get_summary returns coordinates, URL, and revision; wikipedia_get_languages adds an editions filter
