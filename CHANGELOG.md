@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.5](changelog/0.2.x/0.2.5.md) — 2026-09-22
+
+Transient Action API refusals arriving as an HTTP 200 error envelope now retry with the same backoff a 503 gets, honoring Retry-After and bounded at 30s per request
+
 ## [0.2.4](changelog/0.2.x/0.2.4.md) — 2026-09-22
 
 wikipedia_get_article and wikipedia_get_summary keep superscripts and subscripts distinct, render code samples as fenced blocks and data tables as rows, and add citation fields (url, revision_id, last_modified)
