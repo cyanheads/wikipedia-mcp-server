@@ -332,6 +332,25 @@ function decodeEntities(text: string): string {
 }
 
 /**
+ * Strip every `<...>` construct from `html`, looping the removal to a fixed point rather than one
+ * pass. A single pass can uncover a tag it did not remove — the outer bracket of `<scr<script>ipt>`
+ * strips to leave `script>`, and the next pass removes what remains — so anything short of a fixed
+ * point is an incomplete sanitizer against Wikipedia's own attacker-editable markup, and every call
+ * site here quotes the result straight into a read path's output.
+ */
+function stripTags(html: string): string {
+  let text = html;
+  for (
+    let next = text.replace(/<[^>]+>/g, '');
+    next !== text;
+    next = text.replace(/<[^>]+>/g, '')
+  ) {
+    text = next;
+  }
+  return text;
+}
+
+/**
  * Delimits a parked block's index while the surrounding text is whitespace-normalized. `U+FFFF` is a
  * permanent noncharacter, which MediaWiki's input normalization never lets into a page, and it is not
  * whitespace, so the collapsing passes leave it in place.
@@ -440,7 +459,7 @@ function renderScripts(html: string): string {
 
 /** One script's body rendered as {@link renderScripts} describes. */
 function renderScript(superscript: boolean, body: string, inAbbreviation: boolean): string {
-  const escaped = body.replace(/<[^>]+>/g, '').trim();
+  const escaped = stripTags(body).trim();
   const chars = [...decodeEntities(escaped)];
   if (chars.length === 0) return '';
 
@@ -490,12 +509,7 @@ function spanAttribute(openTag: string, name: 'colspan' | 'rowspan'): number {
  * is flattened with the rest: a row holds one line, and a fence cannot sit inside one.
  */
 function cellText(html: string, separator: string): string {
-  return decodeEntities(
-    html
-      .replace(/\s+/g, ' ')
-      .replace(CELL_LINE_BREAK, '\n')
-      .replace(/<[^>]+>/g, ''),
-  )
+  return decodeEntities(stripTags(html.replace(/\s+/g, ' ').replace(CELL_LINE_BREAK, '\n')))
     .split('\n')
     .map((line) => line.replace(/\s+/g, ' ').trim())
     .filter(Boolean)
@@ -730,7 +744,7 @@ export function htmlSectionToPlainText(html: string): string {
   // backtick run in it can close the fence early.
   text = text.replace(/<pre\b[^>]*>([\s\S]*?)<\/pre\s*>/gi, (_match, body: string) => {
     const code = parked
-      .restore(decodeEntities(body.replace(/<[^>]+>/g, '')))
+      .restore(decodeEntities(stripTags(body)))
       .replace(/[^\S\n]+$/gm, '')
       .replace(/^\n+|\n+$/g, '');
     return parked.park(code && fenceCodeBlock(code));
@@ -741,7 +755,7 @@ export function htmlSectionToPlainText(html: string): string {
     /<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1\s*>/gi,
     (_match, level: string, inner: string) => {
       const bar = '='.repeat(Math.max(2, Number(level)));
-      return `\n\n${bar} ${inner.replace(/<[^>]+>/g, '').trim()} ${bar}\n\n`;
+      return `\n\n${bar} ${stripTags(inner).trim()} ${bar}\n\n`;
     },
   );
 
@@ -749,14 +763,15 @@ export function htmlSectionToPlainText(html: string): string {
   // boundaries because a layout table's cells reach here — without them two columns of a
   // `{{col-begin}}` list concatenate into one line.
   text = decodeEntities(
-    text
-      // Closing tag first, consuming the newline that follows it, so consecutive items land on
-      // consecutive lines instead of being separated by a blank one.
-      .replace(/<\/li\s*>\s*/gi, '')
-      .replace(/<li\b[^>]*>/gi, '\n')
-      .replace(/<br\s*\/?>/gi, '\n')
-      .replace(/<\/?(p|div|ul|ol|dl|dd|dt|blockquote|section|tr|td|th)\b[^>]*>/gi, '\n\n')
-      .replace(/<[^>]+>/g, ''),
+    stripTags(
+      text
+        // Closing tag first, consuming the newline that follows it, so consecutive items land on
+        // consecutive lines instead of being separated by a blank one.
+        .replace(/<\/li\s*>\s*/gi, '')
+        .replace(/<li\b[^>]*>/gi, '\n')
+        .replace(/<br\s*\/?>/gi, '\n')
+        .replace(/<\/?(p|div|ul|ol|dl|dd|dt|blockquote|section|tr|td|th)\b[^>]*>/gi, '\n\n'),
+    ),
   );
 
   text = text
@@ -820,7 +835,7 @@ export function splitArticleIntoSections(
  * pass; a chained per-name replace would decode it twice.
  */
 function stripMarkup(html: string): string {
-  return decodeEntities(html.replace(/<[^>]+>/g, '')).trim();
+  return decodeEntities(stripTags(html)).trim();
 }
 
 /**
