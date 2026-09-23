@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.4](changelog/0.2.x/0.2.4.md) — 2026-09-22
+
+wikipedia_get_article and wikipedia_get_summary keep superscripts and subscripts distinct, render code samples as fenced blocks and data tables as rows, and add citation fields (url, revision_id, last_modified)
+
 ## [0.2.3](changelog/0.2.x/0.2.3.md) — 2026-09-22
 
 wikipedia_search_articles and wikipedia_search_nearby results gain short descriptions and Wikidata QIDs; search surfaces spelling suggestions; nearby's cap notice and coordinate-source description are corrected at the 500 ceiling
