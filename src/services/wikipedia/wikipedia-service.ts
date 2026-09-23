@@ -340,13 +340,11 @@ function decodeEntities(text: string): string {
  */
 function stripTags(html: string): string {
   let text = html;
-  for (
-    let next = text.replace(/<[^>]+>/g, '');
-    next !== text;
-    next = text.replace(/<[^>]+>/g, '')
-  ) {
-    text = next;
-  }
+  let previous: string;
+  do {
+    previous = text;
+    text = text.replace(/<[^>]+>/g, '');
+  } while (text !== previous);
   return text;
 }
 
