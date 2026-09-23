@@ -130,7 +130,7 @@ describe('WikipediaService language validation', () => {
     const ctx = createMockContext();
 
     // 'xx' is valid BCP 47 but has no Wikipedia edition.
-    // Without the edition check this would time out after 4 retries (~60s).
+    // Without the edition check this would burn the whole retry ladder before failing.
     await expect(svc.restGet('xx', '/page/summary/Test', ctx)).rejects.toMatchObject({
       message: expect.stringContaining('does not exist on Wikipedia'),
     });
@@ -3894,5 +3894,504 @@ describe('htmlSectionToPlainText — visible MathML and unbalanced scripts (issu
   it('does not let an unclosed superscript reach across a heading to a later one', () => {
     const html = '<p>About 10<sup>8 km away.</p>\n<h2>Orbit</h2>\n<p>Speed c<sup>2</sup>.</p>';
     expect(htmlSectionToPlainText(html)).toBe('About 108 km away.\n\n== Orbit ==\n\nSpeed c².');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #55 — transient Action API error envelopes on HTTP 200
+// ---------------------------------------------------------------------------
+
+/** One upstream reply, built fresh per request so a body is never read twice. */
+type Reply = () => Response;
+
+/** An Action API error envelope on HTTP 200, the shape every refusal arrives in. */
+const envelope =
+  (code: string, info = `${code} from upstream.`, headers?: Record<string, string>): Reply =>
+  () =>
+    Response.json({ error: { code, info } }, headers ? { headers } : undefined);
+
+const okReply =
+  (body: unknown): Reply =>
+  () =>
+    Response.json(body);
+
+/**
+ * Install a strict fetch fake at the network seam, below `apiGet`, so `withRetry` and the envelope
+ * classification both run. Requests `match` selects are answered with `replies` in order, the last
+ * one repeating; any other Action API request (the search description lookup) gets an empty page.
+ */
+function stubUpstream(match: (url: URL) => boolean, ...replies: Reply[]) {
+  let next = 0;
+  const http = createFetchMock([
+    {
+      match: (request) => match(new URL(request.url)),
+      respond: () => (replies[Math.min(next++, replies.length - 1)] as Reply)(),
+    },
+    {
+      match: (request) => new URL(request.url).pathname === '/w/api.php',
+      respond: () => Response.json({ query: { pages: [] } }),
+    },
+  ]);
+  http.install();
+  onTestFinished(() => {
+    http.restore();
+  });
+  return {
+    http,
+    /** Requests `match` selected — the upstream call count under test. */
+    calls: () => http.calls.filter((call) => match(new URL(call.request.url))).length,
+  };
+}
+
+const anyActionRequest = (url: URL) => url.pathname === '/w/api.php';
+const searchRequest = (url: URL) => url.searchParams.get('list') === 'search';
+
+/** Fake the clock for one test, so a retry ladder runs without sleeping through its backoff. */
+function useFakeClock(): void {
+  vi.useFakeTimers();
+  onTestFinished(() => {
+    vi.useRealTimers();
+  });
+}
+
+/** Drive `promise` to completion on the fake clock, capturing its outcome without a rejection. */
+async function settle<T>(promise: Promise<T>): Promise<{ value?: T; error?: unknown }> {
+  const outcome = promise.then(
+    (value) => ({ value }),
+    (error: unknown) => ({ error }),
+  );
+  await vi.runAllTimersAsync();
+  return await outcome;
+}
+
+describe('WikipediaService — contract envelopes stay single-request (issue #55, characterization)', () => {
+  beforeEach(() => {
+    initService();
+    useFakeClock();
+  });
+
+  it('missingtitle: one request, NotFound', async () => {
+    const svc = getWikipediaService();
+    const { calls } = stubUpstream(anyActionRequest, envelope('missingtitle'));
+
+    const { error } = await settle(
+      svc.getArticleSection('Nonexistent', 1, 'en', createMockContext()),
+    );
+
+    expect(calls()).toBe(1);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      message: expect.stringContaining('No Wikipedia article found for "Nonexistent"'),
+    });
+  });
+
+  it('nosuchsection: one request, ValidationError naming the index', async () => {
+    const svc = getWikipediaService();
+    const { calls } = stubUpstream(anyActionRequest, envelope('nosuchsection'));
+
+    const { error } = await settle(svc.getArticleSection('Python', 99, 'en', createMockContext()));
+
+    expect(calls()).toBe(1);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      message: expect.stringContaining('Section index 99 does not exist'),
+    });
+  });
+
+  it('invalidtitle: one request, the invalid_title reason', async () => {
+    const svc = getWikipediaService();
+    const { calls } = stubUpstream(anyActionRequest, envelope('invalidtitle', 'Bad title "A{b}".'));
+
+    const { error } = await settle(svc.getSections('A{b}', 'en', createMockContext()));
+
+    expect(calls()).toBe(1);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'invalid_title' },
+    });
+  });
+
+  it('cirrussearch-offset-too-large: one request, the offset_too_large reason', async () => {
+    const svc = getWikipediaService();
+    const { calls } = stubUpstream(searchRequest, envelope('cirrussearch-offset-too-large'));
+
+    const { error } = await settle(
+      svc.search('Python', 10, 'en', createMockContext(), SEARCH_RESULT_WINDOW),
+    );
+
+    expect(calls()).toBe(1);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'offset_too_large' },
+    });
+  });
+
+  it('a code outside the transient set is not retried: one request, ServiceUnavailable', async () => {
+    const svc = getWikipediaService();
+    const { calls } = stubUpstream(
+      searchRequest,
+      envelope(
+        'cirrussearch-backend-error',
+        'We could not complete your search due to a temporary problem. Please try again later.',
+      ),
+    );
+
+    const { error } = await settle(svc.search('Python', 10, 'en', createMockContext()));
+
+    expect(calls()).toBe(1);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      message:
+        'Wikipedia API error: We could not complete your search due to a temporary problem. Please try again later.',
+    });
+  });
+
+  it('the description lookup degrades on its one attempt when it meets a transient envelope', async () => {
+    const svc = getWikipediaService();
+    captureWarnings();
+    const lookupRequest = (url: URL) => url.searchParams.has('pageids');
+    const http = createFetchMock([
+      {
+        match: (request) => searchRequest(new URL(request.url)),
+        respond: okReply({
+          query: {
+            searchinfo: { totalhits: 1 },
+            search: [{ title: 'Python', pageid: 24, snippet: 'Snakes', wordcount: 10 }],
+          },
+        }),
+      },
+      {
+        match: (request) => lookupRequest(new URL(request.url)),
+        respond: envelope('cirrussearch-too-busy-error', 'Search is currently too busy.', {
+          'retry-after': '1',
+        }),
+      },
+    ]);
+    http.install();
+    onTestFinished(() => {
+      http.restore();
+    });
+
+    const { value } = await settle(svc.search('Python', 10, 'en', createMockContext()));
+
+    expect(http.calls.filter((call) => lookupRequest(new URL(call.request.url)))).toHaveLength(1);
+    expect(value?.results.map((r) => r.pageid)).toEqual([24]);
+    expect(value?.descriptionsUnavailable).toBe(true);
+  });
+});
+
+const TOO_BUSY = 'Search is currently too busy. Please try again later.';
+
+const SEARCH_HIT = {
+  query: {
+    searchinfo: { totalhits: 1 },
+    search: [{ title: 'Python', pageid: 24, snippet: 'Snakes', wordcount: 10 }],
+  },
+};
+
+/** Capture `promise`'s outcome without driving the clock, for tests that step it by hand. */
+function capture<T>(promise: Promise<T>): Promise<{ value?: T; error?: unknown }> {
+  return promise.then(
+    (value) => ({ value }),
+    (error: unknown) => ({ error }),
+  );
+}
+
+describe('WikipediaService — transient envelopes are retried (issue #55)', () => {
+  beforeEach(() => {
+    initService();
+    useFakeClock();
+  });
+
+  it.each([
+    'ratelimited',
+    'readonly',
+    'cirrussearch-too-busy-error',
+    'cirrussearch-regex-too-busy-error',
+  ])('%s: retried, then the search succeeds', async (code) => {
+    const svc = getWikipediaService();
+    const { calls } = stubUpstream(searchRequest, envelope(code), okReply(SEARCH_HIT));
+
+    const { value, error } = await settle(svc.search('Python', 10, 'en', createMockContext()));
+
+    expect(error).toBeUndefined();
+    expect(calls()).toBe(2);
+    expect(value?.results.map((r) => r.title)).toEqual(['Python']);
+    expect(value?.totalResults).toBe(1);
+  });
+
+  it('exhausts the default ladder: four requests, then the envelope as ServiceUnavailable', async () => {
+    const svc = getWikipediaService();
+    const { calls } = stubUpstream(
+      searchRequest,
+      envelope('cirrussearch-too-busy-error', TOO_BUSY),
+    );
+
+    const { error } = await settle(svc.search('the', 10, 'en', createMockContext(), 9990));
+
+    expect(calls()).toBe(4);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      message: `Wikipedia API error: ${TOO_BUSY} (failed after 4 attempts)`,
+      data: { retryAttempts: 4 },
+    });
+  });
+
+  it('retries an empty result page into a normal empty success', async () => {
+    const svc = getWikipediaService();
+    const { calls } = stubUpstream(
+      searchRequest,
+      envelope('ratelimited'),
+      okReply({ query: { searchinfo: { totalhits: 0 }, search: [] } }),
+    );
+
+    const { value } = await settle(svc.search('xyzzy', 10, 'en', createMockContext()));
+
+    expect(calls()).toBe(2);
+    expect(value).toMatchObject({ results: [], totalResults: 0, descriptionsUnavailable: false });
+  });
+
+  const callers: Array<{
+    name: string;
+    success: unknown;
+    run: (svc: WikipediaService) => Promise<unknown>;
+    expected: Record<string, unknown>;
+  }> = [
+    {
+      name: 'getArticleFull',
+      success: {
+        query: {
+          pages: [
+            {
+              pageid: 23862,
+              title: 'Python',
+              extract: '<p>Python is a language.</p>',
+              revisions: [{ revid: 5, timestamp: '2026-09-01T00:00:00Z' }],
+            },
+          ],
+        },
+      },
+      run: (svc) => svc.getArticleFull('Python', 'en', createMockContext()),
+      expected: { title: 'Python', content: 'Python is a language.' },
+    },
+    {
+      name: 'getArticleSection',
+      success: { parse: { title: 'Python', pageid: 23862, revid: 5, text: '<p>Body.</p>' } },
+      run: (svc) => svc.getArticleSection('Python', 0, 'en', createMockContext()),
+      expected: { title: 'Python', content: 'Body.' },
+    },
+    {
+      name: 'getSections',
+      success: {
+        parse: {
+          title: 'Python',
+          pageid: 23862,
+          tocdata: { sections: [{ hLevel: 2, line: 'History', number: '1', index: '1' }] },
+        },
+      },
+      run: (svc) => svc.getSections('Python', 'en', createMockContext()),
+      expected: { sections: [{ index: 1, number: '1', title: 'History', level: 2 }] },
+    },
+    {
+      name: 'getLanguages',
+      success: {
+        query: {
+          pages: [
+            {
+              pageid: 23862,
+              title: 'Python',
+              langlinks: [
+                { lang: 'fr', title: 'Python', url: 'https://fr.wikipedia.org/wiki/Python' },
+              ],
+            },
+          ],
+        },
+      },
+      run: (svc) => svc.getLanguages('Python', 'en', createMockContext()),
+      expected: { languages: [expect.objectContaining({ languageCode: 'fr' })] },
+    },
+    {
+      name: 'searchNearby',
+      success: {
+        query: {
+          geosearch: [{ pageid: 9232, title: 'Eiffel Tower', lat: 48.858, lon: 2.294, dist: 12 }],
+        },
+      },
+      run: (svc) => svc.searchNearby(48.858, 2.294, 1000, 10, 'en', createMockContext()),
+      expected: { results: [expect.objectContaining({ title: 'Eiffel Tower' })] },
+    },
+  ];
+
+  it.each(callers)('$name picks up the retry', async ({ success, run, expected }) => {
+    const svc = getWikipediaService();
+    const { calls } = stubUpstream(anyActionRequest, envelope('ratelimited'), okReply(success));
+
+    const { value, error } = await settle(run(svc));
+
+    expect(error).toBeUndefined();
+    expect(calls()).toBe(2);
+    expect(value).toMatchObject(expected);
+  });
+
+  it('fetchEditionIndex picks up the retry within its one-retry budget', async () => {
+    // The sitematrix fetch itself is under test, so it is not stubbed at the method seam here.
+    initWikipediaService(mockConfig, mockStorage, TEST_USER_AGENT);
+    const svc = getWikipediaService();
+    const { calls } = stubUpstream(
+      anyActionRequest,
+      envelope('readonly'),
+      okReply({
+        sitematrix: {
+          count: 1,
+          '0': { code: 'en', site: [{ url: 'https://en.wikipedia.org', code: 'wiki' }] },
+        },
+      }),
+    );
+
+    const { value } = await settle(svc.fetchEditionIndex(createMockContext()));
+
+    expect(calls()).toBe(2);
+    expect(value?.hosts.en).toBe('https://en.wikipedia.org');
+  });
+
+  it('retries the nested full-article read behind the section-list fallback', async () => {
+    const svc = getWikipediaService();
+    const extractsRequest = (url: URL) =>
+      url.searchParams.get('prop') === 'extracts|info|revisions';
+    let extractsCalls = 0;
+    const http = createFetchMock([
+      {
+        match: (request) => new URL(request.url).searchParams.get('action') === 'parse',
+        respond: okReply({ parse: { title: 'Python', pageid: 1, tocdata: { sections: [] } } }),
+      },
+      {
+        match: (request) => extractsRequest(new URL(request.url)),
+        respond: () =>
+          extractsCalls++ === 0
+            ? envelope('ratelimited')()
+            : Response.json({
+                query: {
+                  pages: [
+                    {
+                      pageid: 1,
+                      title: 'Python',
+                      extract: '<p>Lead.</p><h2>History</h2><p>Past.</p>',
+                    },
+                  ],
+                },
+              }),
+      },
+    ]);
+    http.install();
+    onTestFinished(() => {
+      http.restore();
+    });
+
+    const { value } = await settle(svc.getSections('Python', 'en', createMockContext()));
+
+    expect(extractsCalls).toBe(2);
+    expect(value?.sections).toEqual([{ index: 1, number: '1', title: 'History', level: 2 }]);
+  });
+
+  it('waits the Retry-After the 200 response names instead of the exponential backoff', async () => {
+    const svc = getWikipediaService();
+    const { calls } = stubUpstream(
+      searchRequest,
+      envelope('cirrussearch-too-busy-error', TOO_BUSY, { 'retry-after': '3' }),
+      okReply(SEARCH_HIT),
+    );
+
+    const outcome = capture(svc.search('Python', 10, 'en', createMockContext()));
+    // Past the widest exponential first backoff (1,000 ms + 25% jitter), short of the header's 3 s.
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(calls()).toBe(1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(calls()).toBe(2);
+
+    await vi.runAllTimersAsync();
+    expect((await outcome).value?.results).toHaveLength(1);
+  });
+
+  it('fails fast, Retry-After intact, when the named wait exceeds the retry budget', async () => {
+    const svc = getWikipediaService();
+    const { calls } = stubUpstream(
+      searchRequest,
+      envelope('ratelimited', 'You have exceeded your rate limit.', { 'retry-after': '60' }),
+      okReply(SEARCH_HIT),
+    );
+
+    const { error } = await settle(svc.search('Python', 10, 'en', createMockContext()));
+
+    expect(calls()).toBe(1);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      message: 'Wikipedia API error: You have exceeded your rate limit.',
+      data: { retryAfter: '60' },
+    });
+  });
+
+  it('keeps honored Retry-After waits inside the 30 s request deadline', async () => {
+    const svc = getWikipediaService();
+    const { calls } = stubUpstream(
+      searchRequest,
+      envelope('cirrussearch-too-busy-error', TOO_BUSY, { 'retry-after': '20' }),
+    );
+    const startedAt = Date.now();
+
+    const { error } = await settle(svc.search('Python', 10, 'en', createMockContext()));
+
+    // 0 s, then 20 s; a second 20 s wait would end past the 30 s deadline, so the ladder stops.
+    expect(calls()).toBe(2);
+    expect(Date.now() - startedAt).toBeLessThanOrEqual(30_000);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      message: `Wikipedia API error: ${TOO_BUSY}`,
+      data: { retryAfter: '20' },
+    });
+  });
+
+  it('bounds a stalled upstream at the 30 s request deadline', async () => {
+    const svc = getWikipediaService();
+    let requests = 0;
+    const spy = vi.spyOn(globalThis, 'fetch').mockImplementation((_input, init) => {
+      requests++;
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+      });
+    });
+    onTestFinished(() => {
+      spy.mockRestore();
+    });
+    const startedAt = Date.now();
+
+    const { error } = await settle(svc.search('Python', 10, 'en', createMockContext()));
+
+    expect(Date.now() - startedAt).toBeLessThanOrEqual(30_000);
+    expect(requests).toBe(2);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.Timeout,
+      data: { reason: 'retry_deadline_exceeded', deadlineMs: 30_000 },
+    });
+  });
+
+  it('stops the ladder when the caller cancels during a backoff', async () => {
+    const svc = getWikipediaService();
+    const controller = new AbortController();
+    const { calls } = stubUpstream(
+      searchRequest,
+      envelope('cirrussearch-too-busy-error', TOO_BUSY),
+      okReply(SEARCH_HIT),
+    );
+
+    const outcome = capture(
+      svc.search('Python', 10, 'en', createMockContext({ signal: controller.signal })),
+    );
+    await vi.advanceTimersByTimeAsync(100);
+    expect(calls()).toBe(1);
+    controller.abort();
+    await vi.runAllTimersAsync();
+
+    expect(calls()).toBe(1);
+    expect((await outcome).error).toMatchObject({ name: 'AbortError' });
   });
 });

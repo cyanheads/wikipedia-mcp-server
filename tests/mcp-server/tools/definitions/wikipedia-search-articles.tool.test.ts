@@ -3,10 +3,22 @@
  * @module tests/mcp-server/tools/definitions/wikipedia-search-articles.tool.test
  */
 
-import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import {
+  createFetchMock,
+  createInMemoryStorage,
+  createMockContext,
+  getEnrichment,
+  runToolContract,
+} from '@cyanheads/mcp-ts-core/testing';
+import { beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { allToolDefinitions } from '@/mcp-server/tools/definitions/index.js';
 import { wikipediaSearchArticles } from '@/mcp-server/tools/definitions/wikipedia-search-articles.tool.js';
+import {
+  getWikipediaService,
+  initWikipediaService,
+} from '@/services/wikipedia/wikipedia-service.js';
 import { mockWikipediaService } from '../../../helpers/wikipedia-service-mock.js';
 
 describe('wikipediaSearchArticles', () => {
@@ -725,5 +737,131 @@ describe('wikipediaSearchArticles — description and Wikidata QID (issue #52)',
     expect(structured.truncated).toBe(true);
     expect(structured.notice).toContain('10,000');
     expect(structured.notice).toContain('Descriptions and Wikidata QIDs could not be loaded');
+  });
+});
+
+describe('wikipediaSearchArticles — transient upstream envelopes (issue #55)', () => {
+  const TOO_BUSY = 'Search is currently too busy. Please try again later.';
+  const tooBusy = () =>
+    Response.json({ error: { code: 'cirrussearch-too-busy-error', info: TOO_BUSY } });
+  const isSearch = (request: Request) => new URL(request.url).searchParams.get('list') === 'search';
+
+  /**
+   * Run the real service against a strict fetch fake, so the handler, the service's retry, and the
+   * envelope classification all run. `replies` answer the search request in order, the last one
+   * repeating; the description lookup gets an empty page.
+   */
+  function stubSearch(...replies: Array<() => Response>) {
+    let next = 0;
+    const http = createFetchMock([
+      {
+        match: isSearch,
+        respond: () => (replies[Math.min(next++, replies.length - 1)] as () => Response)(),
+      },
+      {
+        match: (request) => new URL(request.url).searchParams.has('pageids'),
+        respond: () => Response.json({ query: { pages: [] } }),
+      },
+    ]);
+    http.install();
+    onTestFinished(() => {
+      http.restore();
+    });
+    return {
+      requests: () => http.calls.length,
+      searches: () => http.calls.filter((c) => isSearch(c.request)).length,
+    };
+  }
+
+  /** Run the tool on a fake clock, so the retry ladder completes without sleeping through it. */
+  async function run(input: Parameters<typeof runToolContract<typeof wikipediaSearchArticles>>[1]) {
+    const pending = runToolContract(wikipediaSearchArticles, input);
+    await vi.runAllTimersAsync();
+    return await pending;
+  }
+
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    initWikipediaService({} as AppConfig, createInMemoryStorage(), 'wikipedia-mcp-server/test');
+    vi.spyOn(getWikipediaService(), 'fetchEditionIndex').mockResolvedValue({
+      hosts: { en: 'https://en.wikipedia.org' },
+      fetchedAt: '2026-09-22T00:00:00.000Z',
+    });
+  });
+
+  it('retries a too-busy search and renders the results on both surfaces', async () => {
+    const { searches } = stubSearch(tooBusy, () =>
+      Response.json({
+        query: {
+          searchinfo: { totalhits: 1 },
+          search: [{ title: 'Python', pageid: 24, snippet: 'A genus of snakes.', wordcount: 1200 }],
+        },
+      }),
+    );
+
+    const result = await run({ query: 'Python' });
+
+    expect(searches()).toBe(2);
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      results: [{ title: 'Python', pageid: 24, snippet: 'A genus of snakes.', wordcount: 1200 }],
+      totalCount: 1,
+      shown: 1,
+    });
+    const text = contentText(result);
+    expect(text).toContain('### Python');
+    expect(text).not.toContain('too busy');
+  });
+
+  it('retries into an empty page and keeps the no-results notice', async () => {
+    const { searches } = stubSearch(tooBusy, () =>
+      Response.json({ query: { searchinfo: { totalhits: 0 }, search: [] } }),
+    );
+
+    const result = await run({ query: 'xyzzy' });
+
+    expect(searches()).toBe(2);
+    const structured = result.structuredContent as Record<string, unknown>;
+    expect(structured.results).toEqual([]);
+    expect(structured.notice).toContain('No Wikipedia articles found for "xyzzy"');
+    expect(contentText(result)).toContain('No Wikipedia articles found for "xyzzy"');
+  });
+
+  it('reports the exhausted ladder on both surfaces after four requests', async () => {
+    const { searches } = stubSearch(tooBusy);
+
+    const result = await run({ query: 'the', offset: 9990 });
+
+    const message = `Wikipedia API error: ${TOO_BUSY} (failed after 4 attempts)`;
+    expect(searches()).toBe(4);
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        message,
+        data: { retryAttempts: 4 },
+      },
+    });
+    expect(contentText(result)).toContain(message);
+  });
+
+  it('never reaches upstream for an offset past the window or an over-cap limit', async () => {
+    const { requests } = stubSearch(tooBusy);
+
+    const pastWindow = await run({ query: 'Python', offset: 10_000 });
+    expect(pastWindow.structuredContent).toMatchObject({
+      error: { data: { reason: 'offset_too_large' } },
+    });
+
+    const overCap = await run({ query: 'Python', limit: 80 });
+    expect(overCap.structuredContent).toMatchObject({
+      error: { code: JsonRpcErrorCode.InvalidParams },
+    });
+
+    expect(requests()).toBe(0);
   });
 });

@@ -1280,7 +1280,8 @@ function searchWindowError(offset: number): McpError {
  *
  * `title` is passed by the page-addressed endpoints, whose `missingtitle` and `invalidtitle` codes
  * map onto declared tool contracts; anything else is upstream's own refusal and surfaces as a
- * service failure carrying the API's `info` text.
+ * service failure carrying the API's `info` text. The {@link TRANSIENT_ENVELOPE_CODES} never reach
+ * here unless their retries ran out — {@link transientEnvelopeError} throws them inside the retry.
  */
 function actionApiError(error: ActionApiErrorRaw, language: string, title?: string): McpError {
   const code = error.code ?? '';
@@ -1290,6 +1291,44 @@ function actionApiError(error: ActionApiErrorRaw, language: string, title?: stri
   }
   return serviceUnavailable(`Wikipedia API error: ${error.info ?? code}`);
 }
+
+/**
+ * Action API error codes for a condition that clears on its own, which the API reports inside an
+ * HTTP 200 body rather than as a 429 or 503. `ratelimited` and `readonly` are MediaWiki core's codes;
+ * the two CirrusSearch codes are its search pool counter's queue being full — the regex variant is
+ * the same refusal for a query using `insource:/…/`. `cirrussearch-backend-error` stays out: it also
+ * covers backend failures a retry does not clear.
+ */
+const TRANSIENT_ENVELOPE_CODES: ReadonlySet<string> = new Set([
+  'ratelimited',
+  'readonly',
+  'cirrussearch-too-busy-error',
+  'cirrussearch-regex-too-busy-error',
+]);
+
+/**
+ * The retryable failure for a parsed body carrying a {@link TRANSIENT_ENVELOPE_CODES} envelope, or
+ * `undefined` for every other body — including every other envelope, which each call site maps
+ * after the retry returns. The message is the one {@link actionApiError} gives the same envelope,
+ * and a `Retry-After` header on the 200 response rides as `data.retryAfter`, the field `withRetry`
+ * reads its wait from.
+ */
+function transientEnvelopeError(body: unknown, response: Response): McpError | undefined {
+  const error = (body as { error?: ActionApiErrorRaw } | null)?.error;
+  if (!error?.code || !TRANSIENT_ENVELOPE_CODES.has(error.code)) return;
+  const retryAfter = response.headers.get('retry-after');
+  return serviceUnavailable(`Wikipedia API error: ${error.info ?? error.code}`, {
+    ...(retryAfter !== null && { retryAfter }),
+  });
+}
+
+/**
+ * Wall-clock budget for one request's whole retry ladder — every attempt, backoff, and honored
+ * `Retry-After`. Without it the default ladder runs four 15 s attempts past a client's 60 s request
+ * timeout, and three honored `Retry-After` waits of up to 30 s each reach 90 s, so the caller would
+ * see a transport timeout instead of this server's classified error.
+ */
+const REQUEST_DEADLINE_MS = 30_000;
 
 /**
  * Build an {@link EditionIndex} from an `action=sitematrix` response.
@@ -1350,7 +1389,7 @@ export function buildBaseUrl(language: string, baseUrlOverride?: string): string
   }
   assertStructuralLanguage(language);
   const host = FALLBACK_EDITION_HOSTS.get(language.toLowerCase());
-  // Without this check a nonexistent subdomain causes 4 retries × 15s timeout and URL leakage.
+  // Without this check a nonexistent subdomain burns the whole retry ladder and leaks the URL.
   if (!host) throw unknownEditionError(language);
   return host;
 }
@@ -1435,10 +1474,15 @@ export class WikipediaService {
   }
 
   /**
-   * Fetch, JSON-parse, and retry one MediaWiki endpoint.
+   * Fetch, JSON-parse, and retry one MediaWiki endpoint, the whole ladder bounded by
+   * {@link REQUEST_DEADLINE_MS}.
    *
    * MediaWiki serves an HTML error page under rate limiting and maintenance, so a leading
-   * doctype is remapped to a retryable `serviceUnavailable` rather than a JSON parse failure.
+   * doctype is remapped to a retryable `serviceUnavailable` rather than a JSON parse failure. The
+   * Action API reports its own transient refusals inside an HTTP 200 body, so those are thrown
+   * here, inside the retry, and every caller gets the same backoff a 503 gets; every other body is
+   * returned, `error` envelope and all, for the caller to map. The caller's signal ends a backoff
+   * as well as a request in flight.
    */
   private async apiGet<T>(
     url: string,
@@ -1447,13 +1491,13 @@ export class WikipediaService {
     ctx: ServiceContext,
     options: { expectedStatuses?: number[]; timeoutMs?: number; maxRetries?: number } = {},
   ): Promise<T> {
-    const { signal } = ctx;
+    const timeoutMs = options.timeoutMs ?? 15_000;
     return await withRetry(
-      async () => {
-        const response = await fetchWithTimeout(url, options.timeoutMs ?? 15_000, ctx, {
+      async ({ signal, remainingMs }) => {
+        const response = await fetchWithTimeout(url, Math.min(timeoutMs, remainingMs), ctx, {
           headers: this.headers(),
           ...(options.expectedStatuses && { expectedStatuses: options.expectedStatuses }),
-          ...(signal && { signal }),
+          signal,
         });
         const text = await response.text();
         if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
@@ -1461,12 +1505,17 @@ export class WikipediaService {
             `Wikipedia ${apiLabel} returned HTML instead of JSON — likely rate-limited or under maintenance.`,
           );
         }
-        return JSON.parse(text) as T;
+        const body: unknown = JSON.parse(text);
+        const transient = transientEnvelopeError(body, response);
+        if (transient) throw transient;
+        return body as T;
       },
       {
         operation,
         context: ctx,
         baseDelayMs: 1000,
+        deadlineMs: REQUEST_DEADLINE_MS,
+        ...(ctx.signal && { signal: ctx.signal }),
         ...(options.maxRetries !== undefined && { maxRetries: options.maxRetries }),
       },
     );

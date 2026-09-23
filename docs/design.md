@@ -305,16 +305,18 @@ All requests: `format=json`
 
 Pagination: Action API uses `continue` objects in the response. Tools that paginate internally (langlinks) should set `lllimit=500` to minimize round-trips. Geosearch results are bounded by the `limit` parameter alone — the module has no `offset` or `continue`. Search pages with `sroffset`, bounded by CirrusSearch's 10,000-result window: `sroffset >= 10000` is refused outright, and a page crossing the window is cut at the 10,000th result rather than refused, so the window's edge is shaped exactly like the end of the result set and has to be disclosed from `totalCount` against the offset reached.
 
-Errors: the Action API returns its refusals as a top-level `error` object inside an **HTTP 200** body, so status-code mapping never sees them. Every raw response type declares `error` and every call site reads it before the payload; skipping that check renders an upstream refusal as an empty success.
+Errors: the Action API returns its refusals as a top-level `error` object inside an **HTTP 200** body, so status-code mapping never sees them. Every raw response type declares `error` and every call site reads it before the payload; skipping that check renders an upstream refusal as an empty success. The transient codes are the exception: `apiGet` classifies them once, inside the retry, before any call site sees the body (see Rate limits and resilience).
 
 Snippet HTML: Search snippets include `<span class="searchmatch">` markup. Strip to plain text before returning. This is reflected in `wikipedia_search_articles`'s output design — snippets are always plain text in the tool response.
 
 ### Rate limits and resilience
 
 No enforced rate limits, but:
-- Retry on 429 with backoff (1s base, 2 retries max)
-- Retry on 503 (Wikimedia occasionally returns 503 under load)
-- The search description lookup is the exception: best-effort, one attempt with a 5 s timeout
+- Every request runs under `withRetry`: a 429, a 5xx, a timeout, or an HTML error page is retried with exponential backoff (1 s base, ±25% jitter, 3 retries — 4 attempts). A `Retry-After` of 30 s or less is waited out instead of the backoff; a longer one fails the call at once
+- Transient Action API refusals arrive as an HTTP 200 `error` envelope, not a 429 or 503: `ratelimited`, `readonly`, and CirrusSearch's full-pool-counter refusals `cirrussearch-too-busy-error` and `cirrussearch-regex-too-busy-error`. `apiGet` throws these inside the retry, with `Retry-After` taken from the 200 response when present, so every Action API call site gets the backoff a 503 gets. Every other code is returned to its call site on the first response and mapped there — the contract codes (`missingtitle`, `invalidtitle`, `nosuchsection`, `cirrussearch-offset-too-large`) and any code not known to clear on retry, `cirrussearch-backend-error` included, since it also covers backend failures. An exhausted ladder surfaces the envelope's message with `(failed after 4 attempts)` appended
+- Each request's whole ladder is bounded at 30 s (`deadlineMs`), each attempt's timeout shrinking to the time left. Unbounded, four 15 s attempts ran to ≈67 s and three honored 30 s `Retry-After` waits to 90 s — past a client's usual 60 s request timeout, which would report a transport timeout instead of this server's error. The backoff alone adds at most ≈8.75 s. An expired budget fails with `Timeout` and `data.reason: 'retry_deadline_exceeded'`; an honored `Retry-After` that would outlast it fails at once with the envelope's error and `data.retryAfter`
+- A caller's cancellation ends a backoff as well as a request in flight
+- The search description lookup is the exception: best-effort, one attempt with a 5 s timeout, so a transient envelope there drops the descriptions instead of retrying. The sitematrix fetch behind the edition registry retries once, with a 10 s per-attempt timeout
 - User-Agent is required — requests without it are deprioritized
 
 ---

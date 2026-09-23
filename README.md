@@ -118,7 +118,7 @@ Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): s
 Wikipedia-specific:
 
 - Dual API integration — MediaWiki REST API (`/api/rest_v1/`) for summaries, Action API (`/w/api.php`) for search, full text, sections, geo search, and language links
-- Retry and backoff on every required request (the best-effort description lookup on search results gets one short attempt); `User-Agent` header per Wikimedia API policy
+- Retry and backoff on every required request, including the transient refusals (search too busy, rate-limited, read-only) the Action API returns inside an HTTP 200 body, with an upstream `Retry-After` honored and each request's retries bounded at 30 s. The best-effort description lookup on search results gets one short attempt; `User-Agent` header per Wikimedia API policy
 - Every read path renders HTML through one renderer to the same plain-text shape — `== Heading ==` markers, one list item per line, superscripts kept, code fenced: the full article from the Action API's HTML extract, a section from the parser's own HTML for that section, the summary from the REST `extract_html`. A section read additionally carries data tables, infoboxes, and the lists inside layout tables, none of which the extract carries
 - Per-call `language` parameter on every tool — all Wikipedia language editions accessible in a single session
 - Language validation against a live edition registry built from the MediaWiki `action=sitematrix` endpoint (cached 24h) — catches structurally valid but nonexistent editions before they cause timeouts
