@@ -30,7 +30,10 @@ export type RestSummaryRaw = {
   pageid?: number;
   wikibase_item?: string;
   description?: string;
+  /** Plain-text extract. Superscripts and subscripts are flattened into the text beside them. */
   extract?: string;
+  /** The same extract as HTML, with `<sup>`/`<sub>` and list structure intact. */
+  extract_html?: string;
   thumbnail?: {
     source?: string;
     width?: number;
@@ -81,7 +84,13 @@ export type ActionSearchRaw = {
   error?: ActionApiErrorRaw;
 };
 
-/** Action API extracts response (for full article text). */
+/**
+ * Action API full-read response: `prop=extracts|info|revisions&inprop=url&rvprop=ids|timestamp`.
+ *
+ * Without `explaintext`, `extract` is TextExtracts' HTML mode — bare `<hN>` headings, inline
+ * formatting and `<sup>`/`<sub>` kept, tables and infoboxes already stripped upstream — which the
+ * API itself warns "may be malformed and/or unbalanced".
+ */
 export type ActionExtractsRaw = {
   query?: {
     pages?: Record<
@@ -91,6 +100,14 @@ export type ActionExtractsRaw = {
         title?: string;
         extract?: string;
         missing?: string;
+        /** `prop=info&inprop=url`: the canonical article URL. */
+        fullurl?: string;
+        /**
+         * `prop=revisions` with no `rvlimit` on a single title: the current revision alone. Its
+         * `timestamp` is when that revision was saved — unlike `prop=info`'s `touched`, which is a
+         * cache-invalidation time and moves without an edit.
+         */
+        revisions?: Array<{ revid?: number; timestamp?: string }>;
       }
     >;
   };
@@ -135,6 +152,8 @@ export type ActionParseTextRaw = {
   parse?: {
     title?: string;
     pageid?: number;
+    /** `prop=revid`: the revision the text was parsed from. `action=parse` has no timestamp prop. */
+    revid?: number;
     /** formatversion=2: plain string. formatversion=1 used `{ '*': string }` — no longer used. */
     text?: string;
   };

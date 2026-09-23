@@ -1,6 +1,6 @@
 # wikipedia-mcp-server - Directory Structure
 
-Generated on: 2026-09-17 17:00:52
+Generated on: 2026-09-23 00:11:52
 
 ```text
 wikipedia-mcp-server/
@@ -154,6 +154,7 @@ wikipedia-mcp-server/
 │   │           └── escape-markdown.ts
 │   ├── services/
 │   │   └── wikipedia/
+│   │       ├── text-blocks.ts
 │   │       ├── types.ts
 │   │       └── wikipedia-service.ts
 │   └── index.ts
@@ -175,6 +176,7 @@ wikipedia-mcp-server/
 │   ├── resources/
 │   ├── services/
 │   │   └── wikipedia/
+│   │       ├── text-blocks.test.ts
 │   │       └── wikipedia-service.test.ts
 │   └── tools/
 ├── .dockerignore

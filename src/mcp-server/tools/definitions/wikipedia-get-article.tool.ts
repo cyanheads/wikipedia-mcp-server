@@ -7,7 +7,10 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { outlineOnOverflow } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
-import { escapeMarkdown } from '@/mcp-server/tools/utils/escape-markdown.js';
+import {
+  escapeMarkdown,
+  escapeMarkdownOutsideBlocks,
+} from '@/mcp-server/tools/utils/escape-markdown.js';
 import {
   getWikipediaService,
   isBlankTitle,
@@ -20,7 +23,7 @@ import {
 export const wikipediaGetArticle = tool('wikipedia_get_article', {
   title: 'Get Wikipedia Article',
   description:
-    'Fetch article content as clean plain text. Without section_index: returns the full article with == Section == markers preserved for structure — or, when the article exceeds the size budget, a compact section outline (truncated: true) that points to wikipedia_get_sections plus a section_index read instead of the full text. With section_index (from wikipedia_get_sections): returns that section and every subsection nested under it, each heading above its own body. section_index 0 is the lead section, the text above the first heading, which is the full prose wikipedia_get_summary returns only a truncated fragment of. Section-targeted reads are faster and smaller when only part of the article is needed. Data tables are omitted from both paths, so a section whose body is entirely a data table returns its heading and little else; tables used only for layout, such as multi-column lists, keep their content. Page furniture is omitted as well — maintenance banners, sister-project and library-resource boxes, portal bars, and spoken-article notices — while a hatnote naming a related article is kept. Redirect pages are followed automatically.',
+    'Fetch article content as clean plain text. Without section_index: returns the full article with == Section == markers preserved for structure — or, when the article exceeds the size budget, a compact section outline (truncated: true) that points to wikipedia_get_sections plus a section_index read instead of the full text. With section_index (from wikipedia_get_sections): returns that section and every subsection nested under it, each heading above its own body. section_index 0 is the lead section, the text above the first heading, which is the full prose wikipedia_get_summary returns only a truncated fragment of. Section-targeted reads are faster and smaller when only part of the article is needed. Both paths keep superscripts and subscripts apart from the text beside them (10²³, H₂O), render formulas as their TeX, and render code samples as fenced blocks with their indentation intact. A section read also renders data tables as pipe-delimited rows (header row first) and infoboxes as "label: value" lines; a table too large to include leaves a "[table omitted: N rows]" marker in its place. The full-article path carries no data tables or infoboxes, so read the section for those. Tables used only for layout, such as multi-column lists, keep their content as ordinary text. Page furniture is omitted as well — maintenance banners, sister-project and library-resource boxes, portal bars, and spoken-article notices — while a hatnote naming a related article is kept. Every read returns the canonical article URL and the ID of the revision it was read from, for citation; a full read also returns that revision\'s timestamp. Redirect pages are followed automatically, and the citation fields name the target article.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     title: z
@@ -50,7 +53,7 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
     content: z
       .string()
       .describe(
-        'Plain-text article content. Both full articles and section reads carry == Section == markers above the text each one heads. When truncated is true, this instead carries a section outline (heading names and byte sizes) plus a pointer to the targeted-read path.',
+        'Plain-text article content. Both full articles and section reads carry == Section == markers above the text each one heads, code samples as ``` fenced blocks, and superscripts and subscripts as Unicode characters (10²³, H₂O), or as ^x / ^(…) and _x / _(…) where a character has none. Section reads also carry data tables as | cell | cell | rows with a | --- | row under the header. When truncated is true, this instead carries a section outline (heading names and byte sizes) plus a pointer to the targeted-read path.',
       ),
     section_title: z
       .string()
@@ -75,6 +78,24 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
       .optional()
       .describe(
         'True when content is an outline — call wikipedia_get_sections, then wikipedia_get_article with a section_index to read a specific section. Present only when truncated is true.',
+      ),
+    url: z
+      .string()
+      .optional()
+      .describe(
+        'Canonical desktop URL of the article (e.g. "https://en.wikipedia.org/wiki/Eiffel_Tower"), for citing the page rather than composing a URL from the title.',
+      ),
+    revision_id: z
+      .string()
+      .optional()
+      .describe(
+        'ID of the revision the content was read from. "https://<edition>.wikipedia.org/w/index.php?oldid=<revision_id>" is a permanent link to exactly that version.',
+      ),
+    last_modified: z
+      .string()
+      .optional()
+      .describe(
+        'ISO 8601 timestamp of that revision, for dating the content. Full-article reads only; a section read carries none.',
       ),
     language: z.string().describe('Language edition queried.'),
   }),
@@ -197,6 +218,8 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
         section_title: result.sectionTitle,
         content_type: 'section',
         truncated: false,
+        url: result.url,
+        revision_id: result.revisionId,
         language,
       };
     }
@@ -243,6 +266,13 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
       truncated: overflow.kind === 'outline',
     });
 
+    // The outline cites the same revision the full text would have, so both shapes carry it.
+    const citation = {
+      url: result.url,
+      revision_id: result.revisionId,
+      last_modified: result.lastModified,
+    };
+
     if (overflow.kind === 'outline') {
       const content = [
         `Full article outlined — ${originalLength} characters across ${overflow.sections.length} sections (largest first):`,
@@ -259,6 +289,7 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
         truncated: true,
         original_length: originalLength,
         sections_suggested: true,
+        ...citation,
         language,
       };
     }
@@ -269,6 +300,7 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
       content: result.content,
       content_type: 'full_article',
       truncated: false,
+      ...citation,
       language,
     };
   },
@@ -282,6 +314,9 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
         (result.pageid != null ? ` | **Page ID:** ${result.pageid}` : ''),
     );
     if (result.section_title) lines.push(`**Section:** ${escapeMarkdown(result.section_title)}`);
+    if (result.url) lines.push(`**URL:** ${result.url}`);
+    if (result.revision_id) lines.push(`**Revision ID:** ${result.revision_id}`);
+    if (result.last_modified) lines.push(`**Last modified:** ${result.last_modified}`);
     // Overflow disclosure — render each field on its own presence, never as mutually-exclusive
     // branches, so format-parity's all-fields-populated sample renders every field.
     if (result.truncated) {
@@ -296,9 +331,10 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
       );
     }
     lines.push('');
-    // The outline the overflow path writes rides in `content` too, so its own bullets escape with
-    // the section names they carry — one rule, and no path where upstream text reaches raw.
-    lines.push(escapeMarkdown(result.content));
+    // Prose escapes like every other upstream string; a fenced code block and a table row's
+    // delimiters are the renderer's own syntax and pass through. The outline the overflow path writes
+    // rides in `content` too, so its bullets escape with the section names they carry.
+    lines.push(escapeMarkdownOutsideBlocks(result.content));
     return [{ type: 'text', text: lines.join('\n') }];
   },
 });

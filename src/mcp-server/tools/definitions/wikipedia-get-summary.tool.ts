@@ -5,7 +5,10 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { escapeMarkdown } from '@/mcp-server/tools/utils/escape-markdown.js';
+import {
+  escapeMarkdown,
+  escapeMarkdownOutsideBlocks,
+} from '@/mcp-server/tools/utils/escape-markdown.js';
 import {
   getWikipediaService,
   isBlankTitle,
@@ -47,7 +50,7 @@ export const wikipediaGetSummary = tool('wikipedia_get_summary', {
     extract: z
       .string()
       .describe(
-        'Plain-text summary extract — a truncated fragment from the start of the lead section, not the whole lead. Call wikipedia_get_article with section_index 0 for the full lead.',
+        'Plain-text summary extract — a truncated fragment from the start of the lead section, not the whole lead. Superscripts and subscripts stay apart from the text beside them (10²³, H₂O), as wikipedia_get_article renders them. Call wikipedia_get_article with section_index 0 for the full lead.',
       ),
     thumbnail_url: z
       .string()
@@ -214,7 +217,9 @@ export const wikipediaGetSummary = tool('wikipedia_get_summary', {
     if (result.revision_id) lines.push(`**Revision ID:** ${result.revision_id}`);
     if (result.last_modified) lines.push(`**Last modified:** ${result.last_modified}`);
     lines.push('');
-    lines.push(escapeMarkdown(result.extract));
+    // The extract comes from the same renderer as an article read, so a fenced code block or a
+    // table row it writes passes through as syntax while the prose around it is escaped.
+    lines.push(escapeMarkdownOutsideBlocks(result.extract));
     return [{ type: 'text', text: lines.join('\n') }];
   },
 });

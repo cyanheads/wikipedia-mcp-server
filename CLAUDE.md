@@ -250,7 +250,8 @@ src/
     server-config.ts                    # Server-specific env vars (WIKIPEDIA_USER_AGENT, WIKIPEDIA_BASE_URL)
   services/
     wikipedia/
-      wikipedia-service.ts             # WikipediaService — REST API + Action API client, init/accessor
+      wikipedia-service.ts             # WikipediaService — REST API + Action API client, init/accessor, HTML → plain-text renderer
+      text-blocks.ts                   # Fenced-code and table-row grammar the renderer writes and the escaper reads back
       types.ts                         # Raw API response types
   mcp-server/
     tools/definitions/
@@ -261,6 +262,8 @@ src/
       wikipedia-search-nearby.tool.ts
       wikipedia-get-languages.tool.ts
       index.ts                         # Barrel export: allToolDefinitions[]
+    tools/utils/
+      escape-markdown.ts               # Markdown escaping for format() — prose escaped, code fences and row delimiters kept
 ```
 
 ---

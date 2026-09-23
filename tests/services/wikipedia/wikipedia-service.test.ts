@@ -11,7 +11,9 @@ import { createFetchMock, createMockContext } from '@cyanheads/mcp-ts-core/testi
 import { logger } from '@cyanheads/mcp-ts-core/utils';
 import { beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import {
+  articleUrl,
   buildBaseUrl,
+  DATA_TABLE_MAX_BYTES,
   type EditionIndex,
   GEOSEARCH_MAX_LIMIT,
   getWikipediaService,
@@ -911,6 +913,29 @@ describe('WikipediaService.getArticleFull — not_found handling', () => {
     expect(result.title).toBe('Python (programming language)');
     expect(result.content).toContain('Python is a programming language');
     expect(result.pageid).toBe(23862);
+  });
+
+  it('reads the formatversion=2 pages array, the shape upstream actually sends (characterization)', async () => {
+    const svc = getWikipediaService();
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
+      query: {
+        pages: [
+          {
+            pageid: 41545,
+            ns: 0,
+            title: 'Avogadro constant',
+            extract: 'The Avogadro constant is a ratio.',
+          },
+        ],
+      },
+    });
+
+    const result = await svc.getArticleFull('Avogadro constant', 'en', createMockContext());
+    expect(result).toMatchObject({
+      title: 'Avogadro constant',
+      pageid: 41545,
+      content: 'The Avogadro constant is a ratio.',
+    });
   });
 });
 
@@ -1884,8 +1909,8 @@ describe('htmlSectionToPlainText — parser HTML rendering (issue #28)', () => {
     expect(
       htmlSectionToPlainText('<p>Text.</p><figure><figcaption>Caption.</figcaption></figure>'),
     ).toBe('Text.');
-    // `sup` is dropped only when it carries the `reference` class.
-    expect(htmlSectionToPlainText('<p>E = mc<sup>2</sup></p>')).toBe('E = mc2');
+    // `sup` is dropped only when it carries the `reference` class; any other renders (issue #48).
+    expect(htmlSectionToPlainText('<p>E = mc<sup>2</sup></p>')).toBe('E = mc²');
   });
 
   it('decodes named and numeric entities', () => {
@@ -1917,7 +1942,7 @@ describe('htmlSectionToPlainText — parser HTML rendering (issue #28)', () => {
     // that shape from escaped text, or the parked block lands in the middle of the paragraph.
     expect(
       htmlSectionToPlainText('<p>lead &amp;#xFFFF;0&amp;#xFFFF; tail</p><pre>  code</pre>'),
-    ).toBe('lead &#xFFFF;0&#xFFFF; tail\n\n  code');
+    ).toBe('lead &#xFFFF;0&#xFFFF; tail\n\n```\n  code\n```');
   });
 
   it('returns an empty string for empty input', () => {
@@ -1965,15 +1990,21 @@ describe('htmlSectionToPlainText — layout vs data tables (issue #32)', () => {
     ).toBe('Header\n\nLeft\n\nRight');
   });
 
-  it('still drops a data table whole, leaking no cell text into the prose', () => {
+  it('renders a data table as rows rather than running its cells into the prose (issue #50)', () => {
+    // Reverses this block's original "drops a data table whole": a `wikitable` now renders as pipe
+    // rows. Its cells still never reach the prose as paragraphs of their own.
     const data =
       '<p>Lead.</p><table class="wikitable"><tbody><tr><th>Year</th><th>Title</th></tr><tr><td>2006</td><td>One</td></tr></tbody></table><p>Trailing.</p>';
-    expect(htmlSectionToPlainText(data)).toBe('Lead.\n\nTrailing.');
+    expect(htmlSectionToPlainText(data)).toBe(
+      'Lead.\n\n| Year | Title |\n| --- | --- |\n| 2006 | One |\n\nTrailing.',
+    );
   });
 
+  // The two nesting cases below use an unclassed table without `role` — a table the renderer still
+  // drops. A `wikitable` renders since issue #50, and its own nesting cases are covered there.
   it('drops a layout table nested inside a data table along with its parent', () => {
     const nested =
-      '<p>Lead.</p><table class="wikitable"><tbody><tr><td>cell<table role="presentation"><tbody><tr><td><ul><li>list item</li></ul></td></tr></tbody></table>trailing cell</td></tr></tbody></table><p>After.</p>';
+      '<p>Lead.</p><table><tbody><tr><td>cell<table role="presentation"><tbody><tr><td><ul><li>list item</li></ul></td></tr></tbody></table>trailing cell</td></tr></tbody></table><p>After.</p>';
     const text = htmlSectionToPlainText(nested);
     expect(text).toBe('Lead.\n\nAfter.');
     expect(text).not.toContain('list item');
@@ -1981,7 +2012,7 @@ describe('htmlSectionToPlainText — layout vs data tables (issue #32)', () => {
 
   it('drops a data table nested inside a layout table while keeping the layout table content', () => {
     const nested =
-      '<table role="presentation"><tbody><tr><td><ul><li>keep me</li></ul><table class="wikitable"><tbody><tr><td>drop me</td></tr></tbody></table><p>keep me too</p></td></tr></tbody></table>';
+      '<table role="presentation"><tbody><tr><td><ul><li>keep me</li></ul><table><tbody><tr><td>drop me</td></tr></tbody></table><p>keep me too</p></td></tr></tbody></table>';
     const text = htmlSectionToPlainText(nested);
     expect(text).toBe('keep me\n\nkeep me too');
     expect(text).not.toContain('drop me');
@@ -2195,6 +2226,377 @@ describe('htmlSectionToPlainText — side boxes and furniture bars (issue #34)',
   });
 });
 
+describe('htmlSectionToPlainText — tables the renderer still drops (characterization)', () => {
+  it('drops a navbox, whose tables carry neither a data-table class nor the layout role', () => {
+    const navbox = `<p>Before.</p><div role="navigation" class="navbox" aria-label="Navbox"><table class="nowraplinks navbox-inner"><tbody><tr><th class="navbox-group">Topics</th><td class="navbox-list"><ul><li>Alpha</li><li>Beta</li></ul></td></tr></tbody></table></div><p>After.</p>`;
+    expect(htmlSectionToPlainText(navbox)).toBe('Before.\n\nAfter.');
+  });
+
+  it('drops a sidebar table', () => {
+    const sidebar = `<table class="sidebar nomobile nowraplinks"><tbody><tr><th class="sidebar-title">Series</th></tr><tr><td class="sidebar-content">Part one</td></tr></tbody></table><p>Body.</p>`;
+    expect(htmlSectionToPlainText(sidebar)).toBe('Body.');
+  });
+
+  it('drops an unclassed chart table, such as the bar boxes beside a results table', () => {
+    const barbox = `<p>Lead.</p><div class="barbox"><table><caption class="bb-default">Popular vote</caption><tbody><tr><td colspan="2" class="bb-min8"><b>Trump</b></td><td class="bb-b"><div style="width:49.80%">&#8203;</div></td><td colspan="2" class="bb-r">49.80%</td></tr></tbody></table></div><p>After.</p>`;
+    expect(htmlSectionToPlainText(barbox)).toBe('Lead.\n\nAfter.');
+  });
+
+  it('renders a succession box as layout prose — the layout role outranks its wikitable class', () => {
+    const succession = `<table role="presentation" class="wikitable succession-box noprint"><tbody><tr><td class="succession-before">Preceded by<br /><b>Alpha</b></td><td class="succession-title">Office</td><td class="succession-after">Succeeded by<br /><b>Beta</b></td></tr></tbody></table>`;
+    expect(htmlSectionToPlainText(succession)).toBe(
+      'Preceded by\nAlpha\n\nOffice\n\nSucceeded by\nBeta',
+    );
+  });
+
+  it('renders an unclosed pre as prose, losing none of its text', () => {
+    expect(htmlSectionToPlainText('<p>Lead.</p><pre>  x &lt; y')).toBe('Lead.\n\nx < y');
+  });
+
+  it('renders an unclosed superscript as its text, losing none of what follows', () => {
+    expect(htmlSectionToPlainText('<p>10<sup>23 and the rest</p>')).toBe('1023 and the rest');
+  });
+});
+
+describe('htmlSectionToPlainText — superscripts and subscripts (issue #48)', () => {
+  it('renders exponents as Unicode superscripts, so they stay apart from the digits beside them', () => {
+    expect(
+      htmlSectionToPlainText(
+        '<p>the exact value 6.02214076×10<sup>23</sup>&#160;<a href="/wiki/Mole_(unit)">mol</a><sup>−1</sup> (reciprocal mole)</p>',
+      ),
+    ).toBe('the exact value 6.02214076×10²³ mol⁻¹ (reciprocal mole)');
+    expect(htmlSectionToPlainText('<p>about 1.496×10<sup>8</sup>&#160;kilometres</p>')).toBe(
+      'about 1.496×10⁸ kilometres',
+    );
+    expect(htmlSectionToPlainText('<p>O(<i>n</i><sup>2</sup>) and 2<sup>n-1</sup></p>')).toBe(
+      'O(n²) and 2ⁿ⁻¹',
+    );
+  });
+
+  it('renders digit subscripts as Unicode subscripts', () => {
+    expect(htmlSectionToPlainText('<p>H<sub>2</sub>O and CO<sub>2</sub></p>')).toBe('H₂O and CO₂');
+    expect(htmlSectionToPlainText('<p><sup>1</sup>⁄<sub>2</sub> cup</p>')).toBe('¹⁄₂ cup');
+  });
+
+  it('marks a superscript with no Unicode form by a caret, parenthesized past one character', () => {
+    expect(htmlSectionToPlainText('<p>e<sup>x</sup> in the 19<sup>th</sup> century</p>')).toBe(
+      'e^x in the 19^(th) century',
+    );
+  });
+
+  it('marks a subscript with no Unicode form by an underscore', () => {
+    expect(htmlSectionToPlainText('<p>denoted <i>N</i><sub>A</sub> or v<sub>max</sub></p>')).toBe(
+      'denoted N_A or v_(max)',
+    );
+  });
+
+  it('keeps a bracketed or symbol-only superscript as written — a marker, not an exponent', () => {
+    expect(
+      htmlSectionToPlainText(
+        '<p>Claim.<sup class="noprint Inline-Template Template-Fact">[<i>citation needed</i>]</sup> Tallest<sup class="citation nobold">[I]</sup> tower<sup>†</sup> (<a>listen</a><sup class="ext-phonos-attribution">ⓘ</sup>)</p>',
+      ),
+    ).toBe('Claim.[citation needed] Tallest[I] tower† (listenⓘ)');
+  });
+
+  it('still drops a footnote reference marker whole', () => {
+    expect(
+      htmlSectionToPlainText(
+        '<p>Mass 1.989×10<sup>30</sup>&#160;kg<sup id="cite_ref-1" class="reference"><a href="#cite_note-1">[1]</a></sup></p>',
+      ),
+    ).toBe('Mass 1.989×10³⁰ kg');
+  });
+
+  it('decodes a caret-marked superscript once', () => {
+    expect(htmlSectionToPlainText('<p>x<sup>a&amp;lt;b</sup></p>')).toBe('x^(a&lt;b)');
+  });
+
+  it('renders a superscript inside a heading', () => {
+    expect(htmlSectionToPlainText('<h2>Order 2<sup>n</sup></h2><p>Body.</p>')).toBe(
+      '== Order 2ⁿ ==\n\nBody.',
+    );
+  });
+
+  it('keeps an abbreviation superscript joined, as its edition writes it in plain text', () => {
+    // French Wikipedia wraps ordinals and abbreviations in `<abbr>`: {{s|XIX}}, {{1er}}, {{Mme}}, {{n°}}.
+    const html =
+      '<p>Au <abbr class="abbr" title="Dix-neuvième"><span class="romain" style="text-transform:uppercase">XIX</span><sup style="font-size:72%">e</sup></abbr> siècle, le <abbr class="abbr" title="premier">1<sup>er</sup></abbr> mai, <abbr class="abbr" title="Madame">M<sup>me</sup></abbr> Curie, <abbr class="abbr" title="numéro">n<sup>o</sup></abbr> 5, <abbr class="abbr" title="Douzième">12<sup>e</sup></abbr>/14.</p>';
+    expect(htmlSectionToPlainText(html)).toBe(
+      'Au XIXe siècle, le 1er mai, Mme Curie, no 5, 12e/14.',
+    );
+  });
+
+  it('still marks an exponent outside an abbreviation, and renders glyph digits inside one', () => {
+    expect(
+      htmlSectionToPlainText(
+        '<p>N &lt; 2<sup>K</sup>, e<sup>x</sup>, 12<sup>e</sup> and 40 <abbr title="mètres carrés">m<sup>2</sup></abbr></p>',
+      ),
+    ).toBe('N < 2^K, e^x, 12^e and 40 m²');
+  });
+
+  it('does not let an unclosed abbreviation reach past a block to join a later exponent', () => {
+    expect(htmlSectionToPlainText('<p><abbr>XIX</p><p>Then e<sup>x</sup>.</abbr></p>')).toBe(
+      'XIX\n\nThen e^x.',
+    );
+  });
+
+  it('renders a nested script from the inside out, so an inner exponent stays an exponent', () => {
+    expect(
+      htmlSectionToPlainText(
+        '<p>∫ e<sup>−t<sup>2</sup></sup> dt, x<sup>a<sub>i</sub></sup>, 2<sup>2<sup>n</sup></sup></p>',
+      ),
+    ).toBe('∫ e^(−t²) dt, x^(a_i), 2^(2ⁿ)');
+  });
+});
+
+describe('htmlSectionToPlainText — fenced code blocks (issue #49)', () => {
+  it('fences a pre block and keeps its lines and indentation verbatim', () => {
+    const html =
+      '<p>Program:</p><div class="mw-highlight mw-highlight-lang-python"><pre><span></span><span class="k">if</span> n &lt; 0:\n    factorial *= i\n</pre></div><p>After.</p>';
+    expect(htmlSectionToPlainText(html)).toBe(
+      'Program:\n\n```\nif n < 0:\n    factorial *= i\n```\n\nAfter.',
+    );
+  });
+
+  it('makes the fence longer than any backtick run inside the block', () => {
+    expect(htmlSectionToPlainText('<pre>a ``` b\n````\nc</pre>')).toBe(
+      '`````\na ``` b\n````\nc\n`````',
+    );
+  });
+
+  it('omits a pre block with no text rather than emitting an empty fence', () => {
+    expect(htmlSectionToPlainText('<p>Lead.</p><pre>\n  \n</pre><p>After.</p>')).toBe(
+      'Lead.\n\nAfter.',
+    );
+  });
+
+  it('cannot be made to inject a parked block through a decoded placeholder character', () => {
+    // A block is parked behind a U+FFFF-delimited index. A numeric reference decoding to U+FFFF
+    // would let prose rebuild that placeholder and pull the block into the middle of a sentence.
+    const text = htmlSectionToPlainText('<p>lead &#xFFFF;0&#xFFFF; tail</p><pre>code</pre>');
+    expect(text).toBe('lead &#xFFFF;0&#xFFFF; tail\n\n```\ncode\n```');
+    expect(text.match(/code/g)).toHaveLength(1);
+  });
+});
+
+/**
+ * Fixture shaped like the `2024 United States presidential election` `Electoral results` table: a
+ * caption, two header rows joined by `rowspan`, a `colspan` header over two columns, footnote
+ * markers inside header cells, a `colspan` label on a totals row, and a `<th>` row header in the body.
+ */
+const RESULTS_TABLE_HTML = `<p>Candidates are listed individually below.</p>
+<table class="wikitable">
+<caption>Electoral results
+</caption>
+<tbody><tr>
+<th rowspan="2">Presidential candidate
+</th>
+<th colspan="2">Popular vote<sup id="cite_ref-fec_1-1" class="reference"><a href="#cite_note-fec-1">[1]</a></sup>
+</th>
+<th rowspan="2">Electoral<br />vote
+</th></tr>
+<tr>
+<th>Count
+</th>
+<th>Percentage
+</th></tr>
+<tr>
+<td><b> <a href="/wiki/Donald_Trump" title="Donald Trump">Donald Trump</a></b>
+</td>
+<td style="text-align:right;">77,302,580
+</td>
+<td style="text-align:right;">49.80%
+</td>
+<td style="text-align:right;">312
+</td></tr>
+<tr style="text-align:right">
+<td colspan="2" style="text-align:left;"><b>Other</b>
+</td>
+<td>0.30%
+</td>
+<td>—
+</td></tr>
+<tr style="text-align:right">
+<th colspan="3">Needed to win
+</th>
+<td>270
+</td></tr></tbody></table>
+<p>After the table.</p>`;
+
+/** Fixture shaped like the `Eiffel Tower` infobox: title, section headers, and label/value rows. */
+const INFOBOX_HTML = `<table class="infobox vcard"><tbody><tr><th colspan="2" class="infobox-above fn org">Eiffel Tower</th></tr><tr><th colspan="2" class="infobox-header">Height</th></tr><tr><th scope="row" class="infobox-label">Architectural</th><td class="infobox-data">300&#160;m (984&#160;ft)<sup id="cite_ref-CTBUH_2-0" class="reference"><a href="#cite_note-CTBUH-2">[2]</a></sup></td></tr><tr><th scope="row" class="infobox-label"><div style="display: inline-block;">Structural engineer</div></th><td class="infobox-data"><a href="/wiki/Maurice_Koechlin">Maurice Koechlin</a><br /><a href="/wiki/%C3%89mile_Nouguier">Émile Nouguier</a></td></tr><tr><th scope="row" class="infobox-label">Coordinates</th><td class="infobox-data"><span class="geo-dms"><span class="latitude">48°51′29.6″N</span> <span class="longitude">2°17′40.2″E</span></span><span style="display:none">48.858222; 2.294500</span></td></tr><tr style="display:none"><td colspan="2">hidden row</td></tr><tr><td colspan="2" class="infobox-full-data"><span class="url"><a href="https://www.toureiffel.paris/en">toureiffel.paris</a></span></td></tr></tbody></table>
+<p>The <b>Eiffel Tower</b> is a lattice tower.</p>`;
+
+describe('htmlSectionToPlainText — data tables and infoboxes (issue #50)', () => {
+  it('renders a data table as pipe rows, header row first, with its caption above', () => {
+    expect(htmlSectionToPlainText(RESULTS_TABLE_HTML)).toBe(
+      [
+        'Candidates are listed individually below.',
+        '',
+        'Electoral results',
+        '',
+        '| Presidential candidate | Popular vote | Popular vote | Electoral vote |',
+        '| --- | --- | --- | --- |',
+        '| Presidential candidate | Count | Percentage | Electoral vote |',
+        '| Donald Trump | 77,302,580 | 49.80% | 312 |',
+        '| Other |  | 0.30% | — |',
+        '| Needed to win |  |  | 270 |',
+        '',
+        'After the table.',
+      ].join('\n'),
+    );
+  });
+
+  it('renders an infobox as one "label: value" line per row', () => {
+    expect(htmlSectionToPlainText(INFOBOX_HTML)).toBe(
+      [
+        'Eiffel Tower',
+        'Height',
+        'Architectural: 300 m (984 ft)',
+        'Structural engineer: Maurice Koechlin; Émile Nouguier',
+        'Coordinates: 48°51′29.6″N 2°17′40.2″E',
+        'toureiffel.paris',
+        '',
+        'The Eiffel Tower is a lattice tower.',
+      ].join('\n'),
+    );
+  });
+
+  it('repeats a rowspan cell down every row it covers', () => {
+    const html =
+      '<table class="wikitable"><tr><th>Year</th><th>Title</th></tr><tr><td rowspan="3">2006</td><td>One</td></tr><tr><td>Two</td></tr><tr><td>Three</td></tr><tr><td>2008</td><td>Four</td></tr></table>';
+    expect(htmlSectionToPlainText(html)).toBe(
+      '| Year | Title |\n| --- | --- |\n| 2006 | One |\n| 2006 | Two |\n| 2006 | Three |\n| 2008 | Four |',
+    );
+  });
+
+  it('renders superscripts inside a cell the same way as in prose', () => {
+    const html =
+      '<table class="wikitable"><tr><th>Quantity</th><th>Value</th></tr><tr><td>Mass</td><td>1.989×10<sup>30</sup> kg</td></tr></table>';
+    expect(htmlSectionToPlainText(html)).toContain('| Mass | 1.989×10³⁰ kg |');
+  });
+
+  it('escapes a literal pipe in a cell so it cannot split the row', () => {
+    const html =
+      '<table class="wikitable"><tr><th>Operator</th></tr><tr><td><code>a | b</code></td></tr><tr><td>x\\|y</td></tr></table>';
+    expect(htmlSectionToPlainText(html)).toBe('| Operator |\n| --- |\n| a \\| b |\n| x\\\\|y |');
+  });
+
+  it('flattens a code block inside a cell onto the cell line', () => {
+    const html =
+      '<table class="wikitable"><tr><th>Language</th><th>Example</th></tr><tr><td>Python</td><td><pre>def f():\n    return 1</pre></td></tr></table>';
+    expect(htmlSectionToPlainText(html)).toBe(
+      '| Language | Example |\n| --- | --- |\n| Python | def f(): return 1 |',
+    );
+  });
+
+  it('flattens a layout table inside a cell into that cell', () => {
+    const html =
+      '<table class="wikitable"><tr><th>Artist</th><th>Albums</th></tr><tr><td>A</td><td><table role="presentation"><tr><td><ul><li>One</li><li>Two</li></ul></td></tr></table></td></tr></table>';
+    expect(htmlSectionToPlainText(html)).toBe(
+      '| Artist | Albums |\n| --- | --- |\n| A | One; Two |',
+    );
+  });
+
+  it('flattens a data table nested two levels deep without letting its rows reach the outer table', () => {
+    const html =
+      '<table class="wikitable"><tr><th>Outer</th></tr><tr><td>cell<table class="wikitable"><tr><td>inner<table><tr><td>deepest</td></tr></table></td></tr></table>tail</td></tr><tr><td>next</td></tr></table>';
+    expect(htmlSectionToPlainText(html)).toBe(
+      '| Outer |\n| --- |\n| cell; inner; deepest; tail |\n| next |',
+    );
+  });
+
+  it('renders a data table nested in a layout table, keeping the layout content around it', () => {
+    const html =
+      '<table role="presentation"><tbody><tr><td><p>keep me</p><table class="wikitable"><tr><th>Y</th></tr><tr><td>1</td></tr></table><p>keep me too</p></td></tr></tbody></table>';
+    expect(htmlSectionToPlainText(html)).toBe('keep me\n\n| Y |\n| --- |\n| 1 |\n\nkeep me too');
+  });
+
+  it('drops furniture nested inside a data table while rendering the table', () => {
+    const html =
+      '<table class="wikitable"><tr><th>A</th></tr><tr><td>kept<div class="side-box metadata"><p>Library resources</p></div><span style="display:none">hidden</span></td></tr></table>';
+    expect(htmlSectionToPlainText(html)).toBe('| A |\n| --- |\n| kept |');
+  });
+
+  it('leaves a one-line marker in place of a table over the size cap', () => {
+    const cell = 'x'.repeat(100);
+    const rows = Math.ceil(DATA_TABLE_MAX_BYTES / 100) + 1;
+    const html = `<p>Lead.</p><table class="wikitable"><caption>Big</caption><tr><th>H</th></tr>${`<tr><td>${cell}</td></tr>`.repeat(rows)}</table><p>After.</p>`;
+    expect(htmlSectionToPlainText(html)).toBe(
+      `Lead.\n\nBig\n\n[table omitted: ${rows + 1} rows]\n\nAfter.`,
+    );
+  });
+
+  it('renders a table exactly at the cap in full', () => {
+    const header = '| H |\n| --- |\n';
+    const cell = 'y'.repeat(DATA_TABLE_MAX_BYTES - header.length - 4);
+    const text = htmlSectionToPlainText(
+      `<table class="wikitable"><tr><th>H</th></tr><tr><td>${cell}</td></tr></table>`,
+    );
+    expect(Buffer.byteLength(text)).toBe(DATA_TABLE_MAX_BYTES);
+    expect(text).toBe(`${header}| ${cell} |`);
+  });
+
+  it('renders nothing for a data table with no cell text, and keeps its caption', () => {
+    expect(
+      htmlSectionToPlainText(
+        '<p>Lead.</p><table class="wikitable"><caption>Empty</caption><tr><td> </td><td></td></tr></table>',
+      ),
+    ).toBe('Lead.\n\nEmpty');
+    expect(htmlSectionToPlainText('<p>Lead.</p><table class="wikitable"></table>')).toBe('Lead.');
+  });
+
+  it('renders the rows of an unclosed table and of cells missing their end tags', () => {
+    expect(
+      htmlSectionToPlainText('<table class="wikitable"><tr><th>A<th>B<tr><td>1<td>2<tr><td>3'),
+    ).toBe('| A | B |\n| --- | --- |\n| 1 | 2 |\n| 3 |  |');
+  });
+
+  it('writes a header cell alone on its row once, as a group label rather than a column heading', () => {
+    const html =
+      '<table class="wikitable"><tr><th colspan="3">Season by season</th></tr><tr><th>Team</th><th colspan="2">Result</th></tr><tr><th colspan="3">Group A</th></tr><tr><td>X</td><td>3</td><td>1</td></tr></table>';
+    expect(htmlSectionToPlainText(html)).toBe(
+      [
+        '| Season by season |  |  |',
+        '| --- | --- | --- |',
+        '| Team | Result | Result |',
+        '| Group A |  |  |',
+        '| X | 3 | 1 |',
+      ].join('\n'),
+    );
+  });
+
+  it('drops an infobox image caption, which describes a picture the text cannot carry', () => {
+    const html =
+      '<table class="infobox"><tbody><tr><th colspan="2" class="infobox-above">Eiffel Tower</th></tr><tr><td colspan="2" class="infobox-image"><span typeof="mw:File"><img src="t.jpg" alt="The tower"></span><div class="infobox-caption">Seen from the Champ de Mars, 2009</div></td></tr><tr><td colspan="2" class="infobox-image"><a class="mw-kartographer-map"><img alt="Map" src="m.png"></a><div class="infobox-caption">Interactive map of the Eiffel Tower area</div></td></tr><tr><th class="infobox-label">Height</th><td class="infobox-data">330 m</td></tr></tbody></table>';
+    expect(htmlSectionToPlainText(html)).toBe('Eiffel Tower\nHeight: 330 m');
+  });
+
+  it('drops the edit links an infobox carries, on each edition’s own markup', () => {
+    const html = [
+      '<table class="infobox"><tbody><tr><th class="infobox-above">Die Dubarry</th></tr>',
+      '<tr><th class="label">Reino:</th><td>Animalia</td></tr>',
+      '<tr><td class="noprint" colspan="2"><div class="plainlinks wikidata-link">&#x5b;<a href="https://www.wikidata.org/wiki/Q1">editar datos en Wikidata</a>&#x5d;</div></td></tr>',
+      '<tr><td colspan="2"><p class="navbar bordered noprint"><a href="/w/index.php?action=edit">modifier</a></p></td></tr>',
+      '<tr><td colspan="2"><div class="plainlinks hlist navbar mini"><ul><li>view</li><li>talk</li><li>edit</li></ul></div></td></tr>',
+      '<tr><th class="label">Born</th><td>1908<span class="noprint ForceAgeToShow"> (age 38)</span></td></tr>',
+      '</tbody></table>',
+    ].join('');
+    expect(htmlSectionToPlainText(html)).toBe('Die Dubarry\nReino: Animalia\nBorn: 1908 (age 38)');
+  });
+
+  it('keeps the title Module:Navbar sets beside its edit links', () => {
+    const html =
+      '<div style="font-weight:bold"><div class="navbar plainlinks hlist navbar-collapse navbar-mini"><ul><li class="nv-view"><abbr>v</abbr></li><li class="nv-talk"><abbr>t</abbr></li><li class="nv-edit"><abbr>e</abbr></li></ul></div><div class="navbar-ct-mini">Left-step periodic table (by Charles Janet)</div></div>';
+    expect(htmlSectionToPlainText(html)).toBe('Left-step periodic table (by Charles Janet)');
+  });
+
+  it('treats a zero or non-numeric span as one cell and clamps a rowspan past the last row', () => {
+    const html =
+      '<table class="wikitable"><tr><th colspan="0">A</th><th colspan="x">B</th></tr><tr><td rowspan="999">1</td><td>2</td></tr><tr><td>3</td></tr></table>';
+    expect(htmlSectionToPlainText(html)).toBe('| A | B |\n| --- | --- |\n| 1 | 2 |\n| 1 | 3 |');
+  });
+});
+
 describe('htmlSectionToPlainText — elements the page hides (issue #33)', () => {
   it('renders each formula exactly once, as the TeX the fallback image carries', () => {
     const text = htmlSectionToPlainText(DISPLAY_MATH_HTML);
@@ -2239,6 +2641,23 @@ describe('htmlSectionToPlainText — elements the page hides (issue #33)', () =>
   });
 });
 
+describe('htmlSectionToPlainText — parse-preview warnings (issue #57)', () => {
+  const PREVIEW_WARNINGS =
+    '<p><b>White</b> is a community in Ontario.</p><div class="preview-warning"><strong>Preview warning:</strong> Page using <a href="/wiki/Template:Infobox_settlement" title="Template:Infobox settlement">Template:Infobox settlement</a> with deprecated parameter <code>settlement_type</code>. Replace with <code>type</code>.</div><link rel="mw-deduplicated-inline-style" href="mw-data:TemplateStyles:r1"><div class="preview-warning"><strong>Preview warning:</strong> Page using <a href="/wiki/Template:Infobox_settlement">Template:Infobox settlement</a> with deprecated parameter <code>image_caption</code>. Replace with <code>caption</code>.</div><p>It lies on the river.</p>';
+
+  it('drops every preview warning and keeps the prose around them', () => {
+    expect(htmlSectionToPlainText(PREVIEW_WARNINGS)).toBe(
+      'White is a community in Ontario.\n\nIt lies on the river.',
+    );
+  });
+
+  it('keeps a div whose class only starts with preview-warning', () => {
+    expect(htmlSectionToPlainText('<div class="preview-warning-note">Kept text.</div>')).toBe(
+      'Kept text.',
+    );
+  });
+});
+
 describe('WikipediaService.getArticleSection — rendered section reads (issue #28)', () => {
   beforeEach(() => {
     initService();
@@ -2259,9 +2678,10 @@ describe('WikipediaService.getArticleSection — rendered section reads (issue #
     await svc.getArticleSection('Python (programming language)', 4, 'en', createMockContext());
 
     const params = spy.mock.calls[0]?.[1] as Record<string, string>;
-    expect(params.prop).toBe('text');
+    // `revid` rides the same request for the citation fields (issue #53).
+    expect(params.prop).toBe('text|revid');
     expect(params).not.toHaveProperty('wikitext');
-    expect(params.prop).not.toBe('wikitext');
+    expect(params.prop).not.toContain('wikitext');
     // The index space is the endpoint's own, shared with getSections' tocdata indices.
     expect(params.section).toBe('4');
     expect(params.page).toBe('Python (programming language)');
@@ -2371,8 +2791,8 @@ describe('WikipediaService.getArticleSection — lead section (issue #40)', () =
     expect(result.content).not.toBe('');
     expect(result.content).toContain('quokka');
     expect(result.content).toContain('For other uses');
-    // The taxobox is a data table and goes the way every other data table does.
-    expect(result.content).not.toContain('Conservation status');
+    // The taxobox is an infobox, rendered ahead of the prose as label/value lines (issue #50).
+    expect(result.content).toContain('Conservation status\n\nThe quokka');
   });
 
   it('keeps the "Section N" fallback for a headless section other than the lead', async () => {
@@ -3032,5 +3452,447 @@ describe('WikipediaService.searchNearby — description and QID (issue #52)', ()
     expect(results).toEqual([
       { title: 'Only in the list', pageid: 5, latitude: 1, longitude: 2, distance_meters: 3 },
     ]);
+  });
+});
+
+/**
+ * A TextExtracts HTML-mode extract (`prop=extracts` without `explaintext`) in the shape upstream
+ * sends it: bare `<hN>` headings, superscripts and subscripts kept, class attributes mostly gone, an
+ * inline formula as visible MathML whose `alttext` holds the TeX — including a literal `>` — and a
+ * `<pre>` sample.
+ */
+const HTML_EXTRACT = `<p class="mw-empty-elt">
+</p>
+<p>In chemistry, the <b>Avogadro constant</b>, commonly denoted <span><b><i>N</i><sub>A</sub></b></span>, has the exact value <span><span data-sort-value="7023602214076000000♠"></span>6.022<span>140</span><span>76</span><span>×</span>10<sup>23</sup> mol<sup>−1</sup></span>.
+</p>
+<h2><span id="History">History</span></h2>
+<p>Named after Amedeo Avogadro.
+</p>
+<h3><span id="Definition">Definition</span></h3>
+<p>For every <span><span><math xmlns="http://www.w3.org/1998/Math/MathML" class="mathjax_ignore" alttext="{\\displaystyle \\varepsilon >0,\\ a&lt;b}">
+  <semantics>
+    <mrow class="MJX-TeXAtom-ORD">
+      <mi>ε</mi>
+      <mo>&gt;</mo>
+      <mn>0</mn>
+    </mrow>
+    <annotation encoding="application/x-tex">{\\displaystyle \\varepsilon >0,\\ a&lt;b}</annotation>
+  </semantics>
+</math></span></span>, it holds.
+</p>
+<h4><span id="Pseudocode">Pseudocode</span></h4>
+<pre>if n &lt; 0:
+    x *= 2
+</pre>
+<ul><li>First</li>
+<li>Second</li></ul>`;
+
+/** {@link HTML_EXTRACT} as the full-article path must render it. */
+const HTML_EXTRACT_TEXT = [
+  'In chemistry, the Avogadro constant, commonly denoted N_A, has the exact value 6.02214076×10²³ mol⁻¹.',
+  '',
+  '== History ==',
+  '',
+  'Named after Amedeo Avogadro.',
+  '',
+  '=== Definition ===',
+  '',
+  'For every {\\displaystyle \\varepsilon >0,\\ a<b}, it holds.',
+  '',
+  '==== Pseudocode ====',
+  '',
+  '```',
+  'if n < 0:',
+  '    x *= 2',
+  '```',
+  '',
+  'First',
+  'Second',
+].join('\n');
+
+/** A full-read response for the alias `NYC`, carrying the redirect target's revision and URL. */
+function nycFullReadResponse(extract: string) {
+  return {
+    batchcomplete: true,
+    warnings: {
+      extracts: { warnings: 'HTML may be malformed and/or unbalanced and may omit inline images.' },
+    },
+    query: {
+      redirects: [{ from: 'NYC', to: 'New York City' }],
+      pages: [
+        {
+          pageid: 645042,
+          ns: 0,
+          title: 'New York City',
+          extract,
+          touched: '2026-09-22T15:27:10Z',
+          lastrevid: 1376082128,
+          fullurl: 'https://en.wikipedia.org/wiki/New_York_City',
+          canonicalurl: 'https://en.wikipedia.org/wiki/New_York_City',
+          revisions: [
+            { revid: 1376082128, parentid: 1376061545, timestamp: '2026-09-21T23:42:01Z' },
+          ],
+        },
+      ],
+    },
+  };
+}
+
+describe('WikipediaService.getArticleFull — HTML-mode extract (issue #48)', () => {
+  beforeEach(() => {
+    initService();
+  });
+
+  it('requests the HTML extract and the citation metadata in one request (issues #48, #53)', async () => {
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+    const spy = vi
+      .spyOn(svc, 'actionGet')
+      .mockResolvedValue(nycFullReadResponse('<p>New York City.</p>'));
+
+    await svc.getArticleFull('NYC', 'en', ctx);
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledWith(
+      'en',
+      {
+        action: 'query',
+        titles: 'NYC',
+        prop: 'extracts|info|revisions',
+        inprop: 'url',
+        rvprop: 'ids|timestamp',
+        redirects: 'true',
+      },
+      ctx,
+    );
+  });
+
+  it('renders headings as == markers, keeps superscripts, fences code, and renders a formula once', async () => {
+    const svc = getWikipediaService();
+    vi.spyOn(svc, 'actionGet').mockResolvedValue(nycFullReadResponse(HTML_EXTRACT));
+
+    const { content } = await svc.getArticleFull('NYC', 'en', createMockContext());
+    expect(content).toBe(HTML_EXTRACT_TEXT);
+    expect(splitArticleIntoSections(content).map((s) => s.heading)).toEqual([
+      LEAD_SECTION_TITLE,
+      'History',
+      'Definition',
+      'Pseudocode',
+    ]);
+  });
+
+  it('loses no text after an unclosed tag, and every heading still splits a section', async () => {
+    const svc = getWikipediaService();
+    // Unclosed <b>, <i>, <p>, <sup>, and <math>, each followed by more text and a heading. The
+    // superscript and the formula each have a closed twin further on that must not reach back.
+    const unbalanced = [
+      '<p>Lead with an unclosed <b>bold run and 10<sup>8 km of text',
+      '<h2>Alpha</h2>',
+      '<p>Alpha body <i>never closed, then c<sup>2</sup>.',
+      '<p>Formula <math alttext="{\\displaystyle x>1}"><mi>x</mi> left open, still prose.',
+      '<h2>Beta</h2>',
+      '<p>Beta body <math alttext="{\\displaystyle y}"><mi>y</mi></math> closes.</p>',
+    ].join('\n');
+    vi.spyOn(svc, 'actionGet').mockResolvedValue(nycFullReadResponse(unbalanced));
+
+    const { content } = await svc.getArticleFull('NYC', 'en', createMockContext());
+    for (const text of [
+      'Lead with an unclosed bold run and 108 km of text',
+      'Alpha body never closed, then c².',
+      'left open, still prose.',
+      'Beta body {\\displaystyle y} closes.',
+    ]) {
+      expect(content).toContain(text);
+    }
+    expect(splitArticleIntoSections(content).map((s) => s.heading)).toEqual([
+      LEAD_SECTION_TITLE,
+      'Alpha',
+      'Beta',
+    ]);
+  });
+
+  it('reports no readable content when the extract renders to nothing', async () => {
+    const svc = getWikipediaService();
+    vi.spyOn(svc, 'actionGet').mockResolvedValue(
+      nycFullReadResponse('<p class="mw-empty-elt">\n</p>\n\n<p class="mw-empty-elt">\n\n</p>'),
+    );
+
+    await expect(svc.getArticleFull('NYC', 'en', createMockContext())).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      message: expect.stringContaining('no readable content'),
+    });
+  });
+});
+
+describe('WikipediaService.getArticleFull — citation fields (issue #53)', () => {
+  beforeEach(() => {
+    initService();
+  });
+
+  it("returns the redirect target's revision, that revision's timestamp, and its canonical URL", async () => {
+    const svc = getWikipediaService();
+    vi.spyOn(svc, 'actionGet').mockResolvedValue(nycFullReadResponse('<p>New York City.</p>'));
+
+    const result = await svc.getArticleFull('NYC', 'en', createMockContext());
+    expect(result).toEqual({
+      title: 'New York City',
+      pageid: 645042,
+      content: 'New York City.',
+      revisionId: '1376082128',
+      // The revision's own timestamp, never `touched`, which moves without an edit.
+      lastModified: '2026-09-21T23:42:01Z',
+      url: 'https://en.wikipedia.org/wiki/New_York_City',
+    });
+  });
+
+  it('leaves the citation fields undefined when upstream omits them', async () => {
+    const svc = getWikipediaService();
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
+      query: { pages: [{ pageid: 1, title: 'Sparse', extract: '<p>Body.</p>' }] },
+    });
+
+    const result = await svc.getArticleFull('Sparse', 'en', createMockContext());
+    expect(result.revisionId).toBeUndefined();
+    expect(result.lastModified).toBeUndefined();
+    expect(result.url).toBeUndefined();
+  });
+});
+
+/**
+ * Titles paired with the `fullurl` MediaWiki reports for them (`action=query&prop=info&inprop=url`
+ * without `redirects`, so each title is encoded as written). Covers every character class
+ * `wfUrlencode` treats specially: `/ : ; @ $ ! * ( ) , ~` stay literal, `? & + = % " '` are escaped,
+ * and non-ASCII is percent-encoded UTF-8.
+ */
+const LIVE_FULLURLS: ReadonlyArray<readonly [host: string, title: string, fullurl: string]> = [
+  ['https://en.wikipedia.org', 'AC/DC', 'https://en.wikipedia.org/wiki/AC/DC'],
+  [
+    'https://en.wikipedia.org',
+    'Star Trek: The Original Series',
+    'https://en.wikipedia.org/wiki/Star_Trek:_The_Original_Series',
+  ],
+  ['https://en.wikipedia.org', 'C++', 'https://en.wikipedia.org/wiki/C%2B%2B'],
+  ['https://en.wikipedia.org', 'Zürich', 'https://en.wikipedia.org/wiki/Z%C3%BCrich'],
+  [
+    'https://en.wikipedia.org',
+    "Who's Afraid of Virginia Woolf?",
+    'https://en.wikipedia.org/wiki/Who%27s_Afraid_of_Virginia_Woolf%3F',
+  ],
+  [
+    'https://en.wikipedia.org',
+    'Procter & Gamble',
+    'https://en.wikipedia.org/wiki/Procter_%26_Gamble',
+  ],
+  ['https://en.wikipedia.org', 'AT&T', 'https://en.wikipedia.org/wiki/AT%26T'],
+  [
+    'https://en.wikipedia.org',
+    'M*A*S*H (TV series)',
+    'https://en.wikipedia.org/wiki/M*A*S*H_(TV_series)',
+  ],
+  ['https://en.wikipedia.org', '@midnight', 'https://en.wikipedia.org/wiki/@midnight'],
+  ['https://en.wikipedia.org', 'Ke$ha', 'https://en.wikipedia.org/wiki/Ke$ha'],
+  ['https://en.wikipedia.org', 'E=MC²', 'https://en.wikipedia.org/wiki/E%3DMC%C2%B2'],
+  ['https://en.wikipedia.org', '100%', 'https://en.wikipedia.org/wiki/100%25'],
+  [
+    'https://en.wikipedia.org',
+    '"Hello, World!" program',
+    'https://en.wikipedia.org/wiki/%22Hello,_World!%22_program',
+  ],
+  ['https://en.wikipedia.org', 'A;B', 'https://en.wikipedia.org/wiki/A;B'],
+  ['https://en.wikipedia.org', 'A~B', 'https://en.wikipedia.org/wiki/A~B'],
+  [
+    'https://en.wikipedia.org',
+    'What If...? (TV series)',
+    'https://en.wikipedia.org/wiki/What_If...%3F_(TV_series)',
+  ],
+  [
+    'https://en.wikipedia.org',
+    'Mass–energy equivalence',
+    'https://en.wikipedia.org/wiki/Mass%E2%80%93energy_equivalence',
+  ],
+  [
+    'https://en.wikipedia.org',
+    'Talk:Python (programming language)',
+    'https://en.wikipedia.org/wiki/Talk:Python_(programming_language)',
+  ],
+  ['https://de.wikipedia.org', 'Straße', 'https://de.wikipedia.org/wiki/Stra%C3%9Fe'],
+  [
+    'https://ja.wikipedia.org',
+    '東京都',
+    'https://ja.wikipedia.org/wiki/%E6%9D%B1%E4%BA%AC%E9%83%BD',
+  ],
+];
+
+describe('articleUrl — MediaWiki title encoding (issue #53)', () => {
+  it.each(LIVE_FULLURLS)('encodes %s %s byte-identically to fullurl', (host, title, fullurl) => {
+    expect(articleUrl(host, title)).toBe(fullurl);
+  });
+});
+
+describe('WikipediaService.getArticleSection — citation fields (issue #53)', () => {
+  beforeEach(() => {
+    initService();
+  });
+
+  const SECTION_HTML =
+    '<div class="mw-heading mw-heading2"><h2 id="Etymology">Etymology</h2></div>\n<p>In 1664, New York was named after the Duke of York.</p>';
+
+  it('requests the revision with the section and composes the URL from the resolved title', async () => {
+    const svc = getWikipediaService();
+    const ctx = createMockContext();
+    const spy = vi.spyOn(svc, 'actionGet').mockResolvedValue({
+      parse: {
+        title: 'New York City',
+        pageid: 645042,
+        revid: 1376082128,
+        redirects: [{ from: 'NYC', to: 'New York City' }],
+        text: SECTION_HTML,
+      },
+    });
+
+    const result = await svc.getArticleSection('NYC', 1, 'en', ctx);
+    expect(spy).toHaveBeenCalledWith('en', expect.objectContaining({ prop: 'text|revid' }), ctx);
+    expect(result).toEqual({
+      title: 'New York City',
+      pageid: 645042,
+      sectionTitle: 'Etymology',
+      content: 'In 1664, New York was named after the Duke of York.'.replace(
+        /^/,
+        '== Etymology ==\n\n',
+      ),
+      revisionId: '1376082128',
+      url: 'https://en.wikipedia.org/wiki/New_York_City',
+    });
+    // action=parse carries no revision timestamp, and a second request is not spent on one.
+    expect(result).not.toHaveProperty('lastModified');
+  });
+
+  it.each(LIVE_FULLURLS)('composes %s %s as fullurl reports it', async (host, title, fullurl) => {
+    const svc = getWikipediaService();
+    const language = new URL(host).hostname.split('.')[0] as string;
+    vi.spyOn(svc, 'fetchEditionIndex').mockResolvedValue({
+      ...TEST_EDITION_INDEX,
+      hosts: { ...TEST_EDITION_INDEX.hosts, [language]: host },
+    });
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
+      parse: { title, pageid: 1, revid: 2, text: SECTION_HTML },
+    });
+
+    const result = await svc.getArticleSection(title, 1, language, createMockContext());
+    expect(result.url).toBe(fullurl);
+  });
+
+  it('omits the URL under a single-instance override, whose article path is unknown', async () => {
+    const svc = initService('https://mirror.example.org/');
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
+      parse: { title: 'New York City', pageid: 645042, revid: 1376082128, text: SECTION_HTML },
+    });
+
+    const result = await svc.getArticleSection('New York City', 1, 'en', createMockContext());
+    expect(result.revisionId).toBe('1376082128');
+    expect(result.url).toBeUndefined();
+  });
+
+  it('leaves the revision undefined when the parse payload omits it', async () => {
+    const svc = getWikipediaService();
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
+      parse: { title: 'Sparse', pageid: 1, text: SECTION_HTML },
+    });
+
+    const result = await svc.getArticleSection('Sparse', 1, 'en', createMockContext());
+    expect(result.revisionId).toBeUndefined();
+    expect(result.url).toBe('https://en.wikipedia.org/wiki/Sparse');
+  });
+});
+
+describe('WikipediaService.getSummary — extract_html (issue #48)', () => {
+  beforeEach(() => {
+    initService();
+  });
+
+  /** Live `extract` / `extract_html` pair for `Avogadro constant`, trimmed to three sentences. */
+  const AVOGADRO_SUMMARY = {
+    type: 'standard',
+    title: 'Avogadro constant',
+    pageid: 41545,
+    extract:
+      'In chemistry, the Avogadro constant, commonly denoted NA, is a conversion constant. It is an SI defining constant with the exact value 6.02214076×1023 mol−1 (reciprocal mole). It was derived from the number of atoms in 12 grams of carbon-12 (12C).',
+    extract_html:
+      '<p>In chemistry, the <b>Avogadro constant</b>, commonly denoted <span class="texhtml "><b><i>N</i><sub>A</sub></b></span>, is a conversion constant. It is an SI defining constant with the exact value <span class="nowrap">6.022<span>140</span><span>76</span><span>×</span>10<sup>23</sup> mol<sup>−1</sup></span> (reciprocal mole). It was derived from the number of atoms in 12 grams of carbon-12 (<sup>12</sup>C).</p>',
+    revision: '1360615018',
+    timestamp: '2026-06-22T16:08:35Z',
+  };
+
+  it('reads superscripts and subscripts from extract_html instead of the flattened extract', async () => {
+    const svc = getWikipediaService();
+    vi.spyOn(svc, 'restGet').mockResolvedValue(AVOGADRO_SUMMARY);
+
+    const result = await svc.getSummary('Avogadro constant', 'en', createMockContext());
+    expect(result.extract).toBe(
+      'In chemistry, the Avogadro constant, commonly denoted N_A, is a conversion constant. It is an SI defining constant with the exact value 6.02214076×10²³ mol⁻¹ (reciprocal mole). It was derived from the number of atoms in 12 grams of carbon-12 (¹²C).',
+    );
+    // The #44 citation fields ride along unchanged.
+    expect(result.revisionId).toBe('1360615018');
+    expect(result.lastModified).toBe('2026-06-22T16:08:35Z');
+  });
+
+  it('keeps a disambiguation list one entry per line, apart from the sentence that introduces it', async () => {
+    const svc = getWikipediaService();
+    vi.spyOn(svc, 'restGet').mockResolvedValue({
+      type: 'disambiguation',
+      title: 'Mercury',
+      extract:
+        'Mercury most commonly refers to:Mercury (planet), the closest planet to the Sun\nMercury (element), a chemical element',
+      extract_html:
+        '<p><b>Mercury</b> most commonly refers to:</p><ul><li>Mercury (planet), the closest planet to the Sun</li>\n<li>Mercury (element), a chemical element</li></ul>',
+    });
+
+    const result = await svc.getSummary('Mercury', 'en', createMockContext());
+    expect(result.extract).toBe(
+      'Mercury most commonly refers to:\n\nMercury (planet), the closest planet to the Sun\nMercury (element), a chemical element',
+    );
+  });
+
+  it('falls back to the plain extract when the payload carries no extract_html', async () => {
+    const svc = getWikipediaService();
+    const { extract_html: _omitted, ...plainOnly } = AVOGADRO_SUMMARY;
+    vi.spyOn(svc, 'restGet').mockResolvedValue(plainOnly);
+
+    const result = await svc.getSummary('Avogadro constant', 'en', createMockContext());
+    expect(result.extract).toBe(AVOGADRO_SUMMARY.extract);
+  });
+
+  it('still reports no readable content for an empty extract, whatever extract_html holds', async () => {
+    const svc = getWikipediaService();
+    vi.spyOn(svc, 'restGet').mockResolvedValue({
+      type: 'mainpage',
+      title: 'Main Page',
+      extract: '',
+      extract_html: '<p>Welcome to Wikipedia, the free encyclopedia.</p>',
+    });
+
+    await expect(svc.getSummary('Main Page', 'en', createMockContext())).rejects.toMatchObject({
+      message: expect.stringContaining('no readable content'),
+    });
+  });
+});
+
+describe('htmlSectionToPlainText — visible MathML and unbalanced scripts (issues #48, #53)', () => {
+  it('renders a visible formula once, as the TeX its alttext carries, even past a literal >', () => {
+    const html =
+      '<p>For <math class="mathjax_ignore" alttext="{\\displaystyle (\\forall \\varepsilon >0)\\,(0&lt;|x-p|)}"><semantics><mrow><mi>ε</mi><mo>&gt;</mo></mrow><annotation encoding="application/x-tex">{\\displaystyle (\\forall \\varepsilon >0)}</annotation></semantics></math>, done.</p>';
+    expect(htmlSectionToPlainText(html)).toBe(
+      'For {\\displaystyle (\\forall \\varepsilon >0)\\,(0<|x-p|)}, done.',
+    );
+  });
+
+  it('still renders a section-read formula once, from the fallback image, with its hidden twin dropped', () => {
+    const html =
+      '<p>Here <span class="mwe-math-element"><span class="mwe-math-mathml-inline mwe-math-mathml-a11y" style="display: none;"><math alttext="{\\displaystyle H>0}"><mi>H</mi></math></span><img src="s" class="mwe-math-fallback-image-inline" alt="{\\displaystyle H&gt;0}"></span> holds.</p>';
+    expect(htmlSectionToPlainText(html)).toBe('Here {\\displaystyle H>0} holds.');
+  });
+
+  it('does not let an unclosed superscript reach across a heading to a later one', () => {
+    const html = '<p>About 10<sup>8 km away.</p>\n<h2>Orbit</h2>\n<p>Speed c<sup>2</sup>.</p>';
+    expect(htmlSectionToPlainText(html)).toBe('About 108 km away.\n\n== Orbit ==\n\nSpeed c².');
   });
 });

@@ -14,6 +14,7 @@ import {
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import type { RequestContext } from '@cyanheads/mcp-ts-core/utils';
 import { fetchWithTimeout, logger, withExtra, withRetry } from '@cyanheads/mcp-ts-core/utils';
+import { fenceCodeBlock, tableDelimiterRow, tableRow } from './text-blocks.js';
 import type {
   ActionApiErrorRaw,
   ActionExtractsRaw,
@@ -41,9 +42,12 @@ import type {
  */
 const HEADING_LINE = /^(={2,6})\s*(.+?)\s*\1\s*$/gm;
 
-/** Open-tag test for one class token, compiled once per rule. */
-function hasClass(token: string): (openTag: string) => boolean {
-  const re = new RegExp(`class\\s*=\\s*"[^"]*\\b${token}\\b`, 'i');
+/**
+ * Open-tag test for any of the given class tokens, compiled once per rule. A token matches whole, so
+ * `navbar` does not reach `navbar-ct-mini`, the title beside a navbar's edit links.
+ */
+function hasClass(...tokens: string[]): (openTag: string) => boolean {
+  const re = new RegExp(`class\\s*=\\s*"(?:[^"]*\\s)?(?:${tokens.join('|')})(?=[\\s"])`, 'i');
   return (openTag) => re.test(openTag);
 }
 
@@ -67,6 +71,25 @@ const NOT_CONTENT = /\bclass\s*=\s*"[^"]*\bmetadata\b/i;
 /** Whether a table lays out article content, and so must survive rather than be dropped. */
 function isLayoutTable(openTag: string): boolean {
   return PRESENTATION_ROLE.test(openTag) && !NOT_CONTENT.test(openTag);
+}
+
+/** An open tag's `class` attribute value. */
+const CLASS_ATTRIBUTE = /\bclass\s*=\s*"([^"]*)"/i;
+
+/**
+ * How a table holding data is rendered: `grid` for a `wikitable`, as pipe rows; `infobox` as one
+ * `label: value` line per row. Tested on whole class tokens, so `infobox-subbox` and the other
+ * `infobox-*` parts an infobox is built from do not count as infoboxes of their own.
+ *
+ * A layout table is never a data table, whatever its classes: a standalone succession box is
+ * `role="presentation" class="wikitable succession-box"`, and its cells are prose lines.
+ */
+function dataTableKind(openTag: string): 'grid' | 'infobox' | undefined {
+  if (isLayoutTable(openTag)) return;
+  const tokens = CLASS_ATTRIBUTE.exec(openTag)?.[1]?.split(/\s+/) ?? [];
+  if (tokens.includes('infobox')) return 'infobox';
+  if (tokens.includes('wikitable')) return 'grid';
+  return;
 }
 
 /** The parser's marker for an element that points elsewhere rather than carrying prose. */
@@ -111,29 +134,45 @@ function isFurniture(openTag: string): boolean {
 const HIDDEN_BY_STYLE = /\bstyle\s*=\s*"[^"]*display\s*:\s*none/i;
 
 /**
+ * Links for editing the page or its Wikidata item rather than content: `Module:Navbar`'s `navbar`
+ * (English "view · talk · edit", French "modifier") and the `wikidata-link` Spanish infoboxes close
+ * with ("[editar datos en Wikidata]"). Named by class, not by `noprint`, which also marks content
+ * inside infoboxes — an age, a date's "137 years ago", German coordinates.
+ */
+const isEditLinks = hasClass('navbar', 'wikidata-link');
+
+/**
  * Elements dropped whole from parser HTML, keyed by tag name. Each value tests the element's own
  * open tag, so a rule reaches only the elements carrying the artifact it is written for.
  *
  * `figure` goes because the plain-text conventions of the full-article extract path drop it too.
- * `table` goes unless {@link isLayoutTable} — a layout table wraps ordinary lists and paragraphs,
- * so dropping it takes real prose with it. `div.spoken-wikipedia` is `{{Spoken Wikipedia}}`, whose
+ * `table` goes unless it is a layout table, which wraps ordinary lists and paragraphs, or a data
+ * table ({@link dataTableKind}), which {@link renderDataTables} renders as rows. What remains are
+ * navboxes, sidebars, and unclassed chart tables — page furniture, or a picture of numbers a
+ * neighbouring data table carries. Inside a data table no table is dropped by this rule: the cell
+ * holding it is flattened to text instead. `div.spoken-wikipedia` is `{{Spoken Wikipedia}}`, whose
  * body is a duration, the revision date the recording was read from, and a disclaimer that later
  * edits are not reflected — claims about the article rather than any of its content, and the audio
  * itself is not reachable from plain text. It carries neither the `metadata` marker nor `side-box`,
- * so {@link isFurniture} does not reach it.
+ * so {@link isFurniture} does not reach it. `div.infobox-caption` is an infobox image's or map's
+ * caption, which a rendered infobox would otherwise print as a stray line between the title and the
+ * first field — dropped for the same reason `figure` is: it describes a picture the text cannot carry.
  *
  * The rest are artifacts of asking the parser for one section in isolation: for a section that cites
  * something, `sup.reference` is the `[1]` footnote marker whose target is not in the payload,
  * `ol.references` is the reference list the parser appends after the content, and
  * `span.mw-ext-cite-error` is its complaint that the article's `<references/>` tag lives in a section
  * this payload does not contain. A section citing nothing carries none of the three.
+ * `div.preview-warning` is the same kind of artifact. `action=parse` renders the section as an edit
+ * preview, so templates emit editor-only notices ("Preview warning: Page using … with deprecated
+ * parameter …") that the saved page never shows.
  */
 const DROP_RULES: Readonly<Record<string, (openTag: string) => boolean>> = {
   style: () => true,
   script: () => true,
   figure: () => true,
-  table: (openTag) => !isLayoutTable(openTag),
-  div: hasClass('spoken-wikipedia'),
+  table: (openTag) => !isLayoutTable(openTag) && dataTableKind(openTag) === undefined,
+  div: hasClass('spoken-wikipedia', 'infobox-caption', 'preview-warning'),
   sup: hasClass('reference'),
   ol: hasClass('references'),
   span: hasClass('mw-ext-cite-error'),
@@ -178,6 +217,18 @@ const MATH_FALLBACK_IMAGE =
 /** The `alt` attribute of a single tag, still HTML-escaped as the parser emitted it. */
 const ALT_ATTRIBUTE = /\balt\s*=\s*"([^"]*)"/i;
 
+/**
+ * A MathML formula, visible — the form TextExtracts' HTML mode emits, with no fallback image and no
+ * hidden twin. Group 1 is the open tag's attributes, whose `alttext` carries the TeX. The open tag is
+ * read attribute by attribute because that TeX holds a literal `>` (`\varepsilon >0`), which would
+ * end a `[^>]*` match mid-attribute and spill the rest of the formula into the text. The body cannot
+ * run into another `<math`, so an unclosed formula swallows nothing past the next one.
+ */
+const MATH_ELEMENT = /<math\b((?:"[^"]*"|'[^']*'|[^>"'])*)>(?:(?!<math\b)[\s\S])*?<\/math\s*>/gi;
+
+/** The `alttext` attribute of a `<math>` open tag, still HTML-escaped. */
+const ALTTEXT_ATTRIBUTE = /\balttext\s*=\s*"([^"]*)"/i;
+
 /** Named HTML entities the MediaWiki parser emits, beyond the numeric escapes handled generically. */
 const NAMED_ENTITIES: Readonly<Record<string, string>> = {
   amp: '&',
@@ -214,36 +265,46 @@ function elementEnd(html: string, tagName: string, from: number): number {
  * The hidden-element test comes first and is tag-agnostic: MediaWiki hides screen-reader MathML and
  * unrendered gadget chrome behind an inline `display:none` on whatever element wraps them, so an
  * enumeration of gadget class names would keep needing new entries. Whatever the page does not
- * render is not content. {@link isFurniture} is tag-agnostic for the same reason — the box families
- * it names are emitted as a `<div>` on one edition and a `<table>` on another.
+ * render is not content. {@link isFurniture} and {@link isEditLinks} are tag-agnostic for the same
+ * reason — the families they name are emitted as a `<div>` on one edition and a `<p>`, a `<td>`, or
+ * a `<table>` on another. Inside a data table
+ * the `table` rule is off: a table nested in a cell is part of that cell's text.
  */
-function isDropped(openTag: string, tagName: string): boolean {
-  return (
-    HIDDEN_BY_STYLE.test(openTag) ||
-    isFurniture(openTag) ||
-    (DROP_RULES[tagName]?.(openTag) ?? false)
-  );
+function isDropped(openTag: string, tagName: string, insideDataTable: boolean): boolean {
+  if (HIDDEN_BY_STYLE.test(openTag) || isFurniture(openTag) || isEditLinks(openTag)) return true;
+  if (tagName === 'table' && insideDataTable) return false;
+  return DROP_RULES[tagName]?.(openTag) ?? false;
 }
 
 /**
  * Remove every element {@link isDropped} selects, in one pass over `html`'s open tags.
  *
  * A selected element is removed with its whole subtree, so a nested selection inside it needs no
- * separate visit. An element that is *not* selected is walked into, so a data table nested in a
- * layout table still goes while the layout table's own content survives.
+ * separate visit. An element that is *not* selected is walked into, so a navbox table nested in a
+ * layout table still goes while the layout table's own content survives. A data table's body is
+ * walked with `insideDataTable` set: hidden elements, furniture, and footnote markers still go from
+ * its cells, but a table nested in a cell stays, to be flattened into that cell's text.
  */
-function dropElements(html: string): string {
+function dropElements(html: string, insideDataTable = false): string {
   const openTag = new RegExp(OPEN_TAG.source, 'gi');
   let kept = '';
   let cursor = 0;
   for (let open = openTag.exec(html); open; open = openTag.exec(html)) {
     const tagName = (open[1] as string).toLowerCase();
-    if (VOID_TAGS.has(tagName) || !isDropped(open[0], tagName)) continue;
+    if (VOID_TAGS.has(tagName)) continue;
+    const bodyStart = open.index + open[0].length;
 
-    const end = elementEnd(html, tagName, open.index + open[0].length);
-    kept += html.slice(cursor, open.index);
-    cursor = end;
-    openTag.lastIndex = end;
+    if (isDropped(open[0], tagName, insideDataTable)) {
+      kept += html.slice(cursor, open.index);
+      cursor = elementEnd(html, tagName, bodyStart);
+    } else if (tagName === 'table' && !insideDataTable && dataTableKind(open[0])) {
+      const end = elementEnd(html, tagName, bodyStart);
+      kept += html.slice(cursor, bodyStart) + dropElements(html.slice(bodyStart, end), true);
+      cursor = end;
+    } else {
+      continue;
+    }
+    openTag.lastIndex = cursor;
   }
   return kept + html.slice(cursor);
 }
@@ -255,7 +316,9 @@ function dropElements(html: string): string {
  * an article that writes about a character reference reaches here as `&amp;#39;` and must decode to
  * the literal text `&#39;`, not to `'`. Chained passes cannot express that, and where the inner
  * reference is outside Unicode's range (`&amp;#1114112;`) the second pass has no character to
- * produce at all. An unrecognized name or an out-of-range code point keeps its escape as written.
+ * produce at all. An unrecognized name or an out-of-range code point keeps its escape as written, and
+ * so does a reference to {@link BLOCK_MARK}: decoding one would let escaped prose spell out a parked
+ * block's placeholder and pull that block into the middle of a sentence.
  */
 function decodeEntities(text: string): string {
   return text.replace(
@@ -263,30 +326,383 @@ function decodeEntities(text: string): string {
     (match, dec: string | undefined, hex: string | undefined, name: string | undefined) => {
       if (name !== undefined) return NAMED_ENTITIES[name.toLowerCase()] ?? match;
       const code = dec === undefined ? Number.parseInt(hex as string, 16) : Number(dec);
-      return code <= 0x10ffff ? String.fromCodePoint(code) : match;
+      return code <= 0x10ffff && code !== BLOCK_MARK_CODE ? String.fromCodePoint(code) : match;
     },
   );
 }
 
 /**
- * Sentinel wrapping a `<pre>` block's index while the surrounding text is whitespace-normalized.
- * `U+FFFF` is a permanent noncharacter, so no parser output can collide with it, and it is not
+ * Delimits a parked block's index while the surrounding text is whitespace-normalized. `U+FFFF` is a
+ * permanent noncharacter, which MediaWiki's input normalization never lets into a page, and it is not
  * whitespace, so the collapsing passes leave it in place.
  */
-const PRE_SENTINEL = /\uFFFF(\d+)\uFFFF/g;
+const BLOCK_MARK = '\uFFFF';
+const BLOCK_MARK_CODE = BLOCK_MARK.charCodeAt(0);
+
+/** A parked block's placeholder: its index between two {@link BLOCK_MARK}s. */
+const PARKED_BLOCK = /\uFFFF(\d+)\uFFFF/g;
 
 /**
- * Convert the MediaWiki parser's HTML for one section (`action=parse&prop=text`) into the same
- * plain-text shape the full-article extract path returns: `== Heading ==` markers in document
- * order, paragraphs separated by a blank line, list items one per line.
+ * Text the prose passes must not touch — a fenced code sample, a rendered table — set aside behind a
+ * placeholder and restored once the prose around it is normalized. The placeholder stands on its own
+ * paragraph, so a block is never run into the sentence beside it.
+ */
+class ParkedBlocks {
+  private readonly blocks: string[] = [];
+
+  /** Set `block` aside and return its placeholder, or a bare paragraph break for an empty block. */
+  park(block: string): string {
+    if (!block) return '\n\n';
+    this.blocks.push(block);
+    return `\n\n${BLOCK_MARK}${this.blocks.length - 1}${BLOCK_MARK}\n\n`;
+  }
+
+  /** Put every parked block back in place of its placeholder. */
+  restore(text: string): string {
+    return text.replace(
+      PARKED_BLOCK,
+      (match, index: string) => this.blocks[Number(index)] ?? match,
+    );
+  }
+}
+
+/** Pair each character of `plain` with the character at the same position in `glyphs`. */
+function glyphMap(plain: string, glyphs: string): ReadonlyMap<string, string> {
+  const forms = [...glyphs];
+  return new Map([...plain].map((char, i) => [char, forms[i] as string]));
+}
+
+/**
+ * Unicode superscript and subscript forms, limited to the characters that have one in
+ * general-purpose fonts. Both hyphen-minus and U+2212 MINUS SIGN map to the raised or lowered minus.
+ */
+const SUPERSCRIPT_GLYPHS = glyphMap('0123456789+-−=()ni', '⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁻⁼⁽⁾ⁿⁱ');
+const SUBSCRIPT_GLYPHS = glyphMap('0123456789+-−=()', '₀₁₂₃₄₅₆₇₈₉₊₋₋₌₍₎');
+
+/** Block tags no inline element spans. */
+const BLOCK_TAG = '(?:p|div|h[1-6]|ul|ol|li|dl|dd|dt|table|tr|td|th|pre|blockquote)';
+
+/**
+ * An innermost `<sup>` or `<sub>` element; group 1 is the tag name, group 2 its body. A script never
+ * spans a block, so the body stops short of any block tag: an unclosed `<sup>` then reads as ordinary
+ * text rather than reaching past a paragraph or heading to the next `</sup>` and folding a whole
+ * section — heading included — into one superscript. The body holds no script of its own, so a nested
+ * one is rendered first and its parent then sees `2ⁿ`, not a flattened `2n`.
+ */
+const SCRIPT_ELEMENT = new RegExp(
+  `<(sup|sub)\\b[^>]*>((?:(?!<\\/?${BLOCK_TAG}\\b|<(?:sup|sub)\\b)[\\s\\S])*?)<\\/\\1\\s*>`,
+  'gi',
+);
+
+/** An `<abbr>` element, bounded by blocks the way {@link SCRIPT_ELEMENT} is. */
+const ABBREVIATION_ELEMENT = new RegExp(
+  `<abbr\\b[^>]*>(?:(?!<\\/?${BLOCK_TAG}\\b|<abbr\\b)[\\s\\S])*?<\\/abbr\\s*>`,
+  'gi',
+);
+
+/** A footnote-style marker rather than an exponent: `[citation needed]`, `[I]`, `[a]`. */
+const BRACKETED = /^\[.*\]$/;
+
+/** Text carrying a letter or digit — what an exponent or index has and `†` or `ⓘ` do not. */
+const ALPHANUMERIC = /[\p{L}\p{N}]/u;
+
+/**
+ * Render superscripts and subscripts so they stay distinct from the text beside them — flattened,
+ * `6.02214076×10<sup>23</sup>` reads as the number `6.02214076×1023`.
+ *
+ * A script whose every character has a Unicode form becomes those characters (`10²³`, `mol⁻¹`,
+ * `H₂O`). Any other script is marked the way plain-text math writes it — `^` for a superscript, `_`
+ * for a subscript, with parentheses past one character (`e^x`, `19^(th)`, `N_A`) — except a
+ * bracketed or letterless one (`[citation needed]`, `†`, `ⓘ`), which is a marker and keeps its text
+ * as written. A marked body stays escaped, so the one decode pass later reads it exactly once.
+ *
+ * A script inside an `<abbr>` is part of an abbreviation, never an exponent, and keeps its text joined
+ * the way the edition writes it in plain text. French Wikipedia wraps its ordinals and abbreviations
+ * that way (`{{s|XIX}}`, `{{1er}}`, `{{Mme}}`, `{{n°}}`), and marked they read `XIX^e`, `1^(er)`,
+ * `M^(me)`; in a live sample of five editions they were three in four of all marks. Whether the text
+ * beside a script is a digit or a letter decides nothing: `2<sup>K</sup>` and `e<sup>x</sup>` are
+ * exponents in the same shape.
+ *
+ * Runs after {@link dropElements}, which has already removed `sup.reference` footnote markers whole.
+ */
+function renderScripts(html: string): string {
+  const render = (text: string, inAbbreviation: boolean): string => {
+    const next = text.replace(SCRIPT_ELEMENT, (_match, tag: string, body: string) =>
+      renderScript(tag.toLowerCase() === 'sup', body, inAbbreviation),
+    );
+    return next === text ? text : render(next, inAbbreviation);
+  };
+  return render(
+    html.replace(ABBREVIATION_ELEMENT, (abbreviation) => render(abbreviation, true)),
+    false,
+  );
+}
+
+/** One script's body rendered as {@link renderScripts} describes. */
+function renderScript(superscript: boolean, body: string, inAbbreviation: boolean): string {
+  const escaped = body.replace(/<[^>]+>/g, '').trim();
+  const chars = [...decodeEntities(escaped)];
+  if (chars.length === 0) return '';
+
+  const glyphs = superscript ? SUPERSCRIPT_GLYPHS : SUBSCRIPT_GLYPHS;
+  if (chars.every((c) => glyphs.has(c))) return chars.map((c) => glyphs.get(c)).join('');
+
+  const text = chars.join('');
+  if (inAbbreviation || BRACKETED.test(text) || !ALPHANUMERIC.test(text)) return escaped;
+  const mark = superscript ? '^' : '_';
+  return chars.length === 1 ? `${mark}${escaped}` : `${mark}(${escaped})`;
+}
+
+/**
+ * Largest rendered data table, in UTF-8 bytes, that a section read carries in full. A larger one is
+ * replaced by a `[table omitted: N rows]` marker, so the gap stays visible without one table
+ * outweighing the rest of the section many times over.
+ *
+ * Sized from rendered tables: results and statistics tables run 1–5 KB, a US election's per-state
+ * results 12 KB, the chemical elements 15 KB, and the Nobel physics laureates 37 KB, all of which
+ * fit; the 500-row S&P 500 roster (64 KB) does not. At half the default 80 KB full-article budget, one
+ * table never outweighs what a whole article may carry.
+ */
+export const DATA_TABLE_MAX_BYTES = 40_000;
+
+/** A table cell as {@link parseTable} found it. */
+type TableCell = { header: boolean; html: string; colspan: number; rowspan: number };
+
+/** HTML's own ceiling on `colspan`. `rowspan` is bounded by the rows the table actually has. */
+const MAX_COLSPAN = 1000;
+
+/** A structural tag of a table; group 1 marks a close tag, group 2 is the tag name. */
+const TABLE_STRUCTURE_TAG = /<(\/?)(table|caption|tr|td|th)\b[^>]*>/gi;
+
+/** Tags that break a cell's text into separate lines: line breaks, lists, and nested blocks. */
+const CELL_LINE_BREAK =
+  /<br\s*\/?>|<\/?(?:p|div|ul|ol|li|dl|dd|dt|blockquote|pre|table|caption|tr|td|th|h[1-6])\b[^>]*>/gi;
+
+/** A `colspan`/`rowspan` value; a missing, zero, or non-numeric one spans a single cell. */
+function spanAttribute(openTag: string, name: 'colspan' | 'rowspan'): number {
+  const value = Number(new RegExp(`\\b${name}\\s*=\\s*"?(\\d+)`, 'i').exec(openTag)?.[1]);
+  return value >= 1 ? value : 1;
+}
+
+/**
+ * A cell's text on one line: the inline pipeline — tags stripped, entities decoded once, whitespace
+ * collapsed — with each line break or block inside the cell joined by `separator`. Code inside a cell
+ * is flattened with the rest: a row holds one line, and a fence cannot sit inside one.
+ */
+function cellText(html: string, separator: string): string {
+  return decodeEntities(
+    html
+      .replace(/\s+/g, ' ')
+      .replace(CELL_LINE_BREAK, '\n')
+      .replace(/<[^>]+>/g, ''),
+  )
+    .split('\n')
+    .map((line) => line.replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .join(separator);
+}
+
+/** A cell's text, joining a header cell's wrapped lines with spaces and a data cell's items with `; `. */
+function cellLine(cell: TableCell): string {
+  return cellText(cell.html, cell.header ? ' ' : '; ');
+}
+
+/**
+ * Split a table's body — everything after its open tag — into its caption and rows.
+ *
+ * Only the outer table's own structure counts: tags of a table nested in a cell are kept in that
+ * cell's HTML, and the outer table ends at the close tag that brings the nesting back to zero. A
+ * missing end tag is inferred the way HTML does — a new cell ends the previous one, a new row ends
+ * the previous row — and an unclosed table runs to the end of `body` with its last cell's text kept.
+ */
+function parseTable(body: string): { caption: string; rows: TableCell[][] } {
+  const tag = new RegExp(TABLE_STRUCTURE_TAG.source, 'gi');
+  const rows: TableCell[][] = [];
+  let caption = '';
+  let inCaption = false;
+  let row: TableCell[] | undefined;
+  let cell: TableCell | undefined;
+  let depth = 0;
+  let cursor = 0;
+  const append = (html: string) => {
+    if (cell) cell.html += html;
+    else if (inCaption) caption += html;
+  };
+
+  for (let match = tag.exec(body); match; match = tag.exec(body)) {
+    append(body.slice(cursor, match.index));
+    cursor = match.index + match[0].length;
+    const closing = match[1] === '/';
+    const name = (match[2] as string).toLowerCase();
+
+    if (name === 'table') {
+      if (closing && depth === 0) return { caption, rows };
+      depth += closing ? -1 : 1;
+      append(match[0]);
+    } else if (depth > 0) {
+      append(match[0]);
+    } else if (name === 'caption') {
+      inCaption = !closing;
+      cell = undefined;
+    } else if (name === 'tr') {
+      cell = undefined;
+      row = closing ? undefined : [];
+      if (row) rows.push(row);
+    } else if (closing) {
+      cell = undefined;
+    } else {
+      if (!row) {
+        row = [];
+        rows.push(row);
+      }
+      cell = {
+        header: name === 'th',
+        html: '',
+        colspan: Math.min(spanAttribute(match[0], 'colspan'), MAX_COLSPAN),
+        rowspan: spanAttribute(match[0], 'rowspan'),
+      };
+      row.push(cell);
+    }
+  }
+  append(body.slice(cursor));
+  return { caption, rows };
+}
+
+/**
+ * Lay a table's rows out on a rectangular grid of cell text.
+ *
+ * A `rowspan` cell repeats down every row it covers, so each row reads on its own. A `colspan` cell
+ * repeats across its columns only in a header row — there it names every column it heads (`Popular
+ * vote` over `Count` and `Percentage`); in a body row it fills its first column and leaves the rest
+ * blank, so a note spanning the whole table appears once rather than once per column. A header cell
+ * alone on its row heads no columns — it is a title or a group label (`Group A`, `Season by season`)
+ * — so it is written once too, where repeating it would fill a whole line with one phrase.
+ */
+function tableGrid(rows: readonly TableCell[][]): string[][] {
+  const grid: string[][] = [];
+  const carried: Array<{ text: string; rows: number } | undefined> = [];
+  const takeCarried = (line: string[], column: number): boolean => {
+    const carry = carried[column];
+    if (!carry || carry.rows === 0) return false;
+    line[column] = carry.text;
+    carry.rows--;
+    return true;
+  };
+
+  for (const row of rows) {
+    const line: string[] = [];
+    const headerRow = row.length > 1 && row.every((cell) => cell.header);
+    let column = 0;
+    for (const cell of row) {
+      while (takeCarried(line, column)) column++;
+      const text = cellLine(cell);
+      for (let offset = 0; offset < cell.colspan; offset++, column++) {
+        const value = offset === 0 || headerRow ? text : '';
+        line[column] = value;
+        carried[column] = cell.rowspan > 1 ? { text: value, rows: cell.rowspan - 1 } : undefined;
+      }
+    }
+    for (; column < carried.length; column++) takeCarried(line, column);
+    grid.push(line);
+  }
+
+  const width = grid.reduce((widest, line) => Math.max(widest, line.length), 0);
+  return grid.map((line) => Array.from({ length: width }, (_, i) => line[i] ?? ''));
+}
+
+/** A `wikitable` as pipe rows: the first non-empty row, a delimiter row, then the rest. */
+function gridLines(rows: readonly TableCell[][]): string {
+  const [head, ...body] = tableGrid(rows).filter((line) => line.some(Boolean));
+  if (!head) return '';
+  return [
+    tableRow(head),
+    tableDelimiterRow(head.length),
+    ...body.map((line) => tableRow(line)),
+  ].join('\n');
+}
+
+/**
+ * An infobox as one line per row: `label: value` where a header cell labels the data beside it, the
+ * text alone for a title, section header, or full-width value. A label that ends in its own colon, as
+ * Spanish taxoboxes write `Reino:`, loses it, so the line reads `Reino: Animalia`, not `Reino::`.
+ */
+function infoboxLines(rows: readonly TableCell[][]): string {
+  return rows
+    .map((row) => {
+      const [label, ...values] = row;
+      if (label?.header && values.length > 0 && values.every((cell) => !cell.header)) {
+        const labelText = cellLine(label).replace(/\s*:$/, '');
+        const valueText = values.map(cellLine).filter(Boolean).join('; ');
+        return labelText && valueText ? `${labelText}: ${valueText}` : labelText || valueText;
+      }
+      return row.map(cellLine).filter(Boolean).join('; ');
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
+/**
+ * Render one data table from its body, caption first. A table whose rendering exceeds
+ * {@link DATA_TABLE_MAX_BYTES} is replaced by a one-line `[table omitted: N rows]` marker.
+ */
+function renderTable(kind: 'grid' | 'infobox', body: string): string {
+  const { caption, rows } = parseTable(body);
+  const rendered = kind === 'infobox' ? infoboxLines(rows) : gridLines(rows);
+  const table =
+    new TextEncoder().encode(rendered).length > DATA_TABLE_MAX_BYTES
+      ? `[table omitted: ${rows.length} rows]`
+      : rendered;
+  return [cellText(caption, ' '), table].filter(Boolean).join(kind === 'infobox' ? '\n' : '\n\n');
+}
+
+/**
+ * Render every data table ({@link dataTableKind}) in `html` and park the result, so the prose passes
+ * that follow cannot re-decode its text or strip a `<tag>` its cells quote. A data table nested in a
+ * cell of another is flattened into that cell rather than rendered on its own.
+ */
+function renderDataTables(html: string, parked: ParkedBlocks): string {
+  const openTag = /<table\b[^>]*>/gi;
+  let rendered = '';
+  let cursor = 0;
+  for (let open = openTag.exec(html); open; open = openTag.exec(html)) {
+    const kind = dataTableKind(open[0]);
+    if (!kind) continue;
+    const bodyStart = open.index + open[0].length;
+    const end = elementEnd(html, 'table', bodyStart);
+    rendered +=
+      html.slice(cursor, open.index) + parked.park(renderTable(kind, html.slice(bodyStart, end)));
+    cursor = end;
+    openTag.lastIndex = end;
+  }
+  return rendered + html.slice(cursor);
+}
+
+/**
+ * Convert article HTML into the plain-text shape every read path returns: `== Heading ==` markers in
+ * document order, paragraphs separated by a blank line, list items one per line. It renders all three
+ * HTML sources the read paths fetch — the parser's HTML for one section (`action=parse&prop=text`),
+ * TextExtracts' HTML-mode full-article extract (`prop=extracts` without `explaintext`), and the REST
+ * summary's `extract_html` — so a superscript, a formula, or a code sample reads the same on each.
  *
  * Sourcing section reads from rendered HTML rather than raw wikitext is what makes inline templates
  * survive — `{{code|if}}` reaches this function already expanded to `if`, where a wikitext stripper
  * has to re-implement the template grammar and drops what it cannot expand.
  *
- * `<pre>` blocks keep their internal line breaks and indentation while everything around them is
- * collapsed, because in a code sample indentation is syntax — an unindented Python listing reads as
- * valid code and is not, which is worse than omitting it.
+ * Two constructs carry syntax of their own, written by `text-blocks.ts`. A `<pre>` sample becomes a
+ * fenced code block that keeps its line breaks and indentation while everything around it is
+ * collapsed, because in a code sample indentation is syntax. A data table becomes pipe rows, and an
+ * infobox `label: value` lines. Superscripts and subscripts stay distinct from their neighbours
+ * ({@link renderScripts}).
+ *
+ * Pass order is what keeps each pass's input intact. Furniture, hidden elements, and footnote markers
+ * go first, so no later pass renders them. Scripts render next, so a table cell or a heading reads
+ * `10²³` the way prose does. Tables render before code is parked, so a `<pre>` inside a cell is
+ * flattened onto that cell's line. Both are parked before the prose passes, which would otherwise
+ * decode their text a second time and strip any tag it quotes. Unbalanced input — which TextExtracts
+ * warns its HTML mode may emit — loses nothing for being unclosed beyond what a drop rule selects: an
+ * unclosed table renders to the end of the input, an unclosed `<pre>`, `<sup>`, or `<math>` reads as
+ * ordinary text, and an unclosed script cannot reach past a block boundary, nor an unclosed formula
+ * past the next formula, to borrow a later close tag.
  *
  * Pure and exported for unit testing.
  */
@@ -294,17 +710,30 @@ export function htmlSectionToPlainText(html: string): string {
   let text = html.replace(/<!--[\s\S]*?-->/g, '');
 
   // Lift each formula out of its `<img alt>` before anything is dropped, so the TeX survives the
-  // removal of the hidden MathML twin that used to be its only carrier. The alt is inserted still
-  // escaped, so the single decode pass below reads it exactly once.
-  text = text.replace(MATH_FALLBACK_IMAGE, (match) => ALT_ATTRIBUTE.exec(match)?.[1] ?? '');
+  // removal of the hidden MathML twin that used to be its only carrier. A visible `<math>` — the
+  // full-article extract's only form — becomes its `alttext` the same way; the hidden twin a section
+  // read carries becomes its TeX too, and is then dropped whole with the element hiding it. Both are
+  // inserted still escaped, so the single decode pass below reads each exactly once.
+  text = text
+    .replace(MATH_FALLBACK_IMAGE, (match) => ALT_ATTRIBUTE.exec(match)?.[1] ?? '')
+    .replace(
+      MATH_ELEMENT,
+      (_match, attributes: string) => ALTTEXT_ATTRIBUTE.exec(attributes)?.[1] ?? '',
+    );
 
-  text = dropElements(text);
+  text = renderScripts(dropElements(text));
 
-  // Park preformatted blocks behind sentinels so the whitespace pass cannot flatten them.
-  const preBlocks: string[] = [];
+  const parked = new ParkedBlocks();
+  text = renderDataTables(text, parked);
+
+  // A table parked inside a `<pre>` is restored into the code before the fence is sized, so no
+  // backtick run in it can close the fence early.
   text = text.replace(/<pre\b[^>]*>([\s\S]*?)<\/pre\s*>/gi, (_match, body: string) => {
-    preBlocks.push(body);
-    return `\n\n\uFFFF${preBlocks.length - 1}\uFFFF\n\n`;
+    const code = parked
+      .restore(decodeEntities(body.replace(/<[^>]+>/g, '')))
+      .replace(/[^\S\n]+$/gm, '')
+      .replace(/^\n+|\n+$/g, '');
+    return parked.park(code && fenceCodeBlock(code));
   });
 
   // Headings become the `== Heading ==` markers both read paths use for structure.
@@ -336,13 +765,7 @@ export function htmlSectionToPlainText(html: string): string {
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 
-  return text.replace(PRE_SENTINEL, (match, index: string) => {
-    const body = preBlocks[Number(index)];
-    if (body === undefined) return match;
-    return decodeEntities(body.replace(/<[^>]+>/g, ''))
-      .replace(/[^\S\n]+$/gm, '')
-      .replace(/^\n+|\n+$/g, '');
-  });
+  return parked.restore(text);
 }
 
 /**
@@ -919,6 +1342,27 @@ export function buildBaseUrl(language: string, baseUrlOverride?: string): string
   return host;
 }
 
+/** Escapes `encodeURIComponent` writes that MediaWiki's `wfUrlencode` leaves literal in a title. */
+const LITERAL_IN_TITLE_PATH = /%(?:3B|40|24|2C|2F|3A)/g;
+
+/**
+ * The canonical URL of the article `title` on the edition served from `origin`, encoded the way
+ * MediaWiki encodes its own `fullurl`: spaces become underscores, `wfUrlencode` percent-encodes the
+ * rest but leaves `; @ $ ! * ( ) , / ~ :` literal, and `'` is escaped. The result is byte-identical to
+ * the `fullurl` `prop=info&inprop=url` reports for the same title — `AC/DC` stays
+ * `/wiki/AC/DC` and `C++` becomes `/wiki/C%2B%2B` — so a section read cites the same URL a full read
+ * does.
+ *
+ * `title` must be the title MediaWiki resolved (`parse.title`), not the caller's input: a redirect
+ * alias or a lowercase first letter names a different URL than the article's own.
+ */
+export function articleUrl(origin: string, title: string): string {
+  const path = encodeURIComponent(title.replaceAll(' ', '_'))
+    .replaceAll("'", '%27')
+    .replace(LITERAL_IN_TITLE_PATH, decodeURIComponent);
+  return `${origin}/wiki/${path}`;
+}
+
 /**
  * Extract the Wikipedia edition subdomain (the first host label) from an article URL — the value a
  * caller passes as `language` to other tools. Returns `undefined` for a URL that cannot be parsed,
@@ -1207,6 +1651,12 @@ export class WikipediaService {
   /**
    * Fetch the REST summary for an article.
    *
+   * The extract is rendered from `extract_html` through {@link htmlSectionToPlainText}, the renderer
+   * every read path shares. The plain `extract` flattens superscripts into the digits beside them —
+   * `6.02214076×10<sup>23</sup>` reads as `6.02214076×1023` — and runs a disambiguation page's list
+   * into the sentence introducing it. The plain `extract` is still what decides whether the article
+   * has readable content, and stands in for a payload that carries no `extract_html`.
+   *
    * `latitude`/`longitude` come from the response's `coordinates`, which a non-geotagged article
    * carries as an explicit `null` rather than omitting — both are left undefined for that, for an
    * absent key, and for a partial pair, so a caller never reads half a coordinate as a location.
@@ -1267,7 +1717,7 @@ export class WikipediaService {
       pageid: raw.pageid,
       wikidataQid: raw.wikibase_item,
       description: raw.description,
-      extract: raw.extract,
+      extract: (raw.extract_html && htmlSectionToPlainText(raw.extract_html)) || raw.extract,
       thumbnailUrl: raw.thumbnail?.source,
       latitude: geotagged ? lat : undefined,
       longitude: geotagged ? lon : undefined,
@@ -1399,22 +1849,41 @@ export class WikipediaService {
     return pageMetaById(raw.query?.pages);
   }
 
-  /** Fetch full article plain text via Action API extracts. */
+  /**
+   * Fetch the full article as plain text, with the revision it was read from and its canonical URL,
+   * in one Action API request.
+   *
+   * The extract is TextExtracts' HTML mode rendered through {@link htmlSectionToPlainText} rather
+   * than `explaintext`, which flattens superscripts into the digits beside them. Both modes strip the
+   * same infoboxes, tables, and navboxes upstream, so the rendered text carries the same sections
+   * under the same `== Heading ==` markers; beyond superscripts it differs only where the HTML says
+   * more — a `<pre>` sample arrives fenced, and a formula arrives once, as its TeX.
+   *
+   * `lastModified` is the revision's own timestamp (`revisions[0]`), never `prop=info`'s `touched`,
+   * which is a cache-invalidation time that moves without an edit.
+   */
   async getArticleFull(
     title: string,
     language: string,
     ctx: ServiceContext,
-  ): Promise<{ title: string; pageid: number | undefined; content: string }> {
+  ): Promise<{
+    title: string;
+    pageid: number | undefined;
+    content: string;
+    revisionId: string | undefined;
+    lastModified: string | undefined;
+    url: string | undefined;
+  }> {
     const raw = await this.actionGet<ActionExtractsRaw>(
       language,
       {
         action: 'query',
         titles: title,
-        prop: 'extracts',
-        explaintext: 'true',
-        exsectionformat: 'wiki',
+        prop: 'extracts|info|revisions',
+        inprop: 'url',
+        rvprop: 'ids|timestamp',
         // Resolve redirects server-side so aliases (e.g. "NYC" → "New York City") return the
-        // target's content and pageid, matching getSummary's REST behavior.
+        // target's content, pageid, revision, and URL, matching getSummary's REST behavior.
         redirects: 'true',
       },
       ctx,
@@ -1435,14 +1904,20 @@ export class WikipediaService {
     if (page.invalid) throw invalidTitleError(title, page.invalidreason);
     if (page.missing !== undefined) throw articleNotFoundError(title, language);
 
-    if (!page.extract) {
+    // An extract of only empty paragraphs renders to nothing, which is no more readable than none.
+    const content = htmlSectionToPlainText(page.extract ?? '');
+    if (!content) {
       throw notFound(`Article "${title}" exists but has no readable content.`, { title, language });
     }
 
+    const revision = page.revisions?.[0];
     return {
       title: page.title ?? title,
       pageid: page.pageid,
-      content: page.extract,
+      content,
+      revisionId: revision?.revid?.toString(),
+      lastModified: revision?.timestamp,
+      url: page.fullurl,
     };
   }
 
@@ -1457,19 +1932,32 @@ export class WikipediaService {
    * `prop=text` rather than `prop=wikitext`: the parser expands templates and emits headings inline,
    * so inline `{{code}}`-style templates survive and each subsection heading stays attached to its
    * own body. See {@link htmlSectionToPlainText}.
+   *
+   * `prop=revid` names the revision the text was parsed from. `action=parse` offers no URL and no
+   * revision timestamp, so `url` is composed from the resolved `parse.title` with {@link articleUrl}
+   * — byte-identical to the full read's `fullurl` — and the section read carries no `lastModified`,
+   * which would cost a second request. Under a single-instance override the host's article path is
+   * unknown, so `url` is omitted rather than guessed.
    */
   async getArticleSection(
     title: string,
     sectionIndex: number,
     language: string,
     ctx: ServiceContext,
-  ): Promise<{ title: string; pageid: number | undefined; sectionTitle: string; content: string }> {
+  ): Promise<{
+    title: string;
+    pageid: number | undefined;
+    sectionTitle: string;
+    content: string;
+    revisionId: string | undefined;
+    url: string | undefined;
+  }> {
     const raw = await this.actionGet<ActionParseTextRaw>(
       language,
       {
         action: 'parse',
         page: title,
-        prop: 'text',
+        prop: 'text|revid',
         section: String(sectionIndex),
         // Suppress the edit links, table of contents, and parser report — page furniture that
         // would only be stripped again on the way to plain text.
@@ -1510,11 +1998,18 @@ export class WikipediaService {
         ? LEAD_SECTION_TITLE
         : ([...content.matchAll(HEADING_LINE)][0]?.[2] ?? `Section ${sectionIndex}`);
 
+    const resolvedTitle = raw.parse?.title;
     return {
-      title: raw.parse?.title ?? title,
+      title: resolvedTitle ?? title,
       pageid: raw.parse?.pageid,
       sectionTitle,
       content,
+      revisionId: raw.parse?.revid?.toString(),
+      // Only the title MediaWiki resolved names the article's URL — the caller's input may be an alias.
+      url:
+        resolvedTitle && !this.baseUrl
+          ? articleUrl(await this.resolveBaseUrl(language, ctx), resolvedTitle)
+          : undefined,
     };
   }
 

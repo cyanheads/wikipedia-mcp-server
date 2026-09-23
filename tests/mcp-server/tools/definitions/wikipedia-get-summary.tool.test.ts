@@ -3,10 +3,28 @@
  * @module tests/mcp-server/tools/definitions/wikipedia-get-summary.tool.test
  */
 
+import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
+import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { wikipediaGetSummary } from '@/mcp-server/tools/definitions/wikipedia-get-summary.tool.js';
+import {
+  getWikipediaService,
+  initWikipediaService,
+} from '@/services/wikipedia/wikipedia-service.js';
 import { mockWikipediaService } from '../../../helpers/wikipedia-service-mock.js';
+
+/** The joined text of every text block format() returns. */
+function renderText(output: Parameters<NonNullable<typeof wikipediaGetSummary.format>>[0]): string {
+  return wikipediaGetSummary.format!(output)
+    .map((b) => (b.type === 'text' ? b.text : ''))
+    .join('');
+}
+
+/** A StorageService stand-in for the edition index, which the stubbed fetch never needs. */
+function fakeStorage(): StorageService {
+  return { get: async () => null, set: async () => undefined } as unknown as StorageService;
+}
 
 const mockSummary = {
   title: 'Python (programming language)',
@@ -439,6 +457,137 @@ describe('wikipediaGetSummary', () => {
     expect(text).not.toContain('<title>');
     expect(output.extract).toBe(extract);
     expect(output.title).toBe('HTML <element>');
+  });
+
+  it('escapes line-leading list markers and pipes in the extract (characterization)', () => {
+    const text = renderText({
+      title: 'Mercury',
+      page_type: 'disambiguation',
+      extract: 'Mercury may refer to:\n- Mercury (planet)\n1. First | second',
+      language: 'en',
+    });
+    expect(text).toContain('Mercury may refer to:\n\\- Mercury (planet)\n1\\. First \\| second');
+  });
+
+  describe('end to end through the real service (characterization)', () => {
+    beforeEach(() => {
+      vi.restoreAllMocks();
+      initWikipediaService({} as AppConfig, fakeStorage(), 'wikipedia-mcp-server/test');
+      const svc = getWikipediaService();
+      vi.spyOn(svc, 'fetchEditionIndex').mockResolvedValue({
+        hosts: { en: 'https://en.wikipedia.org' },
+        fetchedAt: '2026-09-22T00:00:00.000Z',
+      });
+      vi.spyOn(svc, 'restGet').mockResolvedValue({
+        type: 'standard',
+        title: 'Eiffel Tower',
+        pageid: 9232,
+        wikibase_item: 'Q243',
+        description: 'Tower in Paris, France',
+        extract: 'The Eiffel Tower is a wrought-iron lattice tower in Paris.',
+        extract_html: '<p>The <b>Eiffel Tower</b> is a wrought-iron lattice tower in Paris.</p>',
+        thumbnail: { source: 'https://upload.wikimedia.org/eiffel.jpg' },
+        coordinates: { lat: 48.85822222, lon: 2.2945 },
+        content_urls: { desktop: { page: 'https://en.wikipedia.org/wiki/Eiffel_Tower' } },
+        revision: '1374916289',
+        timestamp: '2026-09-14T20:37:52Z',
+      });
+    });
+
+    it('maps every summary field onto structuredContent and content[]', async () => {
+      const ctx = createMockContext({ errors: wikipediaGetSummary.errors });
+      const input = wikipediaGetSummary.input.parse({ title: 'Eiffel Tower' });
+      const result = wikipediaGetSummary.output.parse(
+        await wikipediaGetSummary.handler(input, ctx),
+      );
+
+      expect(result).toEqual({
+        title: 'Eiffel Tower',
+        page_type: 'standard',
+        pageid: 9232,
+        wikibase_item: 'Q243',
+        description: 'Tower in Paris, France',
+        extract: 'The Eiffel Tower is a wrought-iron lattice tower in Paris.',
+        thumbnail_url: 'https://upload.wikimedia.org/eiffel.jpg',
+        latitude: 48.85822222,
+        longitude: 2.2945,
+        url: 'https://en.wikipedia.org/wiki/Eiffel_Tower',
+        revision_id: '1374916289',
+        last_modified: '2026-09-14T20:37:52Z',
+        language: 'en',
+      });
+      expect(renderText(result)).toBe(
+        [
+          '# Eiffel Tower',
+          '*Tower in Paris, France*',
+          '**Type:** standard | **Language:** en',
+          '**Page ID:** 9232',
+          '**Wikidata QID:** Q243',
+          '**Thumbnail:** https://upload.wikimedia.org/eiffel.jpg',
+          '**URL:** https://en.wikipedia.org/wiki/Eiffel_Tower',
+          '**Latitude:** 48.85822222',
+          '**Longitude:** 2.2945',
+          '**Nearby:** pass latitude and longitude to wikipedia_search_nearby for other notable articles around this point.',
+          '**Revision ID:** 1374916289',
+          '**Last modified:** 2026-09-14T20:37:52Z',
+          '',
+          'The Eiffel Tower is a wrought-iron lattice tower in Paris.',
+        ].join('\n'),
+      );
+    });
+  });
+
+  describe('superscripts from extract_html (issue #48)', () => {
+    beforeEach(() => {
+      vi.restoreAllMocks();
+      initWikipediaService({} as AppConfig, fakeStorage(), 'wikipedia-mcp-server/test');
+      const svc = getWikipediaService();
+      vi.spyOn(svc, 'fetchEditionIndex').mockResolvedValue({
+        hosts: { en: 'https://en.wikipedia.org' },
+        fetchedAt: '2026-09-22T00:00:00.000Z',
+      });
+      vi.spyOn(svc, 'restGet').mockResolvedValue({
+        type: 'standard',
+        title: 'Avogadro constant',
+        pageid: 41545,
+        extract:
+          'The Avogadro constant, commonly denoted NA, has the exact value 6.02214076×1023 mol−1.',
+        extract_html:
+          '<p>The <b>Avogadro constant</b>, commonly denoted <span class="texhtml "><b><i>N</i><sub>A</sub></b></span>, has the exact value <span class="nowrap">6.022<span>140</span><span>76</span><span>×</span>10<sup>23</sup> mol<sup>−1</sup></span>.</p>',
+        content_urls: { desktop: { page: 'https://en.wikipedia.org/wiki/Avogadro_constant' } },
+        revision: '1360615018',
+        timestamp: '2026-06-22T16:08:35Z',
+      });
+    });
+
+    it('keeps exponents apart from their digits in structuredContent and content[]', async () => {
+      const ctx = createMockContext({ errors: wikipediaGetSummary.errors });
+      const input = wikipediaGetSummary.input.parse({ title: 'Avogadro constant' });
+      const result = wikipediaGetSummary.output.parse(
+        await wikipediaGetSummary.handler(input, ctx),
+      );
+
+      expect(result.extract).toBe(
+        'The Avogadro constant, commonly denoted N_A, has the exact value 6.02214076×10²³ mol⁻¹.',
+      );
+      expect(renderText(result)).toContain(
+        '\nThe Avogadro constant, commonly denoted N\\_A, has the exact value 6.02214076×10²³ mol⁻¹.',
+      );
+      // The #44 citation fields are unaffected.
+      expect(result.url).toBe('https://en.wikipedia.org/wiki/Avogadro_constant');
+      expect(result.revision_id).toBe('1360615018');
+      expect(result.last_modified).toBe('2026-06-22T16:08:35Z');
+    });
+  });
+
+  it('passes a fenced code block the renderer wrote into content[] raw, escaping the prose around it', () => {
+    const text = renderText({
+      title: 'Hello',
+      page_type: 'standard',
+      extract: 'A <tiny> program:\n\n```\nif n < 0:\n    x *= 2\n```',
+      language: 'en',
+    });
+    expect(text).toContain('A \\<tiny\\> program:\n\n```\nif n < 0:\n    x *= 2\n```');
   });
 
   it('non-McpError from service propagates without wrapping', async () => {

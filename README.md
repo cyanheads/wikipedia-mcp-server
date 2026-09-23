@@ -37,7 +37,7 @@ Wikipedia content via the MediaWiki REST API and Action API. Search articles, re
 |:---|:---|
 | `wikipedia_search_articles` | Full-text search across Wikipedia, returning ranked results with short descriptions, Wikidata QIDs, plain-text snippets, and page IDs, plus Wikipedia's spelling suggestion. |
 | `wikipedia_get_summary` | Short summary for any article — plain text, Wikidata QID, description, thumbnail URL, page type, canonical URL, revision, and coordinates. |
-| `wikipedia_get_article` | Full article or a targeted section as clean plain text, with section markers preserved. |
+| `wikipedia_get_article` | Full article or a targeted section as clean plain text, with section markers preserved, the canonical URL, and the revision it was read from. |
 | `wikipedia_get_sections` | Table of contents with `section_index` values for targeted section reads. |
 | `wikipedia_search_nearby` | Geotagged Wikipedia articles within a radius of a WGS 84 coordinate, sorted by distance, with short descriptions and Wikidata QIDs. |
 | `wikipedia_get_languages` | All language editions available for an article, with titles and URLs, or just the editions you ask for. |
@@ -61,6 +61,7 @@ Wikipedia content via the MediaWiki REST API and Action API. Search articles, re
 
 - Returns the REST summary extract — a truncated fragment from the start of the lead, not the whole lead — plus the Wikidata QID (`wikibase_item`), short description, and thumbnail URL
 - `url` is the canonical article URL, and `revision_id` / `last_modified` name the revision the extract was read from — `?oldid=<revision_id>` is a permanent link to it
+- Superscripts and subscripts in the extract stay distinct from the digits beside them (`10²³`, `H₂O`), rendered the same way as on `wikipedia_get_article`
 - `latitude` / `longitude` are present for a geotagged article and pass straight to `wikipedia_search_nearby`, whose inputs carry those names; both are absent otherwise
 - For the lead section in full, call `wikipedia_get_article` with `section_index: 0`
 - `page_type` discriminates `standard` / `disambiguation` / `no-extract` — on `disambiguation`, re-query with `wikipedia_search_articles` for a more specific title
@@ -74,8 +75,11 @@ Wikipedia content via the MediaWiki REST API and Action API. Search articles, re
 - Without `section_index`: full article with `== Section ==` markers, unless it exceeds `WIKIPEDIA_ARTICLE_OVERFLOW_BYTES` (default 80,000 bytes) — then returns a section outline (`truncated: true`) pointing to `wikipedia_get_sections` plus a targeted `section_index` read
 - With `section_index` (from `wikipedia_get_sections`): returns that section plus every nested subsection, each heading above its own body
 - `section_index: 0` is the lead section — the text above the first heading, returned under the title `Introduction`
-- Data tables are omitted from both paths — a section whose body is entirely a data table returns little beyond its heading; layout-only tables (multi-column lists, succession boxes) keep their content
-- Page furniture — maintenance banners, sister-project and library-resource boxes, portal bars, spoken-article notices — is stripped; hatnotes are kept
+- Both paths render code samples as fenced blocks with indentation intact and formulas as their TeX. Section reads also render data tables as pipe-delimited rows (header row, `| --- |`, then one line per row; `rowspan` cells repeated) and infoboxes as `label: value` lines; a table over 40,000 rendered bytes leaves a `[table omitted: N rows]` marker. The full-article path carries no tables or infoboxes — upstream extracts strip them — so read the section for those
+- Layout-only tables (multi-column lists, succession boxes) keep their content as ordinary text
+- Superscripts and subscripts stay distinct from the digits beside them: `10²³`, `mol⁻¹`, `H₂O`, or `^x` / `_x` where a character has no Unicode form. An abbreviation's superscript stays joined, as the edition writes it in plain text (French `XIXe siècle`, `1er`, `Mme`)
+- Every read returns `url` (the canonical article URL) and `revision_id` (the revision the text was read from — `?oldid=<revision_id>` is a permanent link to it); a full read, outline included, also returns `last_modified`, that revision's timestamp. For a redirect, all three name the target article. With `WIKIPEDIA_BASE_URL` set, a section read omits `url`, since the mirror's article path is unknown
+- Page furniture — maintenance banners, sister-project and library-resource boxes, portal bars, spoken-article notices — is stripped, as are the editor-only preview warnings a section render emits; hatnotes are kept
 - Redirect pages are followed automatically
 
 ---
@@ -115,7 +119,7 @@ Wikipedia-specific:
 
 - Dual API integration — MediaWiki REST API (`/api/rest_v1/`) for summaries, Action API (`/w/api.php`) for search, full text, sections, geo search, and language links
 - Retry and backoff on every required request (the best-effort description lookup on search results gets one short attempt); `User-Agent` header per Wikimedia API policy
-- Both read paths render to the same plain-text shape — `== Heading ==` markers, one list item per line — the full article from Action API extracts, a section from the parser's own HTML for that section. A section read additionally keeps code-sample indentation and the lists inside layout tables, neither of which the extract carries
+- Every read path renders HTML through one renderer to the same plain-text shape — `== Heading ==` markers, one list item per line, superscripts kept, code fenced: the full article from the Action API's HTML extract, a section from the parser's own HTML for that section, the summary from the REST `extract_html`. A section read additionally carries data tables, infoboxes, and the lists inside layout tables, none of which the extract carries
 - Per-call `language` parameter on every tool — all Wikipedia language editions accessible in a single session
 - Language validation against a live edition registry built from the MediaWiki `action=sitematrix` endpoint (cached 24h) — catches structurally valid but nonexistent editions before they cause timeouts
 
@@ -123,7 +127,7 @@ Agent-friendly output:
 
 - `page_type` on summaries discriminates `standard` / `disambiguation` / `no-extract` — no string parsing needed
 - `wikibase_item` (Wikidata QID) on summaries and on search and nearby results enables direct cross-referencing with wikidata-mcp-server
-- Article text, snippets, and titles are backslash-escaped on the way into the markdown `content[]` render, so an article that writes about markup or markdown syntax reads as itself instead of being interpreted by the client; `structuredContent` carries the same text unescaped
+- Article text, snippets, and titles are backslash-escaped on the way into the markdown `content[]` render, so an article that writes about markup or markdown syntax reads as itself instead of being interpreted by the client; `structuredContent` carries the same text unescaped. Fenced code blocks and table-row delimiters pass through unescaped, while table cells stay escaped
 - `section_index` on table-of-contents entries links directly to the targeted-read parameter on `wikipedia_get_article`, index 0 included
 - Titles MediaWiki cannot name a page with — `< > [ ] { }`, the `|` multi-title separator, percent escapes, magic tildes, relative paths — are refused before any request, with `invalid_title`; a trailing `#fragment` is accepted and resolves normally
 - Recovery hints on every error type — callers get actionable next steps (e.g., "use `wikipedia_search_articles` to find the correct title")
