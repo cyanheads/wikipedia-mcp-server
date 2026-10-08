@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.2.5-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/wikipedia-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/wikipedia-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/wikipedia-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.2.5-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/wikipedia-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.2.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/wikipedia-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/wikipedia-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.2-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -46,70 +46,44 @@ Wikipedia content via the MediaWiki REST API and Action API. Search articles, re
 
 ### `wikipedia_search_articles` <sub>tool</sub>
 
-- Free-text query, ranked by relevance; returns plain-text snippets (HTML stripped), page IDs, and word counts
-- Each result carries the article's short `description` and Wikidata QID (`wikibase_item`) when it has them, from one follow-up lookup per page of results. That lookup is best-effort: if it fails, the results still come back without the two fields and the `notice` says so
-- Enrichment `suggestion` carries Wikipedia's spelling correction whenever it has one (`einstien` → `einstein`), and a zero-hit first page names it in the `notice` — re-run with it as `query`
-- `limit` is 1–50; `offset` pages further results — enrichment `nextOffset` signals more remain and is passed back as `offset`
-- Wikipedia serves no result past the 10,000th for a query: an `offset` at or beyond it fails with `offset_too_large`, and a page ending on the window carries enrichment `truncated` naming the matches no offset reaches — narrow the query to bring them into range
-- An empty `query` fails with `empty_query`; a whitespace-only query is a real search that simply matches nothing
-- `language` selects any Wikipedia edition (default `en`)
-- Best when the exact article title is unknown, or to discover multiple articles on a topic
+- Free-text `query` (an empty one fails with `empty_query`), `limit` 1–50, and `offset` paging, passing back enrichment `nextOffset`. Wikipedia serves no result past the 10,000th: an `offset` at or beyond it fails with `offset_too_large`, and a page ending on that window carries enrichment `truncated`
+- Each result carries a plain-text snippet, page ID, word count, and — when the article has them — its short `description` and Wikidata QID (`wikibase_item`); enrichment `suggestion` carries Wikipedia's spelling correction (`einstien` → `einstein`)
 
 ---
 
 ### `wikipedia_get_summary` <sub>tool</sub>
 
-- Returns the REST summary extract — a truncated fragment from the start of the lead, not the whole lead — plus the Wikidata QID (`wikibase_item`), short description, and thumbnail URL
-- `url` is the canonical article URL, and `revision_id` / `last_modified` name the revision the extract was read from — `?oldid=<revision_id>` is a permanent link to it
-- Superscripts and subscripts in the extract stay distinct from the digits beside them (`10²³`, `H₂O`), rendered the same way as on `wikipedia_get_article`
-- `latitude` / `longitude` are present for a geotagged article and pass straight to `wikipedia_search_nearby`, whose inputs carry those names; both are absent otherwise
-- For the lead section in full, call `wikipedia_get_article` with `section_index: 0`
-- `page_type` discriminates `standard` / `disambiguation` / `no-extract` — on `disambiguation`, re-query with `wikipedia_search_articles` for a more specific title
-- Redirect pages are followed automatically
-- Right tool for most encyclopedic "what is X?" lookups; use `wikipedia_get_article` for full depth
+- Takes a `title`; returns the REST summary extract — a fragment from the start of the lead (`wikipedia_get_article` with `section_index: 0` reads the whole lead) — plus the short description, thumbnail URL, Wikidata QID (`wikibase_item`), and, for a geotagged article, `latitude` / `longitude` to pass straight to `wikipedia_search_nearby`
+- `page_type` discriminates `standard` / `disambiguation` / `no-extract` (on `disambiguation`, re-query with `wikipedia_search_articles`); `url`, `revision_id`, and `last_modified` name the revision read, and `?oldid=<revision_id>` is a permanent link to it
 
 ---
 
 ### `wikipedia_get_article` <sub>tool</sub>
 
-- Without `section_index`: full article with `== Section ==` markers, unless it exceeds `WIKIPEDIA_ARTICLE_OVERFLOW_BYTES` (default 80,000 bytes) — then returns a section outline (`truncated: true`) pointing to `wikipedia_get_sections` plus a targeted `section_index` read
-- With `section_index` (from `wikipedia_get_sections`): returns that section plus every nested subsection, each heading above its own body
-- `section_index: 0` is the lead section — the text above the first heading, returned under the title `Introduction`
-- Both paths render code samples as fenced blocks with indentation intact and formulas as their TeX. Section reads also render data tables as pipe-delimited rows (header row, `| --- |`, then one line per row; `rowspan` cells repeated) and infoboxes as `label: value` lines; a table over 40,000 rendered bytes leaves a `[table omitted: N rows]` marker. The full-article path carries no tables or infoboxes — upstream extracts strip them — so read the section for those
-- Layout-only tables (multi-column lists, succession boxes) keep their content as ordinary text
-- Superscripts and subscripts stay distinct from the digits beside them: `10²³`, `mol⁻¹`, `H₂O`, or `^x` / `_x` where a character has no Unicode form. An abbreviation's superscript stays joined, as the edition writes it in plain text (French `XIXe siècle`, `1er`, `Mme`)
-- Every read returns `url` (the canonical article URL) and `revision_id` (the revision the text was read from — `?oldid=<revision_id>` is a permanent link to it); a full read, outline included, also returns `last_modified`, that revision's timestamp. For a redirect, all three name the target article. With `WIKIPEDIA_BASE_URL` set, a section read omits `url`, since the mirror's article path is unknown
-- Page furniture — maintenance banners, sister-project and library-resource boxes, portal bars, spoken-article notices — is stripped, as are the editor-only preview warnings a section render emits; hatnotes are kept
-- Redirect pages are followed automatically
+- Without `section_index`: the full article with `== Section ==` markers, or a section outline (`truncated: true`) when it exceeds `WIKIPEDIA_ARTICLE_OVERFLOW_BYTES` (default 80,000 bytes). With a `section_index` from `wikipedia_get_sections` (`0` is the lead): that section plus its nested subsections
+- Every read returns `url` and `revision_id` (`?oldid=<revision_id>` is a permanent link to the text read); a full read, outline included, also returns `last_modified`. With `WIKIPEDIA_BASE_URL` set, a section read omits `url`
+- Section reads also carry data tables as pipe-delimited rows and infoboxes as `label: value` lines, which the full-article extract strips; a table over 40,000 rendered bytes leaves a `[table omitted: N rows]` marker
 
 ---
 
 ### `wikipedia_get_sections` <sub>tool</sub>
 
-- Returns section titles, heading levels, hierarchical numbering (e.g. `"2.1"`), and `section_index` values
-- The first entry is the lead: `index: 0`, titled `Introduction` — Wikipedia's own table of contents starts at the first heading
-- `section_index` is the integer to pass to `wikipedia_get_article` for a targeted read
+- Takes a `title`; returns section titles, heading levels, hierarchical numbering (e.g. `"2.1"`), and the `section_index` to pass to `wikipedia_get_article` — the first entry is the lead (`index: 0`, titled `Introduction`)
 - Fails with `no_sections` on a stub or very short article — read it with `wikipedia_get_article` instead
-- Redirect pages are followed automatically
 
 ---
 
 ### `wikipedia_search_nearby` <sub>tool</sub>
 
-- Returns geotagged articles sorted ascending by distance, with coordinates, `distance_meters`, and each article's short `description` and Wikidata QID (`wikibase_item`) when it has them
-- `radius_meters`: 10–10,000 (default 1000); `limit`: 1–500 (default 10) — no pagination past `limit`, so raise it or sweep narrower radii for full coverage
-- Only articles carrying their own coordinate tag (GeoData, set on the article — not the Wikidata item's coordinate) are returned, and that tag places and measures each result. An article with a wrong tag appears where the tag puts it; its `description` usually gives it away (`Palazzo Bernardo Nani` — "Palace on the Grand Canal, Venice" — 161 m from the Eiffel Tower)
-- Enrichment `truncated` flags when more articles matched than `limit` allowed; at `limit: 500`, Wikipedia's ceiling, a full page reports `truncated` and the notice points to narrower sweeps rather than a higher limit
+- `latitude` / `longitude` (WGS 84), `radius_meters` 10–10,000 (default 1000), and `limit` 1–500 (default 10), with no pagination past `limit`; enrichment `truncated` flags more matches than `limit` allowed — at 500, Wikipedia's ceiling, sweep narrower radii instead
+- Returns articles sorted by `distance_meters`, with coordinates, short `description`, and Wikidata QID (`wikibase_item`). Each is placed by the article's own GeoData coordinate tag, not its Wikidata item's coordinate, so a mistagged article appears where the tag puts it
 
 ---
 
 ### `wikipedia_get_languages` <sub>tool</sub>
 
-- Returns each edition's `language_code`, tool-usable `edition_code` (can differ, e.g. `gsw` vs `als`), article title, and URL
-- Pass `edition_code` — not `language_code` — as the `language` parameter on other tools
-- `editions` narrows the answer to the codes asked for, matched against both `edition_code` and `language_code`; requested codes with no article come back under `missing`, and `total_languages` stays the unfiltered count. A popular article lists hundreds of editions, so the filter is the difference between a 40 KB reply and a 1 KB one
-- Fails with `no_other_languages` when the article has no translations — a filter that matches nothing is a normal response with an empty list, not a failure
-- Redirect pages are followed automatically; `source_title` reports the resolved title
+- Takes a `title`; returns each edition's `language_code`, `edition_code`, article title, and URL, plus `source_title`, the resolved title. Pass `edition_code` — not `language_code` — as `language` on other tools; the two can differ (`gsw` vs `als`)
+- `editions` narrows the list to the codes asked for: codes with no article come back under `missing`, and `total_languages` stays the unfiltered count. Fails with `no_other_languages` when the article has no translations; a filter matching nothing is an empty list, not a failure
 
 ## Features
 
@@ -120,7 +94,7 @@ Wikipedia-specific:
 - Dual API integration — MediaWiki REST API (`/api/rest_v1/`) for summaries, Action API (`/w/api.php`) for search, full text, sections, geo search, and language links
 - Retry and backoff on every required request, including the transient refusals (search too busy, rate-limited, read-only) the Action API returns inside an HTTP 200 body, with an upstream `Retry-After` honored and each request's retries bounded at 30 s. The best-effort description lookup on search results gets one short attempt; `User-Agent` header per Wikimedia API policy
 - Every read path renders HTML through one renderer to the same plain-text shape — `== Heading ==` markers, one list item per line, superscripts kept, code fenced: the full article from the Action API's HTML extract, a section from the parser's own HTML for that section, the summary from the REST `extract_html`. A section read additionally carries data tables, infoboxes, and the lists inside layout tables, none of which the extract carries
-- Per-call `language` parameter on every tool — all Wikipedia language editions accessible in a single session
+- Per-call `language` parameter on every tool (default `en`) — all Wikipedia language editions accessible in a single session; every title read follows redirects
 - Language validation against a live edition registry built from the MediaWiki `action=sitematrix` endpoint (cached 24h) — catches structurally valid but nonexistent editions before they cause timeouts
 
 Agent-friendly output:
@@ -257,6 +231,7 @@ cp .env.example .env
 | `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
 | `MCP_LOG_LEVEL` | Log level (RFC 5424). | `info` |
 | `LOGS_DIR` | Directory for log files (Node.js only). | `<project-root>/logs` |
+| `LOG_TOOL_FAILURE_PAYLOADS` | Log each failed tool call's arguments and result, redacted by key name and capped at `LOG_TOOL_FAILURE_PAYLOAD_MAX_BYTES` (default `16384`). A secret inside a free-form value is not redacted. | `false` |
 | `OTEL_ENABLED` | Enable OpenTelemetry instrumentation (spans, metrics, completion logs). | `false` |
 
 See [`.env.example`](./.env.example) for the full list of optional overrides.
