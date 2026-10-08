@@ -170,7 +170,7 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
       throw ctx.fail(
         'invalid_language',
         `Invalid language code "${language}". Use a BCP 47 language code such as "fr", "de", or "ja".`,
-        { language, ...ctx.recoveryFor('invalid_language') },
+        { language },
       );
     }
 
@@ -180,7 +180,7 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
       throw ctx.fail(
         'invalid_language',
         `Language edition "${language}" does not exist on Wikipedia. Use a valid Wikipedia language code such as "fr", "de", or "ja".`,
-        { language, ...ctx.recoveryFor('invalid_language') },
+        { language },
       );
     }
 
@@ -204,7 +204,7 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
       throw ctx.fail(
         'invalid_title',
         `Article title "${input.title}" is not a valid Wikipedia page name. The characters < > [ ] { } and | are not allowed in a title, nor are percent escapes (%41), three or more tildes, or relative paths; a trailing #fragment is fine.`,
-        { title: input.title, ...ctx.recoveryFor('invalid_title') },
+        { title: input.title },
       );
     }
 
@@ -232,7 +232,6 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
         {
           title: input.title,
           language,
-          ...ctx.recoveryFor('no_other_languages'),
         },
       );
     }

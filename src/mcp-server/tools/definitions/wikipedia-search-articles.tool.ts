@@ -157,7 +157,7 @@ export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
       throw ctx.fail(
         'invalid_language',
         `Invalid language code "${language}". Use a BCP 47 language code such as "fr", "de", or "ja".`,
-        { language, ...ctx.recoveryFor('invalid_language') },
+        { language },
       );
     }
 
@@ -167,7 +167,7 @@ export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
       throw ctx.fail(
         'invalid_language',
         `Language edition "${language}" does not exist on Wikipedia. Use a valid Wikipedia language code such as "fr", "de", or "ja".`,
-        { language, ...ctx.recoveryFor('invalid_language') },
+        { language },
       );
     }
 
@@ -178,7 +178,6 @@ export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
       throw ctx.fail(
         'empty_query',
         'Search query must not be empty. Provide search terms, such as an article title or a descriptive phrase.',
-        { ...ctx.recoveryFor('empty_query') },
       );
     }
 
@@ -188,7 +187,7 @@ export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
       throw ctx.fail(
         'offset_too_large',
         `Offset ${input.offset} is at or past Wikipedia's ${WINDOW}-result search window, which has no continuation. Narrow the query instead of paging further.`,
-        { offset: input.offset, ...ctx.recoveryFor('offset_too_large') },
+        { offset: input.offset },
       );
     }
 

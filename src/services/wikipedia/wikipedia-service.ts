@@ -1251,13 +1251,7 @@ function articleNotFoundError(title: string, language: string): McpError {
 function invalidTitleError(title: string, upstreamReason?: string): McpError {
   return validationError(
     `"${title}" is not a valid Wikipedia page name.${upstreamReason ? ` ${upstreamReason}` : ''}`,
-    {
-      title,
-      reason: 'invalid_title',
-      recovery: {
-        hint: 'Use wikipedia_search_articles to find the exact article title and pass it verbatim.',
-      },
-    },
+    { title, reason: 'invalid_title' },
   );
 }
 

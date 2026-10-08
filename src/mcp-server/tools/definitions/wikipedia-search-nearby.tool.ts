@@ -138,17 +138,14 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
       throw ctx.fail(
         'invalid_coordinates',
         `Latitude ${input.latitude} is out of range (−90 to 90).`,
-        {
-          latitude: input.latitude,
-          ...ctx.recoveryFor('invalid_coordinates'),
-        },
+        { latitude: input.latitude },
       );
     }
     if (input.longitude < -180 || input.longitude > 180) {
       throw ctx.fail(
         'invalid_coordinates',
         `Longitude ${input.longitude} is out of range (−180 to 180).`,
-        { longitude: input.longitude, ...ctx.recoveryFor('invalid_coordinates') },
+        { longitude: input.longitude },
       );
     }
 
@@ -159,7 +156,7 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
       throw ctx.fail(
         'invalid_language',
         `Invalid language code "${language}". Use a BCP 47 language code such as "fr", "de", or "ja".`,
-        { language, ...ctx.recoveryFor('invalid_language') },
+        { language },
       );
     }
 
@@ -169,7 +166,7 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
       throw ctx.fail(
         'invalid_language',
         `Language edition "${language}" does not exist on Wikipedia. Use a valid Wikipedia language code such as "fr", "de", or "ja".`,
-        { language, ...ctx.recoveryFor('invalid_language') },
+        { language },
       );
     }
 
