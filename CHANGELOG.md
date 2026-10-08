@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.6](changelog/0.2.x/0.2.6.md) — 2026-10-08
+
+Framework 0.13.6 → 0.13.14: numeric strings and null optionals in tool arguments are repaired instead of rejected, error results carry a request ID and no longer expose stack traces or request context, and the server.json HTTP entry selects the HTTP transport.
+
 ## [0.2.5](changelog/0.2.x/0.2.5.md) — 2026-09-22
 
 Transient Action API refusals arriving as an HTTP 200 error envelope now retry with the same backoff a 503 gets, honoring Retry-After and bounded at 30s per request
