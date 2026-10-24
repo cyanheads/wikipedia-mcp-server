@@ -46,6 +46,18 @@ export const wikipediaGetSections = tool('wikipedia_get_sections', {
       .describe('Wikipedia language edition code (default "en"). Examples: "fr", "de", "ja".'),
   }),
   output: z.object({
+    redirected_from: z.string().optional().describe('Original alias followed to this article.'),
+    redirect_section: z
+      .string()
+      .optional()
+      .describe('Target fragment of the redirect, normalized to its heading when matched.'),
+    redirect_section_index: z
+      .number()
+      .int()
+      .optional()
+      .describe(
+        'Unique numeric TOC index matching the redirect anchor. Absent when no index is verified.',
+      ),
     title: z.string().describe('Article title as resolved by Wikipedia.'),
     pageid: z.number().optional().describe('Wikipedia page ID. Absent for stub articles.'),
     sections: z
@@ -194,6 +206,7 @@ export const wikipediaGetSections = tool('wikipedia_get_sections', {
       // Resolved title from the service (redirects are followed), not the raw input alias.
       title: result.title,
       pageid: result.pageid,
+      ...result.redirect,
       sections,
       total_sections: sections.length,
       language,
@@ -208,6 +221,12 @@ export const wikipediaGetSections = tool('wikipedia_get_sections', {
         (result.pageid != null ? ` | Page ID: ${result.pageid}` : ''),
       '',
     ];
+    if (result.redirected_from)
+      lines.push(`**Redirected from:** ${escapeMarkdown(result.redirected_from)}`);
+    if (result.redirect_section)
+      lines.push(`**Redirect section:** ${escapeMarkdown(result.redirect_section)}`);
+    if (result.redirect_section_index !== undefined)
+      lines.push(`**Redirect section index:** ${result.redirect_section_index}`);
     for (const s of result.sections) {
       const indent = '  '.repeat(Math.max(0, s.level - 2));
       lines.push(

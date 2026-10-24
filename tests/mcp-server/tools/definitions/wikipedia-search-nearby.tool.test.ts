@@ -75,20 +75,12 @@ describe('wikipediaSearchNearby', () => {
     expect(enrichment.notice).toContain('radius_meters');
   });
 
-  it('throws invalid_coordinates for out-of-range latitude', async () => {
-    const ctx = createMockContext({ errors: wikipediaSearchNearby.errors });
-    const input = wikipediaSearchNearby.input.parse({ latitude: 91, longitude: 0 });
-    await expect(wikipediaSearchNearby.handler(input, ctx)).rejects.toMatchObject({
-      data: { reason: 'invalid_coordinates' },
-    });
+  it('rejects out-of-range latitude in the schema', () => {
+    expect(() => wikipediaSearchNearby.input.parse({ latitude: 91, longitude: 0 })).toThrow();
   });
 
-  it('throws invalid_coordinates for out-of-range longitude', async () => {
-    const ctx = createMockContext({ errors: wikipediaSearchNearby.errors });
-    const input = wikipediaSearchNearby.input.parse({ latitude: 0, longitude: 181 });
-    await expect(wikipediaSearchNearby.handler(input, ctx)).rejects.toMatchObject({
-      data: { reason: 'invalid_coordinates' },
-    });
+  it('rejects out-of-range longitude in the schema', () => {
+    expect(() => wikipediaSearchNearby.input.parse({ latitude: 0, longitude: 181 })).toThrow();
   });
 
   it('caps radius at 10000m', async () => {
@@ -213,26 +205,18 @@ describe('wikipediaSearchNearby', () => {
     expect(input.radius_meters).toBe(10);
   });
 
-  it('throws invalid_coordinates for -91 latitude (lower bound)', async () => {
-    const ctx = createMockContext({ errors: wikipediaSearchNearby.errors });
-    const input = wikipediaSearchNearby.input.parse({ latitude: -91, longitude: 0 });
-    await expect(wikipediaSearchNearby.handler(input, ctx)).rejects.toMatchObject({
-      data: { reason: 'invalid_coordinates' },
-    });
+  it('rejects -91 latitude in the schema', () => {
+    expect(() => wikipediaSearchNearby.input.parse({ latitude: -91, longitude: 0 })).toThrow();
   });
 
-  it('throws invalid_coordinates for -181 longitude (lower bound)', async () => {
-    const ctx = createMockContext({ errors: wikipediaSearchNearby.errors });
-    const input = wikipediaSearchNearby.input.parse({ latitude: 0, longitude: -181 });
-    await expect(wikipediaSearchNearby.handler(input, ctx)).rejects.toMatchObject({
-      data: { reason: 'invalid_coordinates' },
-    });
+  it('rejects -181 longitude in the schema', () => {
+    expect(() => wikipediaSearchNearby.input.parse({ latitude: 0, longitude: -181 })).toThrow();
   });
 
-  it('rejects a limit above the geosearch ceiling at schema parse time (issue #29)', () => {
-    expect(() =>
-      wikipediaSearchNearby.input.parse({ latitude: 0, longitude: 0, limit: 999 }),
-    ).toThrow();
+  it('accepts a limit above the geosearch ceiling for disclosed clamping (issue #65)', () => {
+    expect(wikipediaSearchNearby.input.parse({ latitude: 0, longitude: 0, limit: 999 }).limit).toBe(
+      999,
+    );
   });
 
   it('passes a limit up to the geosearch ceiling through to the service (issue #29)', async () => {

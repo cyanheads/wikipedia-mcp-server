@@ -87,6 +87,13 @@ export const wikipediaGetSummary = tool('wikipedia_get_summary', {
     language: z.string().describe('Language edition queried.'),
   }),
 
+  enrichment: {
+    notice: z
+      .string()
+      .optional()
+      .describe('Guidance when the existing page has no summary extract.'),
+  },
+
   errors: [
     {
       reason: 'not_found',
@@ -170,6 +177,12 @@ export const wikipediaGetSummary = tool('wikipedia_get_summary', {
         });
       }
       throw err;
+    }
+
+    if (!result.extract) {
+      ctx.enrich.notice(
+        'This page has no summary extract. Open its canonical URL, or try wikipedia_get_article with section_index: 0. Namespace pages may contain documentation or descriptive text rather than article prose; a readable lead is not guaranteed.',
+      );
     }
 
     ctx.log.info('Summary fetched', {

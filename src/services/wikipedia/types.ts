@@ -13,6 +13,9 @@
  */
 export type ActionApiErrorRaw = { code?: string; info?: string };
 
+/** Redirect hops in traversal order, including an optional destination fragment. */
+export type ActionRedirectRaw = { from?: string; to?: string; tofragment?: string };
+
 /**
  * An `action=query` page entry for a title MediaWiki cannot name a page with (`Foo[bar]`, `A<B`).
  * The entry carries `invalid` with no `missing` key, so a `missing !== undefined` test alone reads
@@ -93,6 +96,7 @@ export type ActionSearchRaw = {
  */
 export type ActionExtractsRaw = {
   query?: {
+    redirects?: ActionRedirectRaw[];
     pages?: Record<
       string,
       InvalidPageRaw & {
@@ -124,6 +128,7 @@ export type ActionExtractsRaw = {
  */
 export type ActionSectionsRaw = {
   parse?: {
+    redirects?: ActionRedirectRaw[];
     title?: string;
     pageid?: number;
     tocdata?: {
@@ -150,6 +155,7 @@ export type ActionSectionsRaw = {
  */
 export type ActionParseTextRaw = {
   parse?: {
+    redirects?: ActionRedirectRaw[];
     title?: string;
     pageid?: number;
     /** `prop=revid`: the revision the text was parsed from. `action=parse` has no timestamp prop. */

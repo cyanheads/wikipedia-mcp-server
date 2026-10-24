@@ -17,7 +17,9 @@ import {
   isInvalidTitle,
   isMalformedLanguage,
   LEAD_SECTION_TITLE,
+  redirectInfo,
   splitArticleIntoSections,
+  tocLineToPlainText,
 } from '@/services/wikipedia/wikipedia-service.js';
 
 export const wikipediaGetArticle = tool('wikipedia_get_article', {
@@ -45,6 +47,16 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
       .describe('Wikipedia language edition code (default "en"). Examples: "fr", "de", "ja".'),
   }),
   output: z.object({
+    redirected_from: z
+      .string()
+      .optional()
+      .describe('Original alias followed to the resolved article.'),
+    redirect_section: z
+      .string()
+      .optional()
+      .describe(
+        'Redirect target fragment, or its normalized heading when verified. Explicit section_index still controls the read.',
+      ),
     title: z.string().describe('Resolved article title.'),
     pageid: z
       .number()
@@ -77,7 +89,7 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
       .boolean()
       .optional()
       .describe(
-        'True when content is an outline — call wikipedia_get_sections, then wikipedia_get_article with a section_index to read a specific section. Present only when truncated is true.',
+        'True when content is an outline — use its verified section_index values with wikipedia_get_article, or call wikipedia_get_sections for unindexed entries. Present only when truncated is true.',
       ),
     url: z
       .string()
@@ -99,6 +111,13 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
       ),
     language: z.string().describe('Language edition queried.'),
   }),
+
+  enrichment: {
+    notice: z
+      .string()
+      .optional()
+      .describe('Redirect guidance or disclosure that optional TOC verification was unavailable.'),
+  },
 
   errors: [
     {
@@ -218,6 +237,10 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
         section_title: result.sectionTitle,
         content_type: 'section',
         truncated: false,
+        ...(result.redirect && {
+          redirected_from: result.redirect.redirected_from,
+          redirect_section: result.redirect.redirect_section,
+        }),
         url: result.url,
         revision_id: result.revisionId,
         language,
@@ -245,20 +268,48 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
     // full vs. outline against this server's domain-tuned byte budget. Section-targeted reads
     // above never reach here, so they are unaffected.
     const originalLength = result.content.length;
-    const sectionDoc: Record<string, string> = {};
+    const sectionDoc: Record<string, string> = Object.create(null);
     const seen = new Map<string, number>();
-    for (const { heading, body } of splitArticleIntoSections(result.content)) {
-      const n = seen.get(heading) ?? 0;
-      seen.set(heading, n + 1);
-      // Disambiguate rare duplicate headings so no section is silently collapsed away.
-      sectionDoc[n > 0 ? `${heading} (${n + 1})` : heading] = body;
+    const parts = splitArticleIntoSections(result.content);
+    for (const { heading } of parts) seen.set(heading, (seen.get(heading) ?? 0) + 1);
+    const nextSuffix = new Map<string, number>();
+    const outlineHeadings = new Map<string, string>();
+    for (const { heading, body } of parts) {
+      let name = heading;
+      if (Object.hasOwn(sectionDoc, name)) {
+        let suffix = nextSuffix.get(heading) ?? 2;
+        do {
+          name = `${heading} (${suffix++})`;
+        } while (seen.has(name) || Object.hasOwn(sectionDoc, name));
+        nextSuffix.set(heading, suffix);
+      }
+      // Reserve actual headings before assigning duplicate labels, so a real "Foo (2)" survives.
+      sectionDoc[name] = body;
+      outlineHeadings.set(name, heading);
     }
 
-    const reCallNotice = `This article is large. Call wikipedia_get_sections to list its section indices, then wikipedia_get_article with a section_index to read a specific section — section_index 0 reads ${LEAD_SECTION_TITLE}, the text above the first heading.`;
+    const reCallNotice = `This article is large. Use a listed section_index with wikipedia_get_article to read a specific section; call wikipedia_get_sections for unindexed entries. section_index 0 reads ${LEAD_SECTION_TITLE}, the text above the first heading.`;
     const overflow = outlineOnOverflow(sectionDoc, {
       budget: getServerConfig().articleOverflowBytes,
       notice: () => reCallNotice,
     });
+
+    const needsToc = overflow.kind === 'outline' || Boolean(result.redirect?.redirect_section);
+    const toc = needsToc ? await svc.getArticleToc(result.title, language, ctx) : undefined;
+    const redirect = result.redirects ? redirectInfo(result.redirects, toc) : result.redirect;
+    const notices: string[] = [];
+    if (needsToc && !toc)
+      notices.push(
+        'Section indices could not be verified because the optional table of contents lookup was unavailable. Call wikipedia_get_sections to retry.',
+      );
+    if (redirect?.redirect_section) {
+      notices.push(
+        redirect.redirect_section_index === undefined
+          ? `The alias targets "${redirect.redirect_section}". This remains a full-article read. Open the canonical URL or call wikipedia_get_sections to locate the target.`
+          : `The alias targets "${redirect.redirect_section}". This remains a full-article read; use wikipedia_get_article with section_index: ${redirect.redirect_section_index} to read that section.`,
+      );
+    }
+    if (notices.length) ctx.enrich.notice(notices.join(' '));
 
     ctx.log.info('Article fetched', {
       title: result.title,
@@ -268,16 +319,52 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
 
     // The outline cites the same revision the full text would have, so both shapes carry it.
     const citation = {
+      ...(redirect && {
+        redirected_from: redirect.redirected_from,
+        redirect_section: redirect.redirect_section,
+      }),
       url: result.url,
       revision_id: result.revisionId,
       last_modified: result.lastModified,
     };
 
     if (overflow.kind === 'outline') {
+      const indices = new Map<string, number>();
+      const tocHeadings = new Map<string, Array<string | undefined>>();
+      for (const section of toc?.tocdata?.sections ?? []) {
+        const heading = tocLineToPlainText(section.line ?? '');
+        const matches = tocHeadings.get(heading) ?? [];
+        matches.push(section.index);
+        tocHeadings.set(heading, matches);
+      }
+      for (const [name, heading] of outlineHeadings) {
+        if (
+          name === LEAD_SECTION_TITLE &&
+          parts[0]?.heading === heading &&
+          !result.content.startsWith('==')
+        ) {
+          indices.set(name, 0);
+          continue;
+        }
+        const matches = tocHeadings.get(heading);
+        const rawIndex = matches?.length === 1 ? matches[0] : undefined;
+        const index = rawIndex?.trim() ? Number(rawIndex) : undefined;
+        if (
+          seen.get(heading) === 1 &&
+          index !== undefined &&
+          Number.isSafeInteger(index) &&
+          String(index) === rawIndex &&
+          index > 0
+        )
+          indices.set(name, index);
+      }
       const content = [
         `Full article outlined — ${originalLength} characters across ${overflow.sections.length} sections (largest first):`,
         '',
-        ...overflow.sections.map((s) => `- ${s.name} — ${s.bytes} bytes`),
+        ...overflow.sections.map(
+          (s) =>
+            `- ${s.name} — ${s.bytes} bytes${indices.has(s.name) ? ` (section_index: ${indices.get(s.name)})` : ''}`,
+        ),
         '',
         overflow.notice,
       ].join('\n');
@@ -314,6 +401,10 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
         (result.pageid != null ? ` | **Page ID:** ${result.pageid}` : ''),
     );
     if (result.section_title) lines.push(`**Section:** ${escapeMarkdown(result.section_title)}`);
+    if (result.redirected_from)
+      lines.push(`**Redirected from:** ${escapeMarkdown(result.redirected_from)}`);
+    if (result.redirect_section)
+      lines.push(`**Redirect section:** ${escapeMarkdown(result.redirect_section)}`);
     if (result.url) lines.push(`**URL:** ${result.url}`);
     if (result.revision_id) lines.push(`**Revision ID:** ${result.revision_id}`);
     if (result.last_modified) lines.push(`**Last modified:** ${result.last_modified}`);
@@ -327,7 +418,7 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
     }
     if (result.sections_suggested) {
       lines.push(
-        '**Sections suggested** — call wikipedia_get_sections, then wikipedia_get_article with a section_index.',
+        '**Sections suggested** — use the listed section_index, or call wikipedia_get_sections for unindexed entries.',
       );
     }
     lines.push('');

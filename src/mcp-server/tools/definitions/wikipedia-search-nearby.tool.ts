@@ -33,8 +33,16 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
     'Find Wikipedia articles about places near a geographic coordinate. Returns articles sorted by distance from the query point, with titles, short descriptions, Wikidata QIDs, page IDs, coordinates, and distance in meters. Useful for "what is notable near X?" research workflows. Only articles carrying their own coordinate tag (GeoData, set on the article itself — not the Wikidata item\'s coordinate) are returned, and that tag is what places and measures each result; not all articles about locations are geotagged, and an article whose tag is wrong appears where the tag puts it, which its description usually makes plain.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
-    latitude: z.number().describe('WGS 84 latitude in decimal degrees (range: −90 to 90).'),
-    longitude: z.number().describe('WGS 84 longitude in decimal degrees (range: −180 to 180).'),
+    latitude: z
+      .number()
+      .min(-90)
+      .max(90)
+      .describe('WGS 84 latitude in decimal degrees (range: −90 to 90).'),
+    longitude: z
+      .number()
+      .min(-180)
+      .max(180)
+      .describe('WGS 84 longitude in decimal degrees (range: −180 to 180).'),
     radius_meters: z
       .number()
       .int()
@@ -47,10 +55,9 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
       .number()
       .int()
       .min(1)
-      .max(GEOSEARCH_MAX_LIMIT)
       .default(10)
       .describe(
-        `Maximum number of results to return (default 10, max ${GEOSEARCH_MAX_LIMIT} — the MediaWiki geosearch ceiling). Must be a positive integer. Geosearch has no pagination, so articles past this limit are only reachable by raising it or searching narrower radii.`,
+        `Maximum number of results to return (default 10). Positive integers above ${GEOSEARCH_MAX_LIMIT} are clamped with a notice. Geosearch has no pagination; use narrower radii at the ceiling.`,
       ),
     language: z
       .string()
@@ -97,6 +104,16 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
   // Agent-facing context — echoes the search parameters, truncation disclosure, plus
   // an optional notice when nothing matched. Reaches both structuredContent and content[].
   enrichment: {
+    requestedLimit: z
+      .number()
+      .int()
+      .optional()
+      .describe('Requested result count, present only when clamped.'),
+    appliedLimit: z
+      .number()
+      .int()
+      .optional()
+      .describe('Applied result count, present only when clamped.'),
     queryLatitude: z.number().describe('Latitude used for the search.'),
     queryLongitude: z.number().describe('Longitude used for the search.'),
     radiusMetersUsed: z.number().describe('Radius in meters used for the search.'),
@@ -117,12 +134,6 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
 
   errors: [
     {
-      reason: 'invalid_coordinates',
-      code: JsonRpcErrorCode.ValidationError,
-      when: 'Latitude or longitude is outside valid WGS 84 range.',
-      recovery: 'Latitude must be between −90 and 90; longitude between −180 and 180.',
-    },
-    {
       reason: 'invalid_language',
       code: JsonRpcErrorCode.ValidationError,
       when: 'The language is not a valid BCP 47 code, or names a Wikipedia edition that does not exist.',
@@ -133,24 +144,9 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
   async handler(input, ctx) {
     const svc = getWikipediaService();
 
-    // Validate coordinate ranges
-    if (input.latitude < -90 || input.latitude > 90) {
-      throw ctx.fail(
-        'invalid_coordinates',
-        `Latitude ${input.latitude} is out of range (−90 to 90).`,
-        { latitude: input.latitude },
-      );
-    }
-    if (input.longitude < -180 || input.longitude > 180) {
-      throw ctx.fail(
-        'invalid_coordinates',
-        `Longitude ${input.longitude} is out of range (−180 to 180).`,
-        { longitude: input.longitude },
-      );
-    }
-
     const radiusMeters = Math.min(input.radius_meters, GEOSEARCH_MAX_RADIUS_METERS);
-    const { limit, language } = input;
+    const { language } = input;
+    const limit = Math.min(input.limit, GEOSEARCH_MAX_LIMIT);
 
     if (isMalformedLanguage(language)) {
       throw ctx.fail(
@@ -188,25 +184,32 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
     );
 
     ctx.enrich({
+      ...(input.limit > limit && { requestedLimit: input.limit, appliedLimit: limit }),
       queryLatitude: input.latitude,
       queryLongitude: input.longitude,
       radiusMetersUsed: radiusMeters,
     });
+    const notices: string[] = [];
+    if (input.limit > limit)
+      notices.push(
+        `Requested limit ${input.limit} was clamped to ${limit}. Reduce radius_meters for coverage beyond the ceiling.`,
+      );
     if (truncated) {
       ctx.enrich.truncated({
         shown: results.length,
         cap: limit,
-        guidance: truncationGuidance(limit),
+        guidance: [...notices, truncationGuidance(limit)].join(' '),
       });
     } else {
       ctx.enrich({ shown: results.length, cap: limit, truncated: false });
     }
 
     if (results.length === 0) {
-      ctx.enrich.notice(
+      notices.push(
         `No geotagged Wikipedia articles found within ${radiusMeters}m of (${input.latitude}, ${input.longitude}). Try increasing radius_meters or verify the coordinates are correct.`,
       );
     }
+    if (!truncated && notices.length) ctx.enrich.notice(notices.join(' '));
 
     ctx.log.info('Geo search complete', { count: results.length, language });
 

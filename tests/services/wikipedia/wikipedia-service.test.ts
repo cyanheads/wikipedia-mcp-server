@@ -968,7 +968,7 @@ describe('WikipediaService.getSummary — REST API mapping', () => {
     expect(result.thumbnailUrl).toBe('https://example.com/python.png');
   });
 
-  it('throws NotFound when REST summary has no extract', async () => {
+  it('returns metadata and an empty extract when REST summary has none', async () => {
     const svc = getWikipediaService();
     const ctx = createMockContext();
 
@@ -978,8 +978,10 @@ describe('WikipediaService.getSummary — REST API mapping', () => {
       pageid: 1,
     });
 
-    await expect(svc.getSummary('Empty Article', 'en', ctx)).rejects.toMatchObject({
-      message: expect.stringContaining('no readable content'),
+    await expect(svc.getSummary('Empty Article', 'en', ctx)).resolves.toMatchObject({
+      title: 'Empty Article',
+      pageid: 1,
+      extract: '',
     });
   });
 
@@ -3637,6 +3639,8 @@ describe('WikipediaService.getArticleFull — citation fields (issue #53)', () =
       title: 'New York City',
       pageid: 645042,
       content: 'New York City.',
+      redirect: { redirected_from: 'NYC' },
+      redirects: [{ from: 'NYC', to: 'New York City' }],
       revisionId: '1376082128',
       // The revision's own timestamp, never `touched`, which moves without an edit.
       lastModified: '2026-09-21T23:42:01Z',
@@ -3755,6 +3759,7 @@ describe('WikipediaService.getArticleSection — citation fields (issue #53)', (
       title: 'New York City',
       pageid: 645042,
       sectionTitle: 'Etymology',
+      redirect: { redirected_from: 'NYC' },
       content: 'In 1664, New York was named after the Duke of York.'.replace(
         /^/,
         '== Etymology ==\n\n',
@@ -3861,7 +3866,7 @@ describe('WikipediaService.getSummary — extract_html (issue #48)', () => {
     expect(result.extract).toBe(AVOGADRO_SUMMARY.extract);
   });
 
-  it('still reports no readable content for an empty extract, whatever extract_html holds', async () => {
+  it('renders available HTML even when the plain REST extract is empty', async () => {
     const svc = getWikipediaService();
     vi.spyOn(svc, 'restGet').mockResolvedValue({
       type: 'mainpage',
@@ -3870,8 +3875,8 @@ describe('WikipediaService.getSummary — extract_html (issue #48)', () => {
       extract_html: '<p>Welcome to Wikipedia, the free encyclopedia.</p>',
     });
 
-    await expect(svc.getSummary('Main Page', 'en', createMockContext())).rejects.toMatchObject({
-      message: expect.stringContaining('no readable content'),
+    await expect(svc.getSummary('Main Page', 'en', createMockContext())).resolves.toMatchObject({
+      extract: 'Welcome to Wikipedia, the free encyclopedia.',
     });
   });
 });

@@ -103,19 +103,18 @@ describe('wikipediaSearchArticles', () => {
     const input = wikipediaSearchArticles.input.parse({ query: 'Test' });
     await wikipediaSearchArticles.handler(input, ctx);
 
-    expect(searchFn).toHaveBeenCalledWith('Test', 10, 'en', ctx, 0);
+    expect(searchFn).toHaveBeenCalledWith('Test', 10, 'en', ctx, 0, 'relevance');
   });
 
-  it('rejects a limit above the page-size cap at schema parse time (issue #41)', () => {
-    const searchFn = vi.fn();
+  it('discloses a limit above the page-size cap (issue #65)', async () => {
+    const searchFn = vi.fn().mockResolvedValue({ results: [], totalResults: 0 });
     mockWikipediaService({ search: searchFn });
 
-    // The clamp was silent: `limit: 80` returned 50 results with no signal. The advertised
-    // schema now carries the bound the server enforces.
-    const parsed = wikipediaSearchArticles.input.safeParse({ query: 'Python', limit: 80 });
-    expect(parsed.success).toBe(false);
-    expect(parsed.error?.issues[0]?.path).toContain('limit');
-    expect(searchFn).not.toHaveBeenCalled();
+    const input = wikipediaSearchArticles.input.parse({ query: 'Python', limit: 80 });
+    const ctx = createMockContext({ errors: wikipediaSearchArticles.errors });
+    await wikipediaSearchArticles.handler(input, ctx);
+    expect(searchFn).toHaveBeenCalledWith('Python', 50, 'en', ctx, 0, 'relevance');
+    expect(getEnrichment(ctx)).toMatchObject({ requestedLimit: 80, appliedLimit: 50 });
   });
 
   it('still accepts a limit at the cap (issue #41)', async () => {
@@ -129,7 +128,7 @@ describe('wikipediaSearchArticles', () => {
     const input = wikipediaSearchArticles.input.parse({ query: 'Test', limit: 50 });
     await wikipediaSearchArticles.handler(input, ctx);
 
-    expect(searchFn).toHaveBeenCalledWith('Test', 50, 'en', ctx, 0);
+    expect(searchFn).toHaveBeenCalledWith('Test', 50, 'en', ctx, 0, 'relevance');
   });
 
   it('rejects an empty query before any fetch, with a typed reason (issue #41)', async () => {
@@ -155,7 +154,7 @@ describe('wikipediaSearchArticles', () => {
     const result = await wikipediaSearchArticles.handler(input, ctx);
 
     // `srsearch=%20` is a legitimate search upstream: HTTP 200, `totalhits: 0`, no error.
-    expect(searchFn).toHaveBeenCalledWith('   ', 10, 'en', ctx, 0);
+    expect(searchFn).toHaveBeenCalledWith('   ', 10, 'en', ctx, 0, 'relevance');
     expect(result.results).toHaveLength(0);
     expect(getEnrichment(ctx).notice).toContain('No Wikipedia articles found');
   });
@@ -306,7 +305,7 @@ describe('wikipediaSearchArticles', () => {
     const input = wikipediaSearchArticles.input.parse({ query: 'Python', language: 'fr' });
     const result = await wikipediaSearchArticles.handler(input, ctx);
 
-    expect(searchFn).toHaveBeenCalledWith('Python', 10, 'fr', ctx, 0);
+    expect(searchFn).toHaveBeenCalledWith('Python', 10, 'fr', ctx, 0, 'relevance');
     expect(result.language).toBe('fr');
   });
 
@@ -344,7 +343,7 @@ describe('wikipediaSearchArticles', () => {
     const input = wikipediaSearchArticles.input.parse({ query: '東京タワー' });
     const result = await wikipediaSearchArticles.handler(input, ctx);
     expect(result.results).toHaveLength(0);
-    expect(searchFn).toHaveBeenCalledWith('東京タワー', 10, 'en', ctx, 0);
+    expect(searchFn).toHaveBeenCalledWith('東京タワー', 10, 'en', ctx, 0, 'relevance');
   });
 
   it('format output does not contain env var names or secret patterns', () => {
@@ -389,7 +388,7 @@ describe('wikipediaSearchArticles', () => {
     const input = wikipediaSearchArticles.input.parse({ query: 'Python', limit: 5, offset: 5 });
     await wikipediaSearchArticles.handler(input, ctx);
 
-    expect(searchFn).toHaveBeenCalledWith('Python', 5, 'en', ctx, 5);
+    expect(searchFn).toHaveBeenCalledWith('Python', 5, 'en', ctx, 5, 'relevance');
     const enrichment = getEnrichment(ctx);
     expect(enrichment.offset).toBe(5);
     expect(enrichment.shown).toBe(1);
@@ -481,7 +480,7 @@ describe('wikipediaSearchArticles', () => {
     const input = wikipediaSearchArticles.input.parse({ query: 'Test' });
     await wikipediaSearchArticles.handler(input, ctx);
 
-    expect(searchFn).toHaveBeenCalledWith('Test', 10, 'en', ctx, 0);
+    expect(searchFn).toHaveBeenCalledWith('Test', 10, 'en', ctx, 0, 'relevance');
     expect(getEnrichment(ctx).offset).toBe(0);
   });
 
@@ -849,7 +848,7 @@ describe('wikipediaSearchArticles — transient upstream envelopes (issue #55)',
     expect(contentText(result)).toContain(message);
   });
 
-  it('never reaches upstream for an offset past the window or an over-cap limit', async () => {
+  it('never reaches upstream for an offset past the window or an invalid limit', async () => {
     const { requests } = stubSearch(tooBusy);
 
     const pastWindow = await run({ query: 'Python', offset: 10_000 });
@@ -857,7 +856,7 @@ describe('wikipediaSearchArticles — transient upstream envelopes (issue #55)',
       error: { data: { reason: 'offset_too_large' } },
     });
 
-    const overCap = await run({ query: 'Python', limit: 80 });
+    const overCap = await run({ query: 'Python', limit: 0 });
     expect(overCap.structuredContent).toMatchObject({
       error: { code: JsonRpcErrorCode.InvalidParams },
     });

@@ -33,6 +33,7 @@ const TEST_EDITIONS = new Set([
 export function mockWikipediaService(methods: Record<string, unknown> = {}): void {
   vi.spyOn(svcModule, 'getWikipediaService').mockReturnValue({
     isUnknownEdition: async (language: string) => !TEST_EDITIONS.has(language.toLowerCase()),
+    getArticleToc: async () => undefined,
     ...methods,
   } as unknown as svcModule.WikipediaService);
 }

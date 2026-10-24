@@ -23,6 +23,7 @@ import type {
   ActionPageMetaQueryRaw,
   ActionPageMetaRaw,
   ActionParseTextRaw,
+  ActionRedirectRaw,
   ActionSearchRaw,
   ActionSectionsRaw,
   RestSummaryRaw,
@@ -847,7 +848,7 @@ function stripMarkup(html: string): string {
  * `wikipedia_get_sections`' `title` and `wikipedia_get_article`'s `section_title` byte-identical for
  * one index. `stripMarkup` has already trimmed, so the collapse cannot leave an edge space behind.
  */
-function tocLineToPlainText(line: string): string {
+export function tocLineToPlainText(line: string): string {
   return stripMarkup(line).replace(/\s+/g, ' ');
 }
 
@@ -1168,6 +1169,50 @@ export const GEOSEARCH_MAX_RADIUS_METERS = 10_000;
  * caller, so the cap is a payload-size choice rather than an API ceiling.
  */
 export const SEARCH_MAX_LIMIT = 50;
+
+/** Supported upstream search orders. */
+export const SEARCH_SORTS = [
+  'relevance',
+  'last_edit_desc',
+  'create_timestamp_desc',
+  'incoming_links_desc',
+  'title_natural_asc',
+] as const;
+
+/** Redirect origin and target fragment, with an index only after TOC verification. */
+export type RedirectInfo = {
+  redirected_from?: string;
+  redirect_section?: string;
+  redirect_section_index?: number;
+};
+
+/** Resolve a redirect chain's final fragment against actual upstream anchors. */
+export function redirectInfo(
+  redirects: ActionRedirectRaw[] | undefined,
+  toc?: ActionSectionsRaw['parse'],
+): RedirectInfo {
+  if (!redirects?.length) return {};
+  let fragment: string | undefined;
+  for (const hop of redirects) if (hop.tofragment) fragment = hop.tofragment;
+  const origin = redirects[0]?.from;
+  const info: RedirectInfo = { ...(origin && { redirected_from: origin }) };
+  if (!fragment) return info;
+  const normalized = fragment.replaceAll('_', ' ');
+  const matches = (toc?.tocdata?.sections ?? []).filter(
+    (section) => section.anchor?.replaceAll('_', ' ') === normalized,
+  );
+  const match = matches.length === 1 ? matches[0] : undefined;
+  const index =
+    match?.index === undefined || match.index.trim() === '' ? undefined : Number(match.index);
+  return {
+    ...info,
+    redirect_section: match?.line ? tocLineToPlainText(match.line) : fragment,
+    ...(Number.isSafeInteger(index) &&
+      index !== undefined &&
+      String(index) === match?.index &&
+      index >= 0 && { redirect_section_index: index }),
+  };
+}
 
 /**
  * The deep-paging window CirrusSearch enforces on `sroffset`. At or past it the API refuses the
@@ -1710,8 +1755,9 @@ export class WikipediaService {
    * The extract is rendered from `extract_html` through {@link htmlSectionToPlainText}, the renderer
    * every read path shares. The plain `extract` flattens superscripts into the digits beside them —
    * `6.02214076×10<sup>23</sup>` reads as `6.02214076×1023` — and runs a disambiguation page's list
-   * into the sentence introducing it. The plain `extract` is still what decides whether the article
-   * has readable content, and stands in for a payload that carries no `extract_html`.
+   * into the sentence introducing it. The plain `extract` stands in for a payload without
+   * `extract_html`. An existing page without either
+   * extract still returns its metadata and an empty string.
    *
    * `latitude`/`longitude` come from the response's `coordinates`, which a non-geotagged article
    * carries as an explicit `null` rather than omitting — both are left undefined for that, for an
@@ -1760,10 +1806,6 @@ export class WikipediaService {
       throw err;
     }
 
-    if (!raw.extract) {
-      throw notFound(`Article "${title}" exists but has no readable content.`, { title, language });
-    }
-
     const { lat, lon } = raw.coordinates ?? {};
     const geotagged = typeof lat === 'number' && typeof lon === 'number';
 
@@ -1772,8 +1814,8 @@ export class WikipediaService {
       pageType: raw.type ?? 'article',
       pageid: raw.pageid,
       wikidataQid: raw.wikibase_item,
-      description: raw.description,
-      extract: (raw.extract_html && htmlSectionToPlainText(raw.extract_html)) || raw.extract,
+      description: raw.description || undefined,
+      extract: (raw.extract_html && htmlSectionToPlainText(raw.extract_html)) || raw.extract || '',
       thumbnailUrl: raw.thumbnail?.source,
       latitude: geotagged ? lat : undefined,
       longitude: geotagged ? lon : undefined,
@@ -1807,6 +1849,7 @@ export class WikipediaService {
     language: string,
     ctx: ServiceContext,
     offset = 0,
+    sort: (typeof SEARCH_SORTS)[number] = 'relevance',
   ): Promise<{
     results: Array<
       { title: string; pageid: number; snippet: string; wordcount: number } & PageMeta
@@ -1822,6 +1865,7 @@ export class WikipediaService {
         action: 'query',
         list: 'search',
         srsearch: query,
+        srsort: sort,
         srlimit: String(Math.min(limit, SEARCH_MAX_LIMIT)),
         sroffset: String(offset),
         srprop: 'snippet|wordcount',
@@ -1929,6 +1973,8 @@ export class WikipediaService {
     revisionId: string | undefined;
     lastModified: string | undefined;
     url: string | undefined;
+    redirect?: RedirectInfo;
+    redirects?: ActionRedirectRaw[];
   }> {
     const raw = await this.actionGet<ActionExtractsRaw>(
       language,
@@ -1974,6 +2020,10 @@ export class WikipediaService {
       revisionId: revision?.revid?.toString(),
       lastModified: revision?.timestamp,
       url: page.fullurl,
+      ...(raw.query?.redirects?.length && {
+        redirect: redirectInfo(raw.query.redirects),
+        redirects: raw.query.redirects,
+      }),
     };
   }
 
@@ -2007,6 +2057,7 @@ export class WikipediaService {
     content: string;
     revisionId: string | undefined;
     url: string | undefined;
+    redirect?: RedirectInfo;
   }> {
     const raw = await this.actionGet<ActionParseTextRaw>(
       language,
@@ -2061,12 +2112,46 @@ export class WikipediaService {
       sectionTitle,
       content,
       revisionId: raw.parse?.revid?.toString(),
+      ...(raw.parse?.redirects?.length && { redirect: redirectInfo(raw.parse.redirects) }),
       // Only the title MediaWiki resolved names the article's URL — the caller's input may be an alias.
       url:
         resolvedTitle && !this.baseUrl
           ? articleUrl(await this.resolveBaseUrl(language, ctx), resolvedTitle)
           : undefined,
     };
+  }
+
+  /** Best-effort TOC for guidance, without the section-list fallback or retries. */
+  async getArticleToc(
+    title: string,
+    language: string,
+    ctx: ServiceContext,
+  ): Promise<ActionSectionsRaw['parse'] | undefined> {
+    try {
+      const raw = await this.actionGet<ActionSectionsRaw>(
+        language,
+        { action: 'parse', page: title, prop: 'tocdata', redirects: 'true' },
+        ctx,
+        { timeoutMs: PAGE_META_TIMEOUT_MS, maxRetries: 0 },
+      );
+      if (raw.error) throw actionApiError(raw.error, language, title);
+      return raw.parse;
+    } catch (err) {
+      if (ctx.signal?.aborted || (err instanceof Error && err.name === 'AbortError')) throw err;
+      if (
+        err instanceof McpError &&
+        (err.code === JsonRpcErrorCode.ServiceUnavailable ||
+          err.code === JsonRpcErrorCode.Timeout ||
+          err.code === JsonRpcErrorCode.RateLimited ||
+          err.code === JsonRpcErrorCode.Forbidden ||
+          err.code === JsonRpcErrorCode.Unauthorized ||
+          err.code === JsonRpcErrorCode.NotFound)
+      )
+        return undefined;
+      // apiGet's exhausted single attempt retains JSON.parse's malformed-body error as its cause.
+      if (err instanceof Error && err.cause instanceof SyntaxError) return undefined;
+      throw err;
+    }
   }
 
   /** Fetch section table of contents for an article. */
@@ -2078,6 +2163,7 @@ export class WikipediaService {
     title: string;
     pageid: number | undefined;
     sections: Array<{ index: number; number: string; title: string; level: number }>;
+    redirect?: RedirectInfo;
   }> {
     const raw = await this.actionGet<ActionSectionsRaw>(
       language,
@@ -2103,7 +2189,14 @@ export class WikipediaService {
         const i = ++idx;
         return [{ index: i, number: String(i), title: headingTitle, level }];
       });
-      return { title: fullArticle.title, pageid: fullArticle.pageid, sections: fallbackSections };
+      return {
+        title: fullArticle.title,
+        pageid: fullArticle.pageid,
+        sections: fallbackSections,
+        ...(raw.parse?.redirects?.length && {
+          redirect: redirectInfo(raw.parse.redirects, raw.parse),
+        }),
+      };
     }
 
     const sections = rawSections
@@ -2117,7 +2210,14 @@ export class WikipediaService {
         level: s.hLevel ?? 2,
       }));
 
-    return { title: resolvedTitle, pageid: raw.parse?.pageid, sections };
+    return {
+      title: resolvedTitle,
+      pageid: raw.parse?.pageid,
+      sections,
+      ...(raw.parse?.redirects?.length && {
+        redirect: redirectInfo(raw.parse.redirects, raw.parse),
+      }),
+    };
   }
 
   /**

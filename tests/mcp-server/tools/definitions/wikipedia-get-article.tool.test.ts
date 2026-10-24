@@ -849,7 +849,8 @@ describe('wikipediaGetArticle — full read end to end through the real renderer
     expect(result.truncated).toBe(true);
     expect(result.sections_suggested).toBe(true);
     for (const heading of ['Introduction', 'Geography', 'Economy', 'Culture', 'Transport']) {
-      expect(result.content).toMatch(new RegExp(`^- ${heading} — \\d+ bytes$`, 'm'));
+      const suffix = heading === 'Introduction' ? ' \\(section_index: 0\\)' : '';
+      expect(result.content).toMatch(new RegExp(`^- ${heading} — \\d+ bytes${suffix}$`, 'm'));
     }
     expect(result.content).not.toContain('lorem ipsum');
     expect(result.content).not.toContain('<h2>');

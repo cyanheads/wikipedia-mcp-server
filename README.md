@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.2.6-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/wikipedia-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.2.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/wikipedia-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/wikipedia-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.2-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.2.6-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/wikipedia-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/wikipedia-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/wikipedia-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -29,7 +29,7 @@
 
 ## Overview
 
-Wikipedia content via the MediaWiki REST API and Action API. Search articles, read summaries or targeted sections, find geotagged pages near a coordinate, and list language editions from any MCP client. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
+Wikipedia in any language edition. Search articles, read summaries or just the sections you need, find geotagged pages near a coordinate, and list an article's language editions.
 
 ### Tools
 
@@ -46,7 +46,8 @@ Wikipedia content via the MediaWiki REST API and Action API. Search articles, re
 
 ### `wikipedia_search_articles` <sub>tool</sub>
 
-- Free-text `query` (an empty one fails with `empty_query`), `limit` 1–50, and `offset` paging, passing back enrichment `nextOffset`. Wikipedia serves no result past the 10,000th: an `offset` at or beyond it fails with `offset_too_large`, and a page ending on that window carries enrichment `truncated`
+- Free-text `query` (an empty one fails with `empty_query`), positive integer `limit` (default 10, clamped to 50), and `offset` paging, passing back enrichment `nextOffset`. Only a clamped call carries `requestedLimit`, `appliedLimit`, and a clamp notice. Wikipedia serves no result past the 10,000th: an `offset` at or beyond it fails with `offset_too_large`, and a page ending on that window carries enrichment `truncated`
+- CirrusSearch operators include `incategory:"1648 treaties"`, `morelike:Peace of Westphalia`, `intitle:Python`, `hastemplate:Infobox`, and `insource:Python` (support depends on the installation). `sort` defaults to `relevance`; alternatives are `last_edit_desc`, `create_timestamp_desc`, `incoming_links_desc`, and `title_natural_asc`. Enrichment echoes `sort`; keep it and `query` unchanged when paging
 - Each result carries a plain-text snippet, page ID, word count, and — when the article has them — its short `description` and Wikidata QID (`wikibase_item`); enrichment `suggestion` carries Wikipedia's spelling correction (`einstien` → `einstein`)
 
 ---
@@ -55,12 +56,15 @@ Wikipedia content via the MediaWiki REST API and Action API. Search articles, re
 
 - Takes a `title`; returns the REST summary extract — a fragment from the start of the lead (`wikipedia_get_article` with `section_index: 0` reads the whole lead) — plus the short description, thumbnail URL, Wikidata QID (`wikibase_item`), and, for a geotagged article, `latitude` / `longitude` to pass straight to `wikipedia_search_nearby`
 - `page_type` discriminates `standard` / `disambiguation` / `no-extract` (on `disambiguation`, re-query with `wikipedia_search_articles`); `url`, `revision_id`, and `last_modified` name the revision read, and `?oldid=<revision_id>` is a permanent link to it
+- An existing page without a summary extract succeeds with metadata, an empty `extract`, and guidance to open the canonical URL or try `section_index: 0`. Namespace pages may contain documentation rather than article prose. An empty description is absent; a missing title still fails with `not_found`
 
 ---
 
 ### `wikipedia_get_article` <sub>tool</sub>
 
 - Without `section_index`: the full article with `== Section ==` markers, or a section outline (`truncated: true`) when it exceeds `WIKIPEDIA_ARTICLE_OVERFLOW_BYTES` (default 80,000 bytes). With a `section_index` from `wikipedia_get_sections` (`0` is the lead): that section plus its nested subsections
+- Outline entries include verified `section_index` values where available, including 0 for the lead. Ambiguous or unindexed headings retain the section-list fallback. TOC verification gets one short attempt; unavailable verification is disclosed
+- Redirects expose `redirected_from` and, for a section target, `redirect_section`. A full read remains full and includes targeted-read guidance; an explicit `section_index`, including 0, takes precedence
 - Every read returns `url` and `revision_id` (`?oldid=<revision_id>` is a permanent link to the text read); a full read, outline included, also returns `last_modified`. With `WIKIPEDIA_BASE_URL` set, a section read omits `url`
 - Section reads also carry data tables as pipe-delimited rows and infoboxes as `label: value` lines, which the full-article extract strips; a table over 40,000 rendered bytes leaves a `[table omitted: N rows]` marker
 
@@ -70,12 +74,13 @@ Wikipedia content via the MediaWiki REST API and Action API. Search articles, re
 
 - Takes a `title`; returns section titles, heading levels, hierarchical numbering (e.g. `"2.1"`), and the `section_index` to pass to `wikipedia_get_article` — the first entry is the lead (`index: 0`, titled `Introduction`)
 - Fails with `no_sections` on a stub or very short article — read it with `wikipedia_get_article` instead
+- Redirect aliases expose `redirected_from` and optional `redirect_section`; `redirect_section_index` appears only when a unique anchor matches a real numeric TOC index
 
 ---
 
 ### `wikipedia_search_nearby` <sub>tool</sub>
 
-- `latitude` / `longitude` (WGS 84), `radius_meters` 10–10,000 (default 1000), and `limit` 1–500 (default 10), with no pagination past `limit`; enrichment `truncated` flags more matches than `limit` allowed — at 500, Wikipedia's ceiling, sweep narrower radii instead
+- `latitude` −90…90 / `longitude` −180…180 (WGS 84), `radius_meters` 10–10,000 (default 1000), and positive integer `limit` (default 10, clamped to 500), with no pagination past `limit`; enrichment `truncated` flags more matches than `limit` allowed — at 500, Wikipedia's ceiling, sweep narrower radii instead. Only a clamped call carries `requestedLimit`, `appliedLimit`, and a clamp notice
 - Returns articles sorted by `distance_meters`, with coordinates, short `description`, and Wikidata QID (`wikibase_item`). Each is placed by the article's own GeoData coordinate tag, not its Wikidata item's coordinate, so a mistagged article appears where the tag puts it
 
 ---
@@ -188,7 +193,7 @@ MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
 
 ### Prerequisites
 
-- [Bun v1.3.0](https://bun.sh/) or higher (or Node.js v24+).
+- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
 - No API keys required — Wikipedia's API is public.
 
 ### Installation

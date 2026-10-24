@@ -1,6 +1,6 @@
 # wikipedia-mcp-server - Directory Structure
 
-Generated on: 2026-10-08 20:37:51
+Generated on: 2026-10-24 07:55:13
 
 ```text
 wikipedia-mcp-server/
@@ -170,6 +170,7 @@ wikipedia-mcp-server/
 │   │       │   ├── wikipedia-get-languages.tool.test.ts
 │   │       │   ├── wikipedia-get-sections.tool.test.ts
 │   │       │   ├── wikipedia-get-summary.tool.test.ts
+│   │       │   ├── wikipedia-read-search-contracts.tool.test.ts
 │   │       │   ├── wikipedia-search-articles.tool.test.ts
 │   │       │   └── wikipedia-search-nearby.tool.test.ts
 │   │       └── utils/

@@ -11,6 +11,7 @@ import {
   isMalformedLanguage,
   SEARCH_MAX_LIMIT,
   SEARCH_RESULT_WINDOW,
+  SEARCH_SORTS,
 } from '@/services/wikipedia/wikipedia-service.js';
 
 /** {@link SEARCH_RESULT_WINDOW} as every caller-facing string spells it. */
@@ -24,15 +25,22 @@ export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
   input: z.object({
     query: z
       .string()
-      .describe('Search query (e.g. "Python programming language"). Must not be empty.'),
+      .describe(
+        'Search query. CirrusSearch operators include incategory:"1648 treaties", morelike:Peace of Westphalia, intitle:Python, hastemplate:Infobox, and insource:Python; support depends on the selected installation. Must not be empty.',
+      ),
+    sort: z
+      .enum(SEARCH_SORTS)
+      .default('relevance')
+      .describe(
+        'Result order (default relevance). Keep the same query and sort when paging with offset.',
+      ),
     limit: z
       .number()
       .int()
       .min(1)
-      .max(SEARCH_MAX_LIMIT)
       .default(10)
       .describe(
-        `Maximum number of results to return per page (default 10, max ${SEARCH_MAX_LIMIT}). Must be a positive integer.`,
+        `Maximum number of results to return per page (default 10). Positive integers above ${SEARCH_MAX_LIMIT} are clamped with a notice.`,
       ),
     offset: z
       .number()
@@ -82,6 +90,17 @@ export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
   // Agent-facing context — query echo, total match count, and optional empty-result
   // notice. Reaches structuredContent AND content[] automatically; disjoint from output.
   enrichment: {
+    sort: z.enum(SEARCH_SORTS).describe('Effective search order sent to Wikipedia.'),
+    requestedLimit: z
+      .number()
+      .int()
+      .optional()
+      .describe('Requested page size, present only when clamped.'),
+    appliedLimit: z
+      .number()
+      .int()
+      .optional()
+      .describe('Applied page size, present only when clamped.'),
     effectiveQuery: z.string().describe('The query sent to Wikipedia.'),
     totalCount: z.number().describe('Total matching results in Wikipedia.'),
     offset: z
@@ -150,7 +169,8 @@ export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
   ],
 
   async handler(input, ctx) {
-    const { language, limit } = input;
+    const { language } = input;
+    const limit = Math.min(input.limit, SEARCH_MAX_LIMIT);
     const svc = getWikipediaService();
 
     if (isMalformedLanguage(language)) {
@@ -199,11 +219,13 @@ export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
     });
 
     const { results, totalResults, nextOffset, suggestion, descriptionsUnavailable } =
-      await svc.search(input.query, limit, language, ctx, input.offset);
+      await svc.search(input.query, limit, language, ctx, input.offset, input.sort);
 
     ctx.enrich.echo(input.query);
     ctx.enrich.total(totalResults);
     ctx.enrich({
+      sort: input.sort,
+      ...(input.limit > limit && { requestedLimit: input.limit, appliedLimit: limit }),
       offset: input.offset,
       shown: results.length,
       ...(nextOffset != null ? { nextOffset } : {}),
@@ -213,6 +235,10 @@ export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
     // `notice` is last-wins, so every condition that has something to say contributes a segment
     // and the page carries them as one notice.
     const notices: string[] = [];
+    if (input.limit > limit)
+      notices.push(
+        `Requested limit ${input.limit} was clamped to ${limit} results per page. Continue with nextOffset, keeping the same query and sort.`,
+      );
     if (results.length === 0) {
       notices.push(
         input.offset > 0

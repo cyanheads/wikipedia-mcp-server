@@ -6,11 +6,11 @@
 
 | Name | Description | Key Inputs | Annotations | Errors |
 |:-----|:------------|:-----------|:------------|:-------|
-| `wikipedia_search_articles` | Full-text search across articles. Returns ranked results with plain-text titles, short descriptions, Wikidata QIDs, snippets, and page IDs, plus Wikipedia's spelling suggestion when it has one. Use when the exact article title is unknown or to find multiple articles on a topic. | `query`, `limit`, `offset`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `empty_query` (ValidationError), `offset_too_large` (ValidationError), `invalid_language` (ValidationError) |
+| `wikipedia_search_articles` | Full-text search across articles. Returns ranked results with plain-text titles, short descriptions, Wikidata QIDs, snippets, and page IDs, plus Wikipedia's spelling suggestion when it has one. Use when the exact article title is unknown or to find multiple articles on a topic. | `query`, `sort`, `limit`, `offset`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `empty_query` (ValidationError), `offset_too_large` (ValidationError), `invalid_language` (ValidationError) |
 | `wikipedia_get_summary` | Fetch the short summary for an article — a truncated fragment from the start of the lead section, which answers "what is X?". Returns plain-text extract, Wikidata QID for cross-referencing, description, thumbnail URL, canonical article URL, the revision the extract was read from, and — for a geotagged article — coordinates that feed `wikipedia_search_nearby`. Handles disambiguation pages: returns `page_type: "disambiguation"` so the agent can detect and pivot to a more specific search. | `title`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `invalid_title` (ValidationError), `invalid_language` (ValidationError) |
 | `wikipedia_get_article` | Fetch article content as clean plain text, with the canonical URL and the revision it was read from. Full-article path uses `action=query&prop=extracts\|info\|revisions` — TextExtracts' HTML mode rendered to plain text (40–100KB for major articles). Section-targeted path uses `action=parse&prop=text\|revid&section={index}`, rendering the parser's HTML for that section to plain text — use `section_index` (from `wikipedia_get_sections`) to retrieve a single section and its subsections, or `section_index: 0` for the lead. Prefer section targeting when only part of the article is needed. | `title`, `section_index`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `invalid_title` (ValidationError), `invalid_section` (ValidationError), `invalid_language` (ValidationError) |
 | `wikipedia_get_sections` | Fetch the table of contents for an article — section titles, numbers, levels, and `section_index` values, led by the index-0 `Introduction` entry for the lead. Call this before `wikipedia_get_article` when only a specific section is needed. The returned `section_index` values are the identifiers for targeted section reads. | `title`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `invalid_title` (ValidationError), `no_sections` (NotFound), `invalid_language` (ValidationError) |
-| `wikipedia_search_nearby` | Find Wikipedia articles about places near a geographic coordinate. Returns articles within a radius, sorted by distance, with short descriptions and Wikidata QIDs. Useful for "what's notable near X?" research. | `latitude`, `longitude`, `radius_meters`, `limit`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `invalid_coordinates` (ValidationError), `invalid_language` (ValidationError) |
+| `wikipedia_search_nearby` | Find Wikipedia articles about places near a geographic coordinate. Returns articles within a radius, sorted by distance, with short descriptions and Wikidata QIDs. Useful for "what's notable near X?" research. | `latitude`, `longitude`, `radius_meters`, `limit`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `invalid_language` (ValidationError); coordinate ranges fail input validation |
 | `wikipedia_get_languages` | List the language editions available for an article. Returns each edition's language code, tool-usable subdomain code, article title, and URL. Pass `editions` to narrow the list to specific codes; unmatched ones come back under `missing`. Use for cross-language research or to find a non-English article title for a known concept. | `title`, `language`, `editions` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `invalid_title` (ValidationError), `no_other_languages` (NotFound), `invalid_language` (ValidationError) |
 
 ### Resources
@@ -228,7 +228,7 @@ The service also recognizes the shapes for callers that reach it directly: an `i
 
 - **An empty `query` and an `offset` at or past the window are refused at the handler edge**, with declared `empty_query` and `offset_too_large` reasons, before the fetch that would be refused anyway. A whitespace-only query is not in that class: `srsearch=%20` is a legitimate search that matches nothing, and rejecting it would be a regression. `offset_too_large`'s recovery says to narrow the query, not to page back — paging back is what the old end-of-results notice wrongly advised, and no offset reaches past the window.
 - **A page ending at the window discloses it** through `ctx.enrich.truncated({ shown, cap: 10000 })` plus a notice naming the matches no offset reaches. The condition is `offset + shown >= 10000` with `totalCount` still higher; below the window nothing changes, so an ordinary page and a genuine last page are untouched. `truncated` and `cap` are optional enrichment fields, absent unless the window cut the page.
-- **`limit` carries `.max(50)`**, so the advertised schema matches the cap the server enforces. This turns a silent clamp into a rejection for a caller passing a larger value. 50 is this server's page size, not an upstream ceiling — `action=paraminfo` reports `limit.max: 500` for an anonymous caller.
+- **Positive integer limits are clamped with disclosure.** Search applies 50 and nearby applies 500; only over-cap calls gain `requestedLimit`, `appliedLimit`, and a clamp notice composed with other guidance. This avoids an extra retry while keeping the effective page size visible. Search's 50 is server policy supporting one metadata lookup, not an upstream ceiling; `action=paraminfo` reports 500 for an anonymous caller.
 - **The spelling suggestion is surfaced, never applied.** `srinfo` already requests CirrusSearch's `suggestion` on every page, so it rides as optional enrichment whenever upstream sends one, and a zero-hit first page names it in the notice. Re-running with it server-side was rejected: it swaps the caller's query without asking, and the suggestion is sometimes partial.
 
 ### Search and nearby results carry a description and a Wikidata QID
@@ -241,9 +241,15 @@ A bare title list forced a `wikipedia_get_summary` call per result to tell same-
 
 At `limit: 500` — the ceiling — nearby's truncation notice drops the "raise limit" advice and points only to narrower sweeps; `truncated` is still `true` on a full page there, because no probe past the cap is possible.
 
+### Redirect targets and verified outline indices
+
+Article and section-list reads expose `redirected_from` for aliases and `redirect_section` for fragment targets. The last fragment in the redirect chain is matched against TOC anchors after space/underscore normalization; an unmatched fragment remains unchanged. Section lists expose `redirect_section_index` only for a unique anchor with a numeric upstream index. Full reads remain full, and explicit section indices always win, including 0.
+
+Overflow outlines preserve the existing byte budget, section bodies and size ordering. The lead has index 0; other entries gain indices only when their normalized headings uniquely match numeric TOC rows. Duplicate, absent or template headings stay unindexed. Full-read fragment guidance and overflow indexing share one optional TOC request with a 5-second timeout and no retries; failure is disclosed and cancellation propagates. Ordinary below-budget and explicit-section reads add no TOC request. This keeps guidance useful without making an optional lookup a prerequisite for reading an article.
+
 ### Disambiguation handling
 
-The REST API summary endpoint returns `"type": "disambiguation"` for disambiguation pages alongside a short extract like "Python may refer to:". This is not an error — surface it in the output schema with a `page_type` field (`"article" | "disambiguation" | "redirect"`). When the agent gets `page_type: "disambiguation"`, it should call `wikipedia_search_articles` with a more specific query. Document this in the tool description.
+The REST API summary endpoint returns `"type": "disambiguation"` for disambiguation pages alongside a short extract like "Python may refer to:". Preserve the upstream type in the string `page_type` field, including `standard`, `disambiguation`, and `no-extract`. When the agent gets `page_type: "disambiguation"`, it should call `wikipedia_search_articles` with a more specific query.
 
 ### Language as a per-call parameter
 
@@ -295,10 +301,10 @@ All requests: `format=json`
 
 | Action + params | Used by |
 |:----------------|:--------|
-| `action=query&list=search&srsearch={q}&srlimit={n}&sroffset={o}&srprop=snippet\|wordcount` | `wikipedia_search_articles` |
+| `action=query&list=search&srsearch={q}&srsort={sort}&srlimit={n}&sroffset={o}&srprop=snippet\|wordcount` | `wikipedia_search_articles` |
 | `action=query&pageids={id\|…}&prop=description\|pageprops&ppprop=wikibase_item` | `wikipedia_search_articles` (best-effort description + QID follow-up) |
 | `action=query&titles={t}&prop=extracts\|info\|revisions&inprop=url&rvprop=ids\|timestamp&redirects=true` | `wikipedia_get_article` (full), and the heading fallback of `wikipedia_get_sections` |
-| `action=parse&page={t}&prop=tocdata` | `wikipedia_get_sections` |
+| `action=parse&page={t}&prop=tocdata&redirects=true` | `wikipedia_get_sections`; shared best-effort lookup for full-read redirect guidance and overflow indices |
 | `action=parse&page={t}&prop=text\|revid&section={index}` | `wikipedia_get_article` (section) |
 | `action=query&titles={t}&prop=langlinks&lllimit=500` | `wikipedia_get_languages` |
 | `action=query&list=geosearch&gscoord={lat}\|{lon}&gsradius={r}&gslimit={n}&generator=geosearch&ggscoord={lat}\|{lon}&ggsradius={r}&ggslimit={n}&prop=description\|pageprops&ppprop=wikibase_item` | `wikipedia_search_nearby` |
@@ -316,7 +322,7 @@ No enforced rate limits, but:
 - Transient Action API refusals arrive as an HTTP 200 `error` envelope, not a 429 or 503: `ratelimited`, `readonly`, and CirrusSearch's full-pool-counter refusals `cirrussearch-too-busy-error` and `cirrussearch-regex-too-busy-error`. `apiGet` throws these inside the retry, with `Retry-After` taken from the 200 response when present, so every Action API call site gets the backoff a 503 gets. Every other code is returned to its call site on the first response and mapped there — the contract codes (`missingtitle`, `invalidtitle`, `nosuchsection`, `cirrussearch-offset-too-large`) and any code not known to clear on retry, `cirrussearch-backend-error` included, since it also covers backend failures. An exhausted ladder surfaces the envelope's message with `(failed after 4 attempts)` appended
 - Each request's whole ladder is bounded at 30 s (`deadlineMs`), each attempt's timeout shrinking to the time left. Unbounded, four 15 s attempts ran to ≈67 s and three honored 30 s `Retry-After` waits to 90 s — past a client's usual 60 s request timeout, which would report a transport timeout instead of this server's error. The backoff alone adds at most ≈8.75 s. An expired budget fails with `Timeout` and `data.reason: 'retry_deadline_exceeded'`; an honored `Retry-After` that would outlast it fails at once with the envelope's error and `data.retryAfter`
 - A caller's cancellation ends a backoff as well as a request in flight
-- The search description lookup is the exception: best-effort, one attempt with a 5 s timeout, so a transient envelope there drops the descriptions instead of retrying. The sitematrix fetch behind the edition registry retries once, with a 10 s per-attempt timeout
+- The search description lookup and optional article TOC verification are best-effort: one attempt with a 5 s timeout, so upstream unavailability is disclosed instead of retried. Caller cancellation and input refusals propagate. The sitematrix fetch behind the edition registry retries once, with a 10 s per-attempt timeout
 - User-Agent is required — requests without it are deprioritized
 
 ---
@@ -329,7 +335,8 @@ No enforced rate limits, but:
 
 **Input:**
 - `query: string` — search query; an empty string is refused before the fetch (whitespace is a legitimate search upstream and is not)
-- `limit?: number` — max results per page (default 10, max 50 — enforced by the schema, so a larger value is rejected rather than silently clamped)
+- `limit?: number` — positive integer results per page (default 10); values above 50 are clamped with `requestedLimit`, `appliedLimit`, and a notice
+- `sort?: string` — `relevance` (default), `last_edit_desc`, `create_timestamp_desc`, `incoming_links_desc`, or `title_natural_asc`; forwarded as `srsort` and echoed in enrichment. Keep query and sort when paging. CirrusSearch query operators include `incategory:"1648 treaties"`, `morelike:Peace of Westphalia`, `intitle:Python`, `hastemplate:Infobox`, and `insource:Python`, subject to installation support
 - `offset?: number` — result offset (default 0); at or past the 10,000-result search window the call is refused, since nothing past it is retrievable
 - `language?: string` — Wikipedia language edition code (default `"en"`); constructs the correct base URL per call
 
@@ -348,13 +355,13 @@ A search that matches nothing is a successful empty result with a notice, not an
 
 ### `wikipedia_get_summary`
 
-**Description:** Fetch the short summary for a Wikipedia article — the REST extract, a truncated fragment from the start of the lead section, which answers "what is X?". Returns a plain-text extract rendered from `extract_html`, superscripts kept, Wikidata QID (`wikibase_item`) for cross-referencing with `wikidata-mcp-server`, description, and thumbnail URL. The full lead is a different call: `wikipedia_get_article` with `section_index: 0`. Disamb pages return `page_type: "disambiguation"` — not an error, but a signal to call `wikipedia_search_articles` with a more specific query. Redirect pages are followed automatically; `page_type: "redirect"` is returned with the resolved title.
+**Description:** Fetch a Wikipedia page's REST summary, rendered from `extract_html` when available. The extract is a fragment of the lead; `wikipedia_get_article` with `section_index: 0` reads the whole lead. An existing page without an extract succeeds with metadata and an empty `extract`, plus guidance to open its canonical URL or try a lead read. Namespace pages may contain documentation rather than article prose. Empty descriptions are absent. Disambiguation pages retain `page_type: "disambiguation"`, prompting a more specific search. Redirects are followed automatically, preserving the upstream page type.
 
 **Input:**
 - `title: string` — article title (URL-decoded; e.g., `"Python (programming language)"`); a trailing `#fragment` is accepted, and a title MediaWiki cannot name a page with is refused before the fetch
 - `language?: string` — language edition code (default `"en"`)
 
-**Output:** `{ title, page_type, pageid, wikibase_item, description, extract, thumbnail_url, latitude?, longitude?, url?, revision_id?, last_modified? }`. `page_type` is one of `"article" | "disambiguation" | "redirect"`. `wikibase_item` is the Wikidata QID (e.g., `"Q28865"`) — use to chain into `wikidata-mcp-server` without a separate title-to-QID lookup. `latitude` / `longitude` are the REST `coordinates`, present only for a geotagged article (the payload carries an explicit `null` otherwise) and named to pass straight into `wikipedia_search_nearby`. `url` is the canonical desktop page URL, and `revision_id` / `last_modified` name the revision the extract was read from, so `?oldid=<revision_id>` cites exactly that version.
+**Output:** `{ title, page_type, pageid, wikibase_item, description, extract, thumbnail_url, latitude?, longitude?, url?, revision_id?, last_modified? }`. `page_type` preserves upstream values such as `standard`, `disambiguation`, and `no-extract`. `wikibase_item` is the Wikidata QID (e.g., `Q28865`) for cross-referencing. Coordinates are present only for a geotagged article and pass directly to `wikipedia_search_nearby`. `url`, `revision_id`, and `last_modified` cite the page and revision read.
 
 **Errors:**
 - `not_found` (NotFound) — no article exists for the title. Recovery: use `wikipedia_search_articles` to find the correct title.
@@ -414,13 +421,13 @@ A search that matches nothing is a successful empty result with a notice, not an
 - `latitude: number` — WGS 84 latitude (−90 to 90)
 - `longitude: number` — WGS 84 longitude (−180 to 180)
 - `radius_meters?: number` — search radius in meters (default 1000, min 10, max 10000 — the `gsradius` bounds `action=paraminfo` reports)
-- `limit?: number` — max results (default 10, max 500 — the `gslimit` ceiling an anonymous caller gets). Geosearch has no `offset`/`continue`, so this is the whole reachable set
+- `limit?: number` — positive integer results (default 10); values above 500 are clamped with `requestedLimit`, `appliedLimit`, and a notice. Geosearch has no `offset`/`continue`, so this is the whole reachable set
 - `language?: string` — language edition code (default `"en"`)
 
 **Output:** Array of results: `{ title, pageid, latitude, longitude, distance_meters, description?, wikibase_item? }`, sorted ascending by `distance_meters`. Enrichment echoes the query point and effective radius, and carries `truncated`, `shown`, and `cap`. A truncation notice advises a higher `limit` below the 500 ceiling and only narrower sweeps at it.
 
 **Errors:**
-- `invalid_coordinates` (ValidationError) — latitude or longitude out of range.
+- Coordinate ranges are advertised and enforced in the input schema (latitude −90…90, longitude −180…180); invalid values fail before the handler runs.
 - `invalid_language` (ValidationError) — unrecognized language code.
 
 No geotagged articles within the radius is a successful empty result with a notice suggesting a wider radius, not an error.
