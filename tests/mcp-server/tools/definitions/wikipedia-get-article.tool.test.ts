@@ -8,13 +8,41 @@ import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { wikipediaGetArticle } from '@/mcp-server/tools/definitions/wikipedia-get-article.tool.js';
+import { wikipediaGetSections } from '@/mcp-server/tools/definitions/wikipedia-get-sections.tool.js';
 import {
   getWikipediaService,
   initWikipediaService,
+  redirectInfo,
 } from '@/services/wikipedia/wikipedia-service.js';
 import { mockWikipediaService } from '../../../helpers/wikipedia-service-mock.js';
 
 describe('wikipediaGetArticle', () => {
+  it('selects only the requested outer table and exposes paging metadata (#67)', async () => {
+    vi.restoreAllMocks();
+    initWikipediaService({} as AppConfig, fakeStorage(), 'test', 'https://en.wikipedia.org');
+    vi.spyOn(getWikipediaService(), 'actionGet').mockResolvedValue({
+      parse: {
+        title: 'Sample',
+        revid: 42,
+        text: '<p>Outside</p><table class="wikitable"><tr><th>H</th></tr><tr><td>same</td></tr><tr><td></td></tr><tr><td>same</td></tr></table>',
+      },
+    });
+    const result = await wikipediaGetArticle.handler(
+      wikipediaGetArticle.input.parse({ title: 'Sample', section_index: 1, table_index: 1 }),
+      createMockContext({ errors: wikipediaGetArticle.errors }),
+    );
+    expect(result.content).toBe('| H |\n| --- |\n| same |\n|  |\n| same |');
+    expect(result).toMatchObject({
+      table_index: 1,
+      table_count: 1,
+      table_rows: 4,
+      row_offset: 0,
+      rows_returned: 4,
+      revision_id: '42',
+      truncated: false,
+    });
+    expect(renderText(result)).toContain('**Table index:** 1');
+  });
   beforeEach(() => {
     vi.restoreAllMocks();
     // Baseline stub so the pre-fetch edition guard resolves offline; tests that need
@@ -254,13 +282,16 @@ describe('wikipediaGetArticle', () => {
   it('throws invalid_section with data.reason when section_index is out of range (issue #15)', async () => {
     const { validationError } = await import('@cyanheads/mcp-ts-core/errors');
     mockWikipediaService({
-      getArticleSection: vi
-        .fn()
-        .mockRejectedValue(
-          validationError(
-            'Section index 999 does not exist in "Python (programming language)". Call wikipedia_get_sections to get valid index values.',
-          ),
+      getArticleSection: vi.fn().mockRejectedValue(
+        validationError(
+          'Section index 999 does not exist in "Python (programming language)". Call wikipedia_get_sections to get valid index values.',
+          {
+            reason: 'invalid_section',
+            title: 'Python (programming language)',
+            sectionIndex: 999,
+          },
         ),
+      ),
     });
 
     const ctx = createMockContext({ errors: wikipediaGetArticle.errors });
@@ -895,3 +926,175 @@ function renderText(output: Parameters<NonNullable<typeof wikipediaGetArticle.fo
 function fakeStorage(): StorageService {
   return { get: async () => null, set: async () => undefined } as unknown as StorageService;
 }
+
+function service() {
+  initWikipediaService({} as AppConfig, fakeStorage(), 'test', 'https://en.wikipedia.org');
+  return getWikipediaService();
+}
+
+/** The same-table sibling labels must pair only with the leaf in their own row. */
+const TREE =
+  '<table class="clade"><tr><td class="clade-label">Family</td><td class="clade-leaf"><table class="clade"><tr><td class="clade-label">Rosoideae</td><td class="clade-leaf"><table class="clade"><tr><td class="clade-label"></td><td class="clade-leaf">Roseae</td></tr><tr><td class="clade-label"></td><td class="clade-leaf">Rubeae</td></tr></table></td></tr><tr><td class="clade-slabel"></td></tr><tr><td class="clade-label">Dryadoideae</td><td class="clade-leaf">Dryadeae</td></tr></table></td></tr><tr><td class="clade-label"></td><td class="clade-leaf">outgroup</td></tr></table>';
+const RENDERED_TREE =
+  '```\n- Family\n  - Rosoideae\n    - Roseae\n    - Rubeae\n  - Dryadoideae\n    - Dryadeae\n- outgroup\n```';
+
+describe('scientific rendering through real tool handlers (#68, #71)', () => {
+  beforeEach(() => vi.restoreAllMocks());
+  it('keeps an unparseable tree visible on both article surfaces', async () => {
+    const svc = service();
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
+      parse: { title: 'Tree', revid: 42, text: '<h2>Tree</h2><table class="clade"></table>' },
+    });
+    const result = await wikipediaGetArticle.handler(
+      wikipediaGetArticle.input.parse({ title: 'Tree', section_index: 1 }),
+      createMockContext({ errors: wikipediaGetArticle.errors }),
+    );
+    expect(result.content).toBe('== Tree ==\n\n[table omitted: unparseable clade]');
+    expect(renderText(result)).toContain('\\[table omitted: unparseable clade\\]');
+    expect(result.truncated).toBe(false);
+  });
+  it('preserves tree indentation on both article surfaces without adding table ordinals', async () => {
+    const svc = service();
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
+      parse: {
+        title: 'Tree',
+        revid: 42,
+        text: `<h2>Tree</h2>${TREE}<table class="wikitable"><tr><th>H</th></tr><tr><td>X</td></tr></table>`,
+      },
+    });
+    const read = (table_index?: number) =>
+      wikipediaGetArticle.handler(
+        wikipediaGetArticle.input.parse({ title: 'Tree', section_index: 1, table_index }),
+        createMockContext({ errors: wikipediaGetArticle.errors }),
+      );
+    const result = await read();
+    expect(result.content).toContain(RENDERED_TREE);
+    expect(wikipediaGetArticle.format!(result)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: 'text', text: expect.stringContaining(RENDERED_TREE) }),
+      ]),
+    );
+    expect(await read(1)).toMatchObject({ content: '| H |\n| --- |\n| X |', table_count: 1 });
+    await expect(read(2)).rejects.toMatchObject({
+      data: { reason: 'invalid_table', availableCount: 1 },
+    });
+  });
+  it('normalizes index 19 through the service, both tools and verified redirects', async () => {
+    const svc = service();
+    const toc = {
+      title: 'Carbon',
+      pageid: 42,
+      tocdata: {
+        sections: [
+          {
+            index: '19',
+            number: '4',
+            hLevel: 2,
+            line: 'CO<sub>2</sub> fertilization effect',
+            anchor: 'CO2_fertilization_effect',
+          },
+        ],
+      },
+    };
+    vi.spyOn(svc, 'actionGet').mockImplementation(async (_language, params) =>
+      params.prop === 'tocdata'
+        ? { parse: toc }
+        : {
+            parse: {
+              title: 'Carbon',
+              revid: 1375796469,
+              text: '<h2>CO<sub>2</sub> fertilization effect</h2><p>Body.</p>',
+            },
+          },
+    );
+    const sections = await wikipediaGetSections.handler(
+      wikipediaGetSections.input.parse({ title: 'Carbon' }),
+      createMockContext({ errors: wikipediaGetSections.errors }),
+    );
+    expect(sections.sections[1]).toMatchObject({ index: 19, title: 'CO₂ fertilization effect' });
+    expect(wikipediaGetSections.format!(sections)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: 'text',
+          text: expect.stringContaining('CO₂ fertilization effect'),
+        }),
+      ]),
+    );
+    const article = await wikipediaGetArticle.handler(
+      wikipediaGetArticle.input.parse({ title: 'Carbon', section_index: 19 }),
+      createMockContext({ errors: wikipediaGetArticle.errors }),
+    );
+    expect(article).toMatchObject({
+      section_title: 'CO₂ fertilization effect',
+      revision_id: '1375796469',
+    });
+    expect(wikipediaGetArticle.format!(article)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: 'text',
+          text: expect.stringContaining('CO₂ fertilization effect'),
+        }),
+      ]),
+    );
+    expect(redirectInfo([{ from: 'Alias', tofragment: 'CO2_fertilization_effect' }], toc)).toEqual({
+      redirected_from: 'Alias',
+      redirect_section: 'CO₂ fertilization effect',
+      redirect_section_index: 19,
+    });
+  });
+
+  it('indexes scientific overflow headings uniquely and retains citations on both surfaces', async () => {
+    const svc = service();
+    const toc = {
+      title: 'Carbon',
+      tocdata: {
+        sections: [
+          { index: '19', line: 'CO<sub>2</sub> fertilization effect' },
+          { index: '20', line: 'N<sub>A</sub>' },
+          { index: '21', line: 'N<sub>A</sub>' },
+          { index: 'not numeric', line: 'x<sup>n</sup>' },
+        ],
+      },
+    };
+    const extract = `<h2>CO<sub>2</sub> fertilization effect</h2><p>${'body '.repeat(17000)}</p><h2>N<sub>A</sub></h2><p>A.</p><h2>x<sup>n</sup></h2><p>B.</p><h2>Absent<sub>2</sub></h2><p>C.</p>`;
+    vi.spyOn(svc, 'actionGet').mockImplementation(async (_language, params) =>
+      params.prop === 'tocdata'
+        ? { parse: toc }
+        : {
+            query: {
+              pages: [
+                {
+                  title: 'Carbon',
+                  pageid: 42,
+                  extract,
+                  fullurl: 'https://en.wikipedia.org/wiki/Carbon',
+                  revisions: [{ revid: 1375796469, timestamp: '2026-10-01T00:00:00Z' }],
+                },
+              ],
+            },
+          },
+    );
+    const result = await wikipediaGetArticle.handler(
+      wikipediaGetArticle.input.parse({ title: 'Carbon' }),
+      createMockContext({ errors: wikipediaGetArticle.errors }),
+    );
+    expect(result.truncated).toBe(true);
+    expect(result.content).toContain('(section_index: 19)');
+    expect(result.content).toMatch(
+      /^- CO₂ fertilization effect — \d+ bytes \(section_index: 19\)$/m,
+    );
+    for (const name of ['N_A', 'xⁿ', 'Absent₂'])
+      expect(result.content).toContain(`- ${name} — 4 bytes\n`);
+    expect(result).toMatchObject({
+      revision_id: '1375796469',
+      last_modified: '2026-10-01T00:00:00Z',
+      url: 'https://en.wikipedia.org/wiki/Carbon',
+    });
+    const text = wikipediaGetArticle.format!(result)
+      .map((block) => (block.type === 'text' ? block.text : ''))
+      .join('');
+    expect(text).toContain('CO₂ fertilization effect');
+    expect(text).toContain('section\\_index: 19');
+    expect(text).toContain('1375796469');
+  });
+});

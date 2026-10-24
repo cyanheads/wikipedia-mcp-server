@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vitest';
 import {
   escapeMarkdown,
   escapeMarkdownOutsideBlocks,
+  formatTablePage,
 } from '@/mcp-server/tools/utils/escape-markdown.js';
 import { htmlSectionToPlainText } from '@/services/wikipedia/wikipedia-service.js';
 
@@ -62,6 +63,11 @@ describe('escapeMarkdown', () => {
 });
 
 describe('escapeMarkdownOutsideBlocks (issues #49, #50)', () => {
+  it('keeps headerless continuation rows literal even when a data row resembles a delimiter (#67)', () => {
+    expect(formatTablePage('| a \\| b | <script> |\n| --- | --- |\n| tail | value |', true)).toBe(
+      '\\| a \\| b \\| \\<script\\> \\|  \n\\| --- \\| --- \\|  \n\\| tail \\| value \\|',
+    );
+  });
   it('matches escapeMarkdown on text with no code block or table row', () => {
     for (const text of [
       'Italic by _underscores_ and <b>tags</b>.\n# Not a heading\n- not a list',

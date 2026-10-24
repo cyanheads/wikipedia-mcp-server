@@ -49,6 +49,7 @@ Wikipedia in any language edition. Search articles, read summaries or just the s
 - Free-text `query` (an empty one fails with `empty_query`), positive integer `limit` (default 10, clamped to 50), and `offset` paging, passing back enrichment `nextOffset`. Only a clamped call carries `requestedLimit`, `appliedLimit`, and a clamp notice. Wikipedia serves no result past the 10,000th: an `offset` at or beyond it fails with `offset_too_large`, and a page ending on that window carries enrichment `truncated`
 - CirrusSearch operators include `incategory:"1648 treaties"`, `morelike:Peace of Westphalia`, `intitle:Python`, `hastemplate:Infobox`, and `insource:Python` (support depends on the installation). `sort` defaults to `relevance`; alternatives are `last_edit_desc`, `create_timestamp_desc`, `incoming_links_desc`, and `title_natural_asc`. Enrichment echoes `sort`; keep it and `query` unchanged when paging
 - Each result carries a plain-text snippet, page ID, word count, and — when the article has them — its short `description` and Wikidata QID (`wikibase_item`); enrichment `suggestion` carries Wikipedia's spelling correction (`einstien` → `einstein`)
+- Invalid or over-complex `insource:/…/` and `intitle:/…/` regexes fail once with `invalid_query`, the `upstreamCode`, and guidance to correct or simplify the regex or remove the operator. A busy regex search remains retryable
 
 ---
 
@@ -66,13 +67,15 @@ Wikipedia in any language edition. Search articles, read summaries or just the s
 - Outline entries include verified `section_index` values where available, including 0 for the lead. Ambiguous or unindexed headings retain the section-list fallback. TOC verification gets one short attempt; unavailable verification is disclosed
 - Redirects expose `redirected_from` and, for a section target, `redirect_section`. A full read remains full and includes targeted-read guidance; an explicit `section_index`, including 0, takes precedence
 - Every read returns `url` and `revision_id` (`?oldid=<revision_id>` is a permanent link to the text read); a full read, outline included, also returns `last_modified`. With `WIKIPEDIA_BASE_URL` set, a section read omits `url`
-- Section reads also carry data tables as pipe-delimited rows and infoboxes as `label: value` lines, which the full-article extract strips; a table over 40,000 rendered bytes leaves a `[table omitted: N rows]` marker
+- Section reads render phylogenetic clade trees as fenced, indented branches, pairing each row’s label with its leaf and preserving unnamed forks. An unparseable tree leaves `[table omitted: unparseable clade]`; trees have no `table_index`
+- Section reads also carry data tables as pipe-delimited rows and infoboxes as `label: value` lines, which the full-article extract strips; a table over 40,000 rendered bytes leaves a `[table omitted: N rows (table T)]` marker. Pass `table_index: T` with the section to read that table in complete row pages, then follow `next_cursor` as `cursor` with the same inputs. Continuations read the first page’s revision; caption and header appear once. Each page's table text fits 40,000 UTF-8 bytes on both surfaces, except an indivisible oversized row or first-page caption/header returned alone with `oversized_row: true`
 
 ---
 
 ### `wikipedia_get_sections` <sub>tool</sub>
 
 - Takes a `title`; returns section titles, heading levels, hierarchical numbering (e.g. `"2.1"`), and the `section_index` to pass to `wikipedia_get_article` — the first entry is the lead (`index: 0`, titled `Introduction`)
+- Heading titles use the article renderer’s script, formula, whitespace and single-pass entity normalization, so `CO₂` stays identical across the section list, article reads and verified outline entries
 - Fails with `no_sections` on a stub or very short article — read it with `wikipedia_get_article` instead
 - Redirect aliases expose `redirected_from` and optional `redirect_section`; `redirect_section_index` appears only when a unique anchor matches a real numeric TOC index
 

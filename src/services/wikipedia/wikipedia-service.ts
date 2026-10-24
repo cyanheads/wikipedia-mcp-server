@@ -3,6 +3,7 @@
  * @module services/wikipedia/wikipedia-service
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import {
   JsonRpcErrorCode,
@@ -13,7 +14,15 @@ import {
 } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import type { RequestContext } from '@cyanheads/mcp-ts-core/utils';
-import { fetchWithTimeout, logger, withExtra, withRetry } from '@cyanheads/mcp-ts-core/utils';
+import {
+  decodeCursor,
+  encodeCursor,
+  fetchWithTimeout,
+  logger,
+  withExtra,
+  withRetry,
+} from '@cyanheads/mcp-ts-core/utils';
+import { formatTablePage } from '@/mcp-server/tools/utils/escape-markdown.js';
 import { fenceCodeBlock, tableDelimiterRow, tableRow } from './text-blocks.js';
 import type {
   ActionApiErrorRaw,
@@ -76,6 +85,9 @@ function isLayoutTable(openTag: string): boolean {
 
 /** An open tag's `class` attribute value. */
 const CLASS_ATTRIBUTE = /\bclass\s*=\s*"([^"]*)"/i;
+
+/** Phylogenetic trees carry article content, independently of selectable data tables. */
+const isClade = hasClass('clade');
 
 /**
  * How a table holding data is rendered: `grid` for a `wikitable`, as pipe rows; `infobox` as one
@@ -148,7 +160,8 @@ const isEditLinks = hasClass('navbar', 'wikidata-link');
  *
  * `figure` goes because the plain-text conventions of the full-article extract path drop it too.
  * `table` goes unless it is a layout table, which wraps ordinary lists and paragraphs, or a data
- * table ({@link dataTableKind}), which {@link renderDataTables} renders as rows. What remains are
+ * table ({@link dataTableKind}), which {@link renderDataTables} renders as rows, or a clade tree,
+ * rendered as fenced branches. What remains are
  * navboxes, sidebars, and unclassed chart tables — page furniture, or a picture of numbers a
  * neighbouring data table carries. Inside a data table no table is dropped by this rule: the cell
  * holding it is flattened to text instead. `div.spoken-wikipedia` is `{{Spoken Wikipedia}}`, whose
@@ -172,7 +185,8 @@ const DROP_RULES: Readonly<Record<string, (openTag: string) => boolean>> = {
   style: () => true,
   script: () => true,
   figure: () => true,
-  table: (openTag) => !isLayoutTable(openTag) && dataTableKind(openTag) === undefined,
+  table: (openTag) =>
+    !isClade(openTag) && !isLayoutTable(openTag) && dataTableKind(openTag) === undefined,
   div: hasClass('spoken-wikipedia', 'infobox-caption', 'preview-warning'),
   sup: hasClass('reference'),
   ol: hasClass('references'),
@@ -288,9 +302,10 @@ function isDropped(openTag: string, tagName: string, insideDataTable: boolean): 
  */
 function dropElements(html: string, insideDataTable = false): string {
   const openTag = new RegExp(OPEN_TAG.source, 'gi');
+  const tagged = html.slice(0, html.lastIndexOf('>') + 1);
   let kept = '';
   let cursor = 0;
-  for (let open = openTag.exec(html); open; open = openTag.exec(html)) {
+  for (let open = openTag.exec(tagged); open; open = openTag.exec(tagged)) {
     const tagName = (open[1] as string).toLowerCase();
     if (VOID_TAGS.has(tagName)) continue;
     const bodyStart = open.index + open[0].length;
@@ -344,7 +359,8 @@ function stripTags(html: string): string {
   let previous: string;
   do {
     previous = text;
-    text = text.replace(/<[^>]+>/g, '');
+    const end = text.lastIndexOf('>') + 1;
+    text = text.slice(0, end).replace(/<[^>]+>/g, '') + text.slice(end);
   } while (text !== previous);
   return text;
 }
@@ -444,16 +460,17 @@ const ALPHANUMERIC = /[\p{L}\p{N}]/u;
  * Runs after {@link dropElements}, which has already removed `sup.reference` footnote markers whole.
  */
 function renderScripts(html: string): string {
+  if (!/<\/(?:sup|sub)\s*>/i.test(html)) return html;
   const render = (text: string, inAbbreviation: boolean): string => {
     const next = text.replace(SCRIPT_ELEMENT, (_match, tag: string, body: string) =>
       renderScript(tag.toLowerCase() === 'sup', body, inAbbreviation),
     );
     return next === text ? text : render(next, inAbbreviation);
   };
-  return render(
-    html.replace(ABBREVIATION_ELEMENT, (abbreviation) => render(abbreviation, true)),
-    false,
-  );
+  const abbreviations = /<\/abbr\s*>/i.test(html)
+    ? html.replace(ABBREVIATION_ELEMENT, (abbreviation) => render(abbreviation, true))
+    : html;
+  return render(abbreviations, false);
 }
 
 /** One script's body rendered as {@link renderScripts} describes. */
@@ -473,7 +490,7 @@ function renderScript(superscript: boolean, body: string, inAbbreviation: boolea
 
 /**
  * Largest rendered data table, in UTF-8 bytes, that a section read carries in full. A larger one is
- * replaced by a `[table omitted: N rows]` marker, so the gap stays visible without one table
+ * replaced by a `[table omitted: N rows (table T)]` marker, so the gap stays visible without one table
  * outweighing the rest of the section many times over.
  *
  * Sized from rendered tables: results and statistics tables run 1–5 KB, a US election's per-state
@@ -482,6 +499,81 @@ function renderScript(superscript: boolean, body: string, inAbbreviation: boolea
  * table never outweighs what a whole article may carry.
  */
 export const DATA_TABLE_MAX_BYTES = 40_000;
+
+/** Revision and row position bound to the exact selected-table request. */
+const TableCursorSchema = z.strictObject({
+  kind: z.literal('wikipedia_table_v1'),
+  offset: z.number().int().positive(),
+  limit: z.literal(DATA_TABLE_MAX_BYTES),
+  title: z.string(),
+  language: z.string(),
+  sectionIndex: z.number().int().nonnegative(),
+  tableIndex: z.number().int().positive(),
+  revisionId: z.number().int().positive(),
+});
+
+type TableCursor = z.infer<typeof TableCursorSchema>;
+
+/** A selected table and an already validated continuation, if present. */
+export type ArticleTableRead = { index: number; continuation?: TableCursor };
+
+/** Reject malformed cursors and request mismatches before any edition or article lookup. */
+export function articleTableRead(
+  title: string,
+  language: string,
+  sectionIndex: number | undefined,
+  tableIndex: number | undefined,
+  cursor: string | undefined,
+  ctx: RequestContext,
+): ArticleTableRead | undefined {
+  if (tableIndex === undefined && !cursor) return;
+  if (sectionIndex === undefined || tableIndex === undefined) {
+    throw validationError(
+      'Table reads require section_index; continuation also requires table_index.',
+      {
+        reason: 'invalid_table',
+      },
+    );
+  }
+  if (!cursor) return { index: tableIndex };
+  let decoded: unknown;
+  try {
+    decoded = decodeCursor(cursor, ctx);
+  } catch (error) {
+    if (!(error instanceof McpError) || error.data?.reason !== 'invalid_cursor') throw error;
+    throw validationError(
+      'The table cursor is malformed. Pass the previous next_cursor unchanged.',
+      { reason: 'invalid_cursor' },
+      { cause: error },
+    );
+  }
+  const parsed = TableCursorSchema.safeParse(decoded);
+  if (
+    !parsed.success ||
+    parsed.data.title !== title ||
+    parsed.data.language !== language ||
+    parsed.data.sectionIndex !== sectionIndex ||
+    parsed.data.tableIndex !== tableIndex
+  ) {
+    throw validationError(
+      'The table cursor does not match this article, language, section, or table.',
+      { reason: 'invalid_cursor' },
+    );
+  }
+  return { index: tableIndex, continuation: parsed.data };
+}
+
+/** Selected-table metadata; `truncated` remains reserved for full-article outlining. */
+type TablePage = {
+  table_index: number;
+  table_count: number;
+  table_rows: number;
+  row_offset: number;
+  rows_returned: number;
+  table_continued: boolean;
+  next_cursor?: string;
+  oversized_row?: boolean;
+};
 
 /** A table cell as {@link parseTable} found it. */
 type TableCell = { header: boolean; html: string; colspan: number; rowspan: number };
@@ -498,8 +590,8 @@ const CELL_LINE_BREAK =
 
 /** A `colspan`/`rowspan` value; a missing, zero, or non-numeric one spans a single cell. */
 function spanAttribute(openTag: string, name: 'colspan' | 'rowspan'): number {
-  const value = Number(new RegExp(`\\b${name}\\s*=\\s*"?(\\d+)`, 'i').exec(openTag)?.[1]);
-  return value >= 1 ? value : 1;
+  const value = Number(new RegExp(`\\b${name}\\s*=\\s*"?(\\d+)`, 'i').exec(openTag)?.[1] ?? '1');
+  return Math.max(value, 1);
 }
 
 /**
@@ -656,38 +748,201 @@ function infoboxLines(rows: readonly TableCell[][]): string {
 
 /**
  * Render one data table from its body, caption first. A table whose rendering exceeds
- * {@link DATA_TABLE_MAX_BYTES} is replaced by a one-line `[table omitted: N rows]` marker.
+ * {@link DATA_TABLE_MAX_BYTES} is replaced by a one-line omission marker naming its selector.
  */
-function renderTable(kind: 'grid' | 'infobox', body: string): string {
+function renderTable(kind: 'grid' | 'infobox', body: string, index: number): string {
   const { caption, rows } = parseTable(body);
   const rendered = kind === 'infobox' ? infoboxLines(rows) : gridLines(rows);
   const table =
     new TextEncoder().encode(rendered).length > DATA_TABLE_MAX_BYTES
-      ? `[table omitted: ${rows.length} rows]`
+      ? `[table omitted: ${rows.length} rows (table ${index})]`
       : rendered;
   return [cellText(caption, ' '), table].filter(Boolean).join(kind === 'infobox' ? '\n' : '\n\n');
 }
 
+/** Page expanded rows without splitting a row or repeating the first page's caption/header. */
+function pageTable(
+  kind: 'grid' | 'infobox',
+  body: string,
+  offset: number,
+): { content: string; nextOffset: number; total: number; oversized: boolean } {
+  const parsed = parseTable(body);
+  const caption = cellText(parsed.caption, ' ');
+  const grid = kind === 'grid' ? tableGrid(parsed.rows) : undefined;
+  const rows = grid
+    ? grid.some((row) => row.some(Boolean))
+      ? grid.map((row) => tableRow(row))
+      : []
+    : parsed.rows.map((row) => infoboxLines([row]));
+  if (offset > 0 && offset >= rows.length) {
+    throw validationError('The table cursor row offset is past the end of the pinned table.', {
+      reason: 'invalid_cursor',
+    });
+  }
+  if (!rows.length)
+    return {
+      content: caption,
+      nextOffset: 0,
+      total: 0,
+      oversized: Buffer.byteLength(formatTablePage(caption, false)) > DATA_TABLE_MAX_BYTES,
+    };
+  const header = grid ? `${rows[0]}\n${tableDelimiterRow(grid[0]?.length ?? 0)}` : rows[0];
+  const initial = caption ? `${caption}${grid ? '\n\n' : '\n'}${header}` : (header as string);
+  const selected: string[] = [];
+  let bytes = 0;
+  let nextOffset = offset;
+  for (; nextOffset < rows.length; nextOffset++) {
+    const row = nextOffset === 0 ? initial : (rows[nextOffset] as string);
+    const plainBytes = Buffer.byteLength(row);
+    const markdownBytes = Buffer.byteLength(formatTablePage(row, offset > 0));
+    const separatorBytes = selected.length ? (offset > 0 ? 3 : 1) : 0;
+    const cost = Math.max(plainBytes, markdownBytes) + separatorBytes;
+    if (selected.length && bytes + cost > DATA_TABLE_MAX_BYTES) break;
+    selected.push(row);
+    bytes += cost;
+    if (bytes > DATA_TABLE_MAX_BYTES) {
+      nextOffset++;
+      break;
+    }
+  }
+  return {
+    content: selected.join('\n'),
+    nextOffset,
+    total: rows.length,
+    oversized: bytes > DATA_TABLE_MAX_BYTES,
+  };
+}
+
 /**
- * Render every data table ({@link dataTableKind}) in `html` and park the result, so the prose passes
+ * Render data tables and clade trees in `html` and park the result, so the prose passes
  * that follow cannot re-decode its text or strip a `<tag>` its cells quote. A data table nested in a
- * cell of another is flattened into that cell rather than rendered on its own.
+ * cell of another is flattened into that cell rather than rendered on its own. Only data tables
+ * consume selector ordinals; a tree's nested tables belong to that tree.
  */
-function renderDataTables(html: string, parked: ParkedBlocks): string {
+function renderDataTables(html: string, parked: ParkedBlocks, render: typeof renderTable): string {
   const openTag = /<table\b[^>]*>/gi;
   let rendered = '';
   let cursor = 0;
+  let index = 0;
   for (let open = openTag.exec(html); open; open = openTag.exec(html)) {
     const kind = dataTableKind(open[0]);
-    if (!kind) continue;
+    const clade = isClade(open[0]);
+    if (!kind && !clade) continue;
     const bodyStart = open.index + open[0].length;
     const end = elementEnd(html, 'table', bodyStart);
     rendered +=
-      html.slice(cursor, open.index) + parked.park(renderTable(kind, html.slice(bodyStart, end)));
+      html.slice(cursor, open.index) +
+      parked.park(
+        kind && !clade
+          ? render(kind, html.slice(bodyStart, end), ++index)
+          : renderClade(html.slice(bodyStart, end)),
+      );
     cursor = end;
     openTag.lastIndex = end;
   }
   return rendered + html.slice(cursor);
+}
+
+/** A clade cell's own text and nested tables, excluding descendant text from that own text. */
+type CladeCell = { html: string[]; children: CladeRow[][] };
+type CladeRow = { label?: CladeCell; leaf?: CladeCell; secondary?: CladeCell };
+type CladeFrame = { rows: CladeRow[]; row?: CladeRow; cell?: CladeCell };
+
+/**
+ * Parse all nested clades in one structural walk. Row ownership pairs a label with its leaf;
+ * separate rows are siblings even when both labels occur in the same table. Empty secondary-label
+ * rows are connector geometry. Unknown or incomplete structure gets an explicit omission marker.
+ * Both parsing and output traversal use stacks so deeply nested forks do not consume the JS stack.
+ */
+function renderClade(body: string): string {
+  const omitted = '[table omitted: unparseable clade]';
+  const root: CladeFrame = { rows: [] };
+  const frames = [root];
+  const tag = new RegExp(TABLE_STRUCTURE_TAG.source, 'gi');
+  let cursor = 0;
+  let closed = false;
+  for (let match = tag.exec(body); match; match = tag.exec(body)) {
+    const frame = frames.at(-1);
+    if (!frame) return omitted;
+    frame.cell?.html.push(body.slice(cursor, match.index));
+    cursor = match.index + match[0].length;
+    const closing = match[1] === '/';
+    const name = (match[2] as string).toLowerCase();
+    if (name === 'table') {
+      if (closing) {
+        if (frame.row || frame.cell) return omitted;
+        frames.pop();
+        if (!frames.length) {
+          closed = true;
+          break;
+        }
+      } else {
+        if (!isClade(match[0]) || !frame.cell || frame.cell !== frame.row?.leaf) return omitted;
+        const child: CladeFrame = { rows: [] };
+        frame.cell.children.push(child.rows);
+        frames.push(child);
+      }
+    } else if (name === 'tr') {
+      if (frame.cell || (closing ? !frame.row : frame.row)) return omitted;
+      if (closing) delete frame.row;
+      else {
+        frame.row = {};
+        frame.rows.push(frame.row);
+      }
+    } else if (name === 'td' || name === 'th') {
+      if (!frame.row) return omitted;
+      if (closing) {
+        if (!frame.cell) return omitted;
+        delete frame.cell;
+      } else {
+        if (frame.cell) return omitted;
+        const classes = CLASS_ATTRIBUTE.exec(match[0])?.[1]?.split(/\s+/) ?? [];
+        const role = classes.includes('clade-label')
+          ? 'label'
+          : classes.includes('clade-leaf')
+            ? 'leaf'
+            : classes.includes('clade-slabel')
+              ? 'secondary'
+              : undefined;
+        if (!role || frame.row[role]) return omitted;
+        frame.cell = { html: [], children: [] };
+        frame.row[role] = frame.cell;
+      }
+    } else return omitted;
+  }
+  if (!closed || !root.rows.length) return omitted;
+
+  const lines: string[] = [];
+  const pending = root.rows.map((row) => ({ row, depth: 0 })).reverse();
+  while (pending.length) {
+    const { row, depth } = pending.pop() as { row: CladeRow; depth: number };
+    if (row.secondary) {
+      if (
+        row.label ||
+        row.leaf ||
+        row.secondary.children.length ||
+        cellText(row.secondary.html.join(''), ' ')
+      )
+        return omitted;
+      continue;
+    }
+    if (!row.label || !row.leaf || row.label.children.length) return omitted;
+    const label = cellText(row.label.html.join(''), ' ');
+    const leaf = cellText(row.leaf.html.join(''), ' ');
+    const children = row.leaf.children;
+    if ((!leaf && !children.length) || (leaf && children.length)) return omitted;
+    const indent = '  '.repeat(depth);
+    lines.push(`${indent}-${label ? ` ${label}` : children.length ? '' : ` ${leaf}`}`);
+    if (label && leaf) lines.push(`${indent}  - ${leaf}`);
+    for (let table = children.length - 1; table >= 0; table--) {
+      const rows = children[table] as CladeRow[];
+      if (!rows.length) return omitted;
+      for (let index = rows.length - 1; index >= 0; index--) {
+        pending.push({ row: rows[index] as CladeRow, depth: depth + 1 });
+      }
+    }
+  }
+  return lines.length ? fenceCodeBlock(lines.join('\n')) : omitted;
 }
 
 /**
@@ -704,7 +959,8 @@ function renderDataTables(html: string, parked: ParkedBlocks): string {
  * Two constructs carry syntax of their own, written by `text-blocks.ts`. A `<pre>` sample becomes a
  * fenced code block that keeps its line breaks and indentation while everything around it is
  * collapsed, because in a code sample indentation is syntax. A data table becomes pipe rows, and an
- * infobox `label: value` lines. Superscripts and subscripts stay distinct from their neighbours
+ * infobox `label: value` lines. A clade tree uses a fence to preserve branch indentation on both
+ * surfaces. Superscripts and subscripts stay distinct from their neighbours
  * ({@link renderScripts}).
  *
  * Pass order is what keeps each pass's input intact. Furniture, hidden elements, and footnote markers
@@ -720,6 +976,11 @@ function renderDataTables(html: string, parked: ParkedBlocks): string {
  * Pure and exported for unit testing.
  */
 export function htmlSectionToPlainText(html: string): string {
+  return renderSectionHtml(html, renderTable);
+}
+
+/** Preserve formulas and scripts before any caller strips tags or decodes entities. */
+function prepareInlineHtml(html: string): string {
   let text = html.replace(/<!--[\s\S]*?-->/g, '');
 
   // Lift each formula out of its `<img alt>` before anything is dropped, so the TeX survives the
@@ -727,17 +988,25 @@ export function htmlSectionToPlainText(html: string): string {
   // full-article extract's only form — becomes its `alttext` the same way; the hidden twin a section
   // read carries becomes its TeX too, and is then dropped whole with the element hiding it. Both are
   // inserted still escaped, so the single decode pass below reads each exactly once.
-  text = text
-    .replace(MATH_FALLBACK_IMAGE, (match) => ALT_ATTRIBUTE.exec(match)?.[1] ?? '')
-    .replace(
-      MATH_ELEMENT,
-      (_match, attributes: string) => ALTTEXT_ATTRIBUTE.exec(attributes)?.[1] ?? '',
-    );
+  const end = text.lastIndexOf('>') + 1;
+  text =
+    text
+      .slice(0, end)
+      .replace(MATH_FALLBACK_IMAGE, (match) => ALT_ATTRIBUTE.exec(match)?.[1] ?? '')
+      .replace(
+        MATH_ELEMENT,
+        (_match, attributes: string) => ALTTEXT_ATTRIBUTE.exec(attributes)?.[1] ?? '',
+      ) + text.slice(end);
 
-  text = renderScripts(dropElements(text));
+  return renderScripts(dropElements(text));
+}
+
+/** Share the preparation and table walk between inline rendering and selected-table reads. */
+function renderSectionHtml(html: string, render: typeof renderTable): string {
+  let text = prepareInlineHtml(html);
 
   const parked = new ParkedBlocks();
-  text = renderDataTables(text, parked);
+  text = renderDataTables(text, parked, render);
 
   // A table parked inside a `<pre>` is restored into the code before the fence is sized, so no
   // backtick run in it can close the fence early.
@@ -849,7 +1118,7 @@ function stripMarkup(html: string): string {
  * one index. `stripMarkup` has already trimmed, so the collapse cannot leave an edge space behind.
  */
 export function tocLineToPlainText(line: string): string {
-  return stripMarkup(line).replace(/\s+/g, ' ');
+  return stripMarkup(prepareInlineHtml(line)).replace(/\s+/g, ' ');
 }
 
 // ---------------------------------------------------------------------------
@@ -1318,12 +1587,25 @@ function searchWindowError(offset: number): McpError {
  * Translate the Action API's top-level `error` envelope into this server's typed failures.
  *
  * `title` is passed by the page-addressed endpoints, whose `missingtitle` and `invalidtitle` codes
- * map onto declared tool contracts; anything else is upstream's own refusal and surfaces as a
- * service failure carrying the API's `info` text. The {@link TRANSIENT_ENVELOPE_CODES} never reach
- * here unless their retries ran out — {@link transientEnvelopeError} throws them inside the retry.
+ * map onto declared tool contracts. Regex syntax and complexity refusals are invalid queries;
+ * other codes surface as service failures carrying the API's `info` text. The
+ * {@link TRANSIENT_ENVELOPE_CODES} never reach here unless their retries ran out —
+ * {@link transientEnvelopeError} throws them inside the retry.
  */
 function actionApiError(error: ActionApiErrorRaw, language: string, title?: string): McpError {
   const code = error.code ?? '';
+  if (
+    code === 'cirrussearch-regex-syntax-error' ||
+    code === 'cirrussearch-regex-too-complex-error'
+  ) {
+    return validationError(`Wikipedia API error (${code}): ${error.info ?? code}`, {
+      reason: 'invalid_query',
+      upstreamCode: code,
+      recovery: {
+        hint: 'Correct or simplify the regex, or remove the insource:/…/ or intitle:/…/ operator and try again.',
+      },
+    });
+  }
   if (title !== undefined) {
     if (code === 'missingtitle') return articleNotFoundError(title, language);
     if (code === 'invalidtitle') return invalidTitleError(title, error.info);
@@ -2050,6 +2332,7 @@ export class WikipediaService {
     sectionIndex: number,
     language: string,
     ctx: ServiceContext,
+    tableRead?: ArticleTableRead,
   ): Promise<{
     title: string;
     pageid: number | undefined;
@@ -2058,12 +2341,15 @@ export class WikipediaService {
     revisionId: string | undefined;
     url: string | undefined;
     redirect?: RedirectInfo;
+    tablePage?: TablePage;
   }> {
     const raw = await this.actionGet<ActionParseTextRaw>(
       language,
       {
         action: 'parse',
-        page: title,
+        ...(tableRead?.continuation
+          ? { oldid: String(tableRead.continuation.revisionId) }
+          : { page: title }),
         prop: 'text|revid',
         section: String(sectionIndex),
         // Suppress the edit links, table of contents, and parser report — page furniture that
@@ -2079,12 +2365,19 @@ export class WikipediaService {
     );
 
     if (raw.error) {
+      if (tableRead?.continuation) {
+        throw serviceUnavailable(
+          'The pinned table revision could not be read. Retry this cursor; omit it only to start a new revision.',
+          { reason: 'revision_unavailable', revisionId: tableRead.continuation.revisionId },
+        );
+      }
       if (raw.error.code === 'nosuchsection') {
         throw validationError(
           `Section index ${sectionIndex} does not exist in "${title}". Call wikipedia_get_sections to get valid index values.`,
           {
             title,
             sectionIndex,
+            reason: 'invalid_section',
             recovery: { hint: 'Call wikipedia_get_sections to obtain valid section_index values.' },
           },
         );
@@ -2093,7 +2386,59 @@ export class WikipediaService {
     }
 
     // formatversion=2: text is a plain string, not { '*': string }.
-    const content = htmlSectionToPlainText(raw.parse?.text ?? '');
+    if (
+      tableRead &&
+      (!raw.parse?.revid ||
+        typeof raw.parse.text !== 'string' ||
+        (tableRead.continuation && raw.parse.revid !== tableRead.continuation.revisionId))
+    ) {
+      throw serviceUnavailable(
+        'The table response did not contain the requested revision and HTML. Retry the same request.',
+        { reason: 'revision_unavailable' },
+      );
+    }
+    let selected: { kind: 'grid' | 'infobox'; body: string } | undefined;
+    let tableCount = 0;
+    const sectionContent = tableRead
+      ? renderSectionHtml(raw.parse?.text ?? '', (kind, body, index) => {
+          tableCount = index;
+          if (index === tableRead.index) selected = { kind, body };
+          return '';
+        })
+      : htmlSectionToPlainText(raw.parse?.text ?? '');
+    let content = sectionContent;
+    let tablePage: TablePage | undefined;
+    if (tableRead) {
+      if (!selected)
+        throw validationError(
+          `Table index ${tableRead.index} does not exist; this section has ${tableCount} available tables.`,
+          { reason: 'invalid_table', availableCount: tableCount },
+        );
+      const offset = tableRead.continuation?.offset ?? 0;
+      const page = pageTable(selected.kind, selected.body, offset);
+      content = page.content;
+      tablePage = {
+        table_index: tableRead.index,
+        table_count: tableCount,
+        table_rows: page.total,
+        row_offset: offset,
+        rows_returned: page.nextOffset - offset,
+        table_continued: offset > 0,
+        ...(page.oversized && { oversized_row: true }),
+        ...(page.nextOffset < page.total && {
+          next_cursor: encodeCursor({
+            kind: 'wikipedia_table_v1',
+            title,
+            language,
+            sectionIndex,
+            tableIndex: tableRead.index,
+            revisionId: raw.parse?.revid,
+            offset: page.nextOffset,
+            limit: DATA_TABLE_MAX_BYTES,
+          }),
+        }),
+      };
+    }
 
     // The lead carries no heading of its own, so it takes the label every other surface prints for
     // it rather than the positional fallback. A heading inside a lead — a template can emit one —
@@ -2103,7 +2448,7 @@ export class WikipediaService {
     const sectionTitle =
       sectionIndex === LEAD_SECTION_INDEX
         ? LEAD_SECTION_TITLE
-        : ([...content.matchAll(HEADING_LINE)][0]?.[2] ?? `Section ${sectionIndex}`);
+        : ([...sectionContent.matchAll(HEADING_LINE)][0]?.[2] ?? `Section ${sectionIndex}`);
 
     const resolvedTitle = raw.parse?.title;
     return {
@@ -2111,6 +2456,7 @@ export class WikipediaService {
       pageid: raw.parse?.pageid,
       sectionTitle,
       content,
+      ...(tablePage && { tablePage }),
       revisionId: raw.parse?.revid?.toString(),
       ...(raw.parse?.redirects?.length && { redirect: redirectInfo(raw.parse.redirects) }),
       // Only the title MediaWiki resolved names the article's URL — the caller's input may be an alias.

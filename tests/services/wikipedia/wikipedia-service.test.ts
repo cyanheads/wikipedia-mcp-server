@@ -11,6 +11,7 @@ import { createFetchMock, createMockContext } from '@cyanheads/mcp-ts-core/testi
 import { logger } from '@cyanheads/mcp-ts-core/utils';
 import { beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import {
+  articleTableRead,
   articleUrl,
   buildBaseUrl,
   DATA_TABLE_MAX_BYTES,
@@ -24,9 +25,11 @@ import {
   isMalformedLanguage,
   LEAD_SECTION_TITLE,
   parseSiteMatrix,
+  redirectInfo,
   SEARCH_MAX_LIMIT,
   SEARCH_RESULT_WINDOW,
   splitArticleIntoSections,
+  tocLineToPlainText,
   WikipediaService,
 } from '@/services/wikipedia/wikipedia-service.js';
 
@@ -98,6 +101,17 @@ function captureWarnings() {
   });
   return spy;
 }
+
+it.each(['', ' colspan="0" rowspan="0"', ' colspan="bad" rowspan="bad"'])(
+  'characterizes absent or invalid spans as one cell: %s',
+  (attributes) => {
+    expect(
+      htmlSectionToPlainText(
+        `<table class="wikitable"><tr><th>A</th><th>B</th></tr><tr><td${attributes}>X</td><td>Y</td></tr></table>`,
+      ),
+    ).toBe('| A | B |\n| --- | --- |\n| X | Y |');
+  },
+);
 
 describe('WikipediaService init/accessor', () => {
   beforeEach(() => {
@@ -2380,6 +2394,155 @@ describe('htmlSectionToPlainText — fenced code blocks (issue #49)', () => {
   });
 });
 
+describe('WikipediaService — revision-pinned table pages (#67)', () => {
+  function fixture(html: string) {
+    const svc = initService();
+    const action = vi
+      .spyOn(svc, 'actionGet')
+      .mockResolvedValue({ parse: { title: 'Tables', revid: 42, text: html } });
+    const ctx = createMockContext();
+    const read = (cursor?: string, index = 1) =>
+      svc.getArticleSection(
+        'Tables',
+        1,
+        'en',
+        ctx,
+        articleTableRead('Tables', 'en', 1, index, cursor, ctx),
+      );
+    return { action, read, svc, ctx };
+  }
+
+  it('pins every continuation to oldid and preserves repeated and blank rows across pages', async () => {
+    const value = 'é_*'.repeat(6000);
+    const html = `<h2>Rows</h2><table class="wikitable"><caption>Caption</caption><tr><th>H</th></tr><tr><td>A${value}</td></tr><tr><td></td></tr><tr><td>A${value}</td></tr><tr><td>Z</td></tr></table>`;
+    const { read, action } = fixture(html);
+    const pages = [];
+    let cursor: string | undefined;
+    do {
+      const page = await read(cursor);
+      pages.push(page);
+      cursor = page.tablePage?.next_cursor;
+      // Current content changes after page 1; oldid remains the captured revision.
+      action.mockImplementation(async (_language, params) => ({
+        parse: {
+          title: 'Tables',
+          revid: params.oldid ? 42 : 99,
+          text: params.oldid ? html : '<table class="wikitable"><tr><td>changed</td></tr></table>',
+        },
+      }));
+    } while (cursor);
+    expect(pages.map((page) => page.content).join('\n')).toBe(
+      `Caption\n\n| H |\n| --- |\n| A${value} |\n|  |\n| A${value} |\n| Z |`,
+    );
+    expect(pages.map((page) => page.revisionId)).toEqual(['42', '42']);
+    expect(pages.map((page) => page.tablePage?.row_offset)).toEqual([0, 3]);
+    expect(pages.map((page) => page.tablePage?.rows_returned)).toEqual([3, 2]);
+    for (const call of action.mock.calls.slice(1)) {
+      expect(call[1]).toMatchObject({ oldid: '42' });
+      expect(call[1]).not.toHaveProperty('page');
+    }
+  });
+
+  it('returns a header-only page and advances before the first data row', async () => {
+    const { read } = fixture(
+      `<table class="wikitable"><caption>C</caption><tr><th>${'h'.repeat(39976)}</th></tr><tr><td>next row</td></tr></table>`,
+    );
+    const first = await read();
+    expect(first.tablePage).toMatchObject({ rows_returned: 1, row_offset: 0 });
+    expect(first.tablePage?.next_cursor).toBeTruthy();
+    const next = await read(first.tablePage?.next_cursor);
+    expect(next.content).toBe('| next row |');
+    expect(next.tablePage).toMatchObject({
+      row_offset: 1,
+      rows_returned: 1,
+      table_continued: true,
+    });
+    expect(next.tablePage?.next_cursor).toBeUndefined();
+  });
+
+  it('fills exactly the byte cap and continues with the next complete row', async () => {
+    const header = '| H |\n| --- |\n';
+    const value = 'y'.repeat(40000 - header.length - 4);
+    const { read } = fixture(
+      `<table class="wikitable"><tr><th>H</th></tr><tr><td>${value}</td></tr><tr><td>tail</td></tr></table>`,
+    );
+    const first = await read();
+    expect(Buffer.byteLength(first.content)).toBe(40000);
+    expect(first.tablePage).toMatchObject({ rows_returned: 2 });
+    expect(first.tablePage?.oversized_row).toBeUndefined();
+    const next = await read(first.tablePage?.next_cursor);
+    expect(next.content).toBe('| tail |');
+    expect(next.tablePage).toMatchObject({ row_offset: 2, rows_returned: 1 });
+    expect(next.tablePage?.next_cursor).toBeUndefined();
+  });
+
+  it.each(['header', 'data'] as const)(
+    'delivers an oversized %s row alone and then advances',
+    async (kind) => {
+      const huge = 'x'.repeat(40001);
+      const html =
+        kind === 'header'
+          ? `<table class="wikitable"><tr><th>${huge}</th></tr><tr><td>tail</td></tr></table>`
+          : `<table class="wikitable"><tr><th>H</th></tr><tr><td>${huge}</td></tr><tr><td>tail</td></tr></table>`;
+      const { read } = fixture(html);
+      let page = await read();
+      if (kind === 'data') page = await read(page.tablePage?.next_cursor);
+      expect(page.content).toContain(huge);
+      expect(page.tablePage).toMatchObject({ rows_returned: 1, oversized_row: true });
+      const tail = await read(page.tablePage?.next_cursor);
+      expect(tail.content).toBe('| tail |');
+      expect(tail.tablePage?.next_cursor).toBeUndefined();
+    },
+  );
+
+  it('counts only independently rendered tables in order and preserves nested cells and spans', async () => {
+    const { read } = fixture(
+      '<table role="presentation"><tr><td><table class="wikitable"><tr><th>H</th></tr><tr><td rowspan="2">X<table class="wikitable"><tr><td>Y<table><tr><td>Z</td></tr></table></td></tr></table></td><td>one</td></tr><tr><td>two</td></tr></table></td></tr></table><table class="infobox"><tr><th>Label:</th><td>Value</td></tr></table>',
+    );
+    const first = await read();
+    expect(first.content).toBe('| H |  |\n| --- | --- |\n| X; Y; Z | one |\n| X; Y; Z | two |');
+    expect(first.tablePage?.table_count).toBe(2);
+    expect((await read(undefined, 2)).content).toBe('Label: Value');
+    await expect(read(undefined, 3)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'invalid_table', availableCount: 2 },
+    });
+  });
+
+  it('pages infobox label/value rows and terminates empty tables', async () => {
+    const { read } = fixture(
+      `<table class="infobox"><caption>Box</caption><tr><th>One</th><td>${'v'.repeat(25000)}</td></tr><tr><th>Two:</th><td>${'w'.repeat(25000)}</td></tr></table><table class="wikitable"><caption>Empty</caption></table>`,
+    );
+    const first = await read();
+    expect(first.content).toBe(`Box\nOne: ${'v'.repeat(25000)}`);
+    const next = await read(first.tablePage?.next_cursor);
+    expect(next.content).toBe(`Two: ${'w'.repeat(25000)}`);
+    expect(next.tablePage?.next_cursor).toBeUndefined();
+    const empty = await read(undefined, 2);
+    expect(empty.content).toBe('Empty');
+    expect(empty.tablePage).toMatchObject({ rows_returned: 0, table_rows: 0 });
+    expect(empty.tablePage?.next_cursor).toBeUndefined();
+  });
+
+  it('fails when a pinned revision is unavailable or replaced, never reading current content', async () => {
+    const { read, action } = fixture(
+      `<table class="wikitable"><tr><th>H</th></tr><tr><td>${'x'.repeat(40001)}</td></tr></table>`,
+    );
+    const first = await read();
+    for (const response of [
+      { error: { code: 'nosuchrevid', info: 'missing revision' } },
+      { parse: { title: 'Tables', revid: 99, text: '<p>changed</p>' } },
+      { parse: { revid: 42 } },
+    ]) {
+      action.mockResolvedValue(response);
+      await expect(read(first.tablePage?.next_cursor)).rejects.toMatchObject({
+        data: { reason: 'revision_unavailable' },
+      });
+    }
+    expect(action).toHaveBeenCalledTimes(4);
+  });
+});
+
 /**
  * Fixture shaped like the `2024 United States presidential election` `Electoral results` table: a
  * caption, two header rows joined by `rowspan`, a `colspan` header over two columns, footnote
@@ -2429,6 +2592,13 @@ const INFOBOX_HTML = `<table class="infobox vcard"><tbody><tr><th colspan="2" cl
 <p>The <b>Eiffel Tower</b> is a lattice tower.</p>`;
 
 describe('htmlSectionToPlainText — data tables and infoboxes (issue #50)', () => {
+  it('keeps repeated rows and omits blank rows in an inline table (characterization #67)', () => {
+    expect(
+      htmlSectionToPlainText(
+        '<table class="wikitable"><tr><th>H</th></tr><tr><td></td></tr><tr><td>same</td></tr><tr><td>same</td></tr></table>',
+      ),
+    ).toBe('| H |\n| --- |\n| same |\n| same |');
+  });
   it('renders a data table as pipe rows, header row first, with its caption above', () => {
     expect(htmlSectionToPlainText(RESULTS_TABLE_HTML)).toBe(
       [
@@ -2524,7 +2694,7 @@ describe('htmlSectionToPlainText — data tables and infoboxes (issue #50)', () 
     const rows = Math.ceil(DATA_TABLE_MAX_BYTES / 100) + 1;
     const html = `<p>Lead.</p><table class="wikitable"><caption>Big</caption><tr><th>H</th></tr>${`<tr><td>${cell}</td></tr>`.repeat(rows)}</table><p>After.</p>`;
     expect(htmlSectionToPlainText(html)).toBe(
-      `Lead.\n\nBig\n\n[table omitted: ${rows + 1} rows]\n\nAfter.`,
+      `Lead.\n\nBig\n\n[table omitted: ${rows + 1} rows (table 1)]\n\nAfter.`,
     );
   });
 
@@ -3975,6 +4145,21 @@ describe('WikipediaService — contract envelopes stay single-request (issue #55
     useFakeClock();
   });
 
+  it('keeps an unknown refusal as a single-attempt service failure', async () => {
+    const { calls } = stubUpstream(
+      searchRequest,
+      envelope('unrecognized-refusal', 'Unknown refusal.'),
+    );
+    const { error } = await settle(
+      getWikipediaService().search('river intitle:/river/', 3, 'en', createMockContext()),
+    );
+    expect(calls()).toBe(1);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      message: 'Wikipedia API error: Unknown refusal.',
+    });
+  });
+
   it('missingtitle: one request, NotFound', async () => {
     const svc = getWikipediaService();
     const { calls } = stubUpstream(anyActionRequest, envelope('missingtitle'));
@@ -4000,6 +4185,28 @@ describe('WikipediaService — contract envelopes stay single-request (issue #55
     expect(error).toMatchObject({
       code: JsonRpcErrorCode.ValidationError,
       message: expect.stringContaining('Section index 99 does not exist'),
+      data: { reason: 'invalid_section', title: 'Python', sectionIndex: 99 },
+    });
+  });
+
+  it.each([
+    ['river insource:/[/', 'cirrussearch-regex-syntax-error'],
+    ['insource:/a{99999}/', 'cirrussearch-regex-too-complex-error'],
+    ['river intitle:/[/', 'cirrussearch-regex-syntax-error'],
+    ['intitle:/a{99999}/', 'cirrussearch-regex-too-complex-error'],
+  ])('classifies the regex refusal for %s without retrying', async (query, upstreamCode) => {
+    const { calls } = stubUpstream(searchRequest, envelope(upstreamCode!, 'Regex refused.'));
+    const { error } = await settle(
+      getWikipediaService().search(query!, 3, 'en', createMockContext()),
+    );
+    expect(calls()).toBe(1);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: {
+        reason: 'invalid_query',
+        upstreamCode,
+        recovery: { hint: expect.stringContaining('regex') },
+      },
     });
   });
 
@@ -4398,5 +4605,110 @@ describe('WikipediaService — transient envelopes are retried (issue #55)', () 
 
     expect(calls()).toBe(1);
     expect((await outcome).error).toMatchObject({ name: 'AbortError' });
+  });
+});
+
+/** The same-table sibling labels must pair only with the leaf in their own row. */
+const TREE =
+  '<table class="clade"><tr><td class="clade-label">Family</td><td class="clade-leaf"><table class="clade"><tr><td class="clade-label">Rosoideae</td><td class="clade-leaf"><table class="clade"><tr><td class="clade-label"></td><td class="clade-leaf">Roseae</td></tr><tr><td class="clade-label"></td><td class="clade-leaf">Rubeae</td></tr></table></td></tr><tr><td class="clade-slabel"></td></tr><tr><td class="clade-label">Dryadoideae</td><td class="clade-leaf">Dryadeae</td></tr></table></td></tr><tr><td class="clade-label"></td><td class="clade-leaf">outgroup</td></tr></table>';
+const RENDERED_TREE =
+  '```\n- Family\n  - Rosoideae\n    - Roseae\n    - Rubeae\n  - Dryadoideae\n    - Dryadeae\n- outgroup\n```';
+
+describe('rendering compatibility characterization', () => {
+  it('keeps nested cell tables flat and excluded furniture invisible', () => {
+    expect(
+      htmlSectionToPlainText(
+        '<p>Before.</p><table class="wikitable"><tr><th>H</th></tr><tr><td>A<table><tr><td>B</td></tr></table>C</td></tr></table><table class="navbox"><tr><td>hidden</td></tr></table><table><tr><td>chart</td></tr></table><p>After.</p>',
+      ),
+    ).toBe('Before.\n\n| H |\n| --- |\n| A; B; C |\n\nAfter.');
+  });
+
+  it('retains once-decoded TOC entities and conservative redirect indices', () => {
+    expect(tocLineToPlainText(' <span>A&nbsp; B</span> &amp;lt;ref&amp;gt; ')).toBe(
+      'A B &lt;ref&gt;',
+    );
+    expect(
+      redirectInfo([{ from: 'Alias', tofragment: 'Missing' }], { tocdata: { sections: [] } }),
+    ).toEqual({ redirected_from: 'Alias', redirect_section: 'Missing' });
+  });
+});
+
+describe('clade row pairing (#68)', () => {
+  beforeEach(() => vi.restoreAllMocks());
+
+  it('keeps sibling ancestry and terminal order through nested forks', () => {
+    expect(htmlSectionToPlainText(TREE)).toBe(RENDERED_TREE);
+    expect(
+      htmlSectionToPlainText(
+        `<table class="clade"><tr><td class="clade-label"></td><td class="clade-leaf">${TREE}</td></tr></table>`,
+      ),
+    ).toBe(
+      '```\n-\n  - Family\n    - Rosoideae\n      - Roseae\n      - Rubeae\n    - Dryadoideae\n      - Dryadeae\n  - outgroup\n```',
+    );
+  });
+
+  it.each([
+    '<table class="clade"></table>',
+    '<table class="clade"><tr><td class="clade-label">unpaired</td></tr></table>',
+    '<table class="clade"><tr><td class="clade-label"></td><td class="clade-leaf"></td></tr></table>',
+    '<table class="clade"><tr><td class="clade-label">A</td><td class="clade-leaf">B',
+    '<table class="clade"><tr><td class="clade-label">A</td><td class="clade-leaf"><table><tr><td>B</td></tr></table></td></tr></table>',
+  ])('marks unparseable trees: %s', (html) => {
+    expect(htmlSectionToPlainText(html)).toBe('[table omitted: unparseable clade]');
+  });
+
+  it('normalizes inline scripts, formulas, entities and sizes a safe fence', () => {
+    expect(
+      htmlSectionToPlainText(
+        '<table class="clade"><tr><td class="clade-label">CO<sub>2</sub></td><td class="clade-leaf"><math alttext="x^{2}"><mi>x</mi></math> &amp;lt; ```</td></tr></table>',
+      ),
+    ).toBe('````\n- CO₂\n  - x^{2} &lt; ```\n````');
+  });
+});
+
+describe('shared scientific heading normalization (#71)', () => {
+  beforeEach(() => vi.restoreAllMocks());
+
+  it.each([
+    (size: number) => '<sup'.repeat(Math.ceil(size / 4)),
+    (size: number) => '<sup>'.repeat(Math.ceil(size / 5)),
+    (size: number) => `${'x'.repeat(size)}\n`,
+    (size: number) => 'x\n'.repeat(Math.ceil(size / 2)),
+    (size: number) =>
+      `<table class="clade"><tr><td class="clade-label"></td><td class="clade-leaf">${'<table class="clade">'.repeat(Math.ceil(size / 21))}`,
+  ])('keeps normalization work bounded across input sizes', (input) => {
+    const samples: number[] = [];
+    for (const size of [1250, 2500, 5000, 10000, 20000, 40000, 80000]) {
+      const html = input(size);
+      tocLineToPlainText(html);
+      let fastestMs = Infinity;
+      for (let run = 0; run < 5; run++) {
+        const started = process.threadCpuUsage();
+        tocLineToPlainText(html);
+        const cpu = process.threadCpuUsage(started);
+        fastestMs = Math.min(fastestMs, (cpu.user + cpu.system) / 1000);
+      }
+      expect(fastestMs).toBeLessThan(2000);
+      samples.push(fastestMs);
+    }
+    expect((samples.at(-1) as number) / Math.max(samples[0] as number, 0.01)).toBeLessThanOrEqual(
+      256,
+    );
+  });
+
+  it.each([
+    ['CO<sub>2</sub> fertilization effect', 'CO₂ fertilization effect'],
+    ['x<sup>n</sup> N<sub>A</sub> 19<sup>th</sup>', 'xⁿ N_A 19^(th)'],
+    ['x<sup>a<sub>i</sub></sup>', 'x^(a_i)'],
+    ['<abbr>XIX<sup>e</sup></abbr> <abbr>1<sup>er</sup></abbr>', 'XIXe 1er'],
+    ['<span> A&nbsp; <b>B</b> </span> &amp;lt;ref&amp;gt;', 'A B &lt;ref&gt;'],
+    ['<math alttext="x^{2}"><mi>x</mi></math>', 'x^{2}'],
+    [
+      '<span style="display:none"><math alttext="x"><mi>x</mi></math></span><img class="mwe-math-fallback-image-inline" alt="x &amp; y">',
+      'x & y',
+    ],
+  ])('agrees with article headings for %s', (html, expected) => {
+    expect(tocLineToPlainText(html)).toBe(expected);
+    expect(htmlSectionToPlainText(`<h2>${html}</h2>`)).toBe(`== ${expected} ==`);
   });
 });

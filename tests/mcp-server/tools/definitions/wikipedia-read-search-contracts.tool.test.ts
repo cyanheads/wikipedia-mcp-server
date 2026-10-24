@@ -7,6 +7,7 @@ import {
   createMockContext,
   runToolContract,
 } from '@cyanheads/mcp-ts-core/testing';
+import { encodeCursor } from '@cyanheads/mcp-ts-core/utils';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { wikipediaGetArticle } from '@/mcp-server/tools/definitions/wikipedia-get-article.tool.js';
 import { wikipediaGetSections } from '@/mcp-server/tools/definitions/wikipedia-get-sections.tool.js';
@@ -30,6 +31,333 @@ afterEach(() => {
 function text(result: { content: Array<{ type: string; text?: string }> }): string {
   return result.content.map((block) => block.text ?? '').join('\n');
 }
+
+function expectActionRequests(calls: readonly { request: Request }[], action: string): void {
+  for (const { request } of calls) {
+    const url = new URL(request.url);
+    expect(request.method).toBe('GET');
+    expect(url.origin).toBe('https://example.org');
+    expect(url.pathname).toBe('/w/api.php');
+    expect(url.searchParams.get('action')).toBe(action);
+    expect(request.headers.get('User-Agent')).toBe('test');
+    expect(request.headers.get('accept')).toBe('application/json');
+  }
+}
+
+const tableRequest = { title: 'Tables', language: 'en', section_index: 1, table_index: 1 };
+const tableCursor = {
+  kind: 'wikipedia_table_v1',
+  title: 'Tables',
+  language: 'en',
+  sectionIndex: 1,
+  tableIndex: 1,
+  revisionId: 42,
+  offset: 1,
+  limit: 40000,
+};
+
+it('propagates caller cancellation through a pinned table fetch without restarting (#67)', async () => {
+  const caller = new AbortController();
+  const http = createFetchMock([
+    {
+      match: () => true,
+      respond: () => {
+        caller.abort();
+        throw new DOMException('Stop table read', 'AbortError');
+      },
+    },
+  ]);
+  http.install();
+  try {
+    const result = await runToolContract(
+      wikipediaGetArticle,
+      { ...tableRequest, cursor: encodeCursor(tableCursor) },
+      { context: { signal: caller.signal } },
+    );
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: { code: JsonRpcErrorCode.RequestCancelled },
+    });
+    expect(text(result)).toContain('was aborted');
+    expect(http.calls).toHaveLength(1);
+    expectActionRequests(http.calls, 'parse');
+    expect(new URL(http.calls[0]!.request.url).searchParams.get('oldid')).toBe('42');
+  } finally {
+    http.restore();
+  }
+});
+
+it.each([
+  { input: { title: 'Tables', table_index: 1 }, reason: 'invalid_table' },
+  { input: { title: 'Tables', section_index: 1, cursor: 'bad' }, reason: 'invalid_table' },
+  ...[
+    'bad',
+    encodeCursor({ ...tableCursor, offset: 1.5 }),
+    encodeCursor({ ...tableCursor, revisionId: 0 }),
+    encodeCursor({ ...tableCursor, title: 'Other' }),
+    encodeCursor({ ...tableCursor, language: 'fr' }),
+    encodeCursor({ ...tableCursor, sectionIndex: 2 }),
+    encodeCursor({ ...tableCursor, tableIndex: 2 }),
+    encodeCursor({ ...tableCursor, limit: 100 }),
+    encodeCursor({ ...tableCursor, extra: true }),
+  ].map((cursor) => ({ input: { ...tableRequest, cursor }, reason: 'invalid_cursor' })),
+])('rejects $reason before any upstream call on both surfaces (#67)', async ({ input, reason }) => {
+  const fetch = vi.spyOn(globalThis, 'fetch');
+  const result = await runToolContract(wikipediaGetArticle, input);
+  expect(result.isError).toBe(true);
+  expect(result.structuredContent).toMatchObject({
+    error: {
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason, recovery: { hint: expect.stringContaining('table_index') } },
+    },
+  });
+  expect(text(result)).toContain(reason);
+  expect(text(result)).toContain('table_index');
+  expect(fetch).not.toHaveBeenCalled();
+});
+
+it.each([
+  {
+    response: {
+      parse: {
+        title: 'Tables',
+        revid: 42,
+        text: '<table class="wikitable"><tr><th>H</th></tr></table>',
+      },
+    },
+    input: { ...tableRequest, table_index: 2 },
+    reason: 'invalid_table',
+    code: JsonRpcErrorCode.ValidationError,
+  },
+  {
+    response: {
+      parse: {
+        title: 'Tables',
+        revid: 42,
+        text: '<table class="wikitable"><tr><th>H</th></tr></table>',
+      },
+    },
+    input: { ...tableRequest, cursor: encodeCursor({ ...tableCursor, offset: 999 }) },
+    reason: 'invalid_cursor',
+    code: JsonRpcErrorCode.ValidationError,
+  },
+  {
+    response: { error: { code: 'nosuchrevid', info: 'missing' } },
+    input: { ...tableRequest, cursor: encodeCursor(tableCursor) },
+    reason: 'revision_unavailable',
+    code: JsonRpcErrorCode.ServiceUnavailable,
+  },
+])(
+  'renders service $reason with recovery on both surfaces (#67)',
+  async ({ response, input, reason, code }) => {
+    const http = createFetchMock([{ match: () => true, respond: () => Response.json(response) }]);
+    http.install();
+    try {
+      const result = await runToolContract(wikipediaGetArticle, input);
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: { code, data: { reason, recovery: { hint: expect.any(String) } } },
+      });
+      expect(text(result)).toContain(reason);
+      expect(text(result)).toContain('Recovery:');
+      expect(http.calls).toHaveLength(1);
+      expectActionRequests(http.calls, 'parse');
+      expect(new URL(http.calls[0]!.request.url).searchParams.get('section')).toBe('1');
+    } finally {
+      http.restore();
+    }
+  },
+);
+
+it('carries paged rows, revision, cursor and oversize disclosure on both surfaces (#67)', async () => {
+  const value = 'é_*'.repeat(7000);
+  const html = `<table class="wikitable"><caption>Cap</caption><tr><th>H</th></tr><tr><td>${value}</td></tr><tr><td>tail</td></tr></table>`;
+  const http = createFetchMock([
+    {
+      match: () => true,
+      respond: () => Response.json({ parse: { title: 'Tables', revid: 42, text: html } }),
+    },
+  ]);
+  http.install();
+  try {
+    const first = await runToolContract(wikipediaGetArticle, { ...tableRequest, cursor: '' });
+    const page1 = wikipediaGetArticle.output.parse(first.structuredContent);
+    expect(page1.content).toBe('Cap\n\n| H |\n| --- |');
+    expect(page1.next_cursor).toBeTruthy();
+    expect(text(first)).toContain(page1.next_cursor);
+    const second = await runToolContract(wikipediaGetArticle, {
+      ...tableRequest,
+      cursor: page1.next_cursor,
+    });
+    const page2 = wikipediaGetArticle.output.parse(second.structuredContent);
+    expect(page2.content).toBe(`| ${value} |`);
+    expect(page2).toMatchObject({
+      oversized_row: true,
+      revision_id: '42',
+      rows_returned: 1,
+      row_offset: 1,
+      table_continued: true,
+      truncated: false,
+    });
+    expect(text(second)).toContain('**Oversized row:** true');
+    expect(text(second)).toContain('**Revision ID:** 42');
+    expect(text(second)).toContain(`\\| ${'é\\_\\*'.repeat(7000)} \\|`);
+    expect(text(second)).toContain(page2.next_cursor);
+    const last = await runToolContract(wikipediaGetArticle, {
+      ...tableRequest,
+      cursor: page2.next_cursor,
+    });
+    expect(last.structuredContent).toMatchObject({
+      content: '| tail |',
+      row_offset: 2,
+      rows_returned: 1,
+    });
+    expect(last.structuredContent).not.toHaveProperty('next_cursor');
+    expect(text(last)).toContain('\\| tail \\|');
+    expect(http.calls).toHaveLength(3);
+    expectActionRequests(http.calls, 'parse');
+    expect(new URL(http.calls[0]!.request.url).searchParams.get('page')).toBe('Tables');
+    for (const { request } of http.calls.slice(1)) {
+      const params = new URL(request.url).searchParams;
+      expect(params.get('oldid')).toBe('42');
+      expect(params.has('page')).toBe(false);
+      expect(params.get('section')).toBe('1');
+    }
+  } finally {
+    http.restore();
+  }
+});
+
+it('characterizes an empty valid regex search through the HTTP seam', async () => {
+  const http = createFetchMock([
+    {
+      match: () => true,
+      respond: () => Response.json({ query: { search: [], searchinfo: { totalhits: 0 } } }),
+    },
+  ]);
+  http.install();
+  try {
+    const result = await runToolContract(wikipediaSearchArticles, {
+      query: 'river intitle:/river/',
+    });
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({ results: [], totalCount: 0 });
+    expect(text(result)).toContain('No Wikipedia articles found');
+    expect(http.calls).toHaveLength(1);
+    expectActionRequests(http.calls, 'query');
+    expect(new URL(http.calls[0]!.request.url).searchParams.get('srsearch')).toBe(
+      'river intitle:/river/',
+    );
+  } finally {
+    http.restore();
+  }
+});
+
+it.each(['cirrussearch-regex-syntax-error', 'cirrussearch-regex-too-complex-error'])(
+  'renders %s as invalid_query with upstream code and recovery on both surfaces',
+  async (upstreamCode) => {
+    const http = createFetchMock([
+      {
+        match: () => true,
+        respond: () => Response.json({ error: { code: upstreamCode, info: 'Regex refused.' } }),
+      },
+    ]);
+    http.install();
+    try {
+      const result = await runToolContract(wikipediaSearchArticles, {
+        query: 'river insource:/[/',
+      });
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: {
+            reason: 'invalid_query',
+            upstreamCode,
+            recovery: { hint: expect.stringContaining('regex') },
+          },
+        },
+      });
+      expect(text(result)).toContain('invalid_query');
+      expect(text(result)).toContain(upstreamCode);
+      expect(text(result)).toContain('regex');
+      expect(text(result)).toContain('remove');
+      expect(http.calls).toHaveLength(1);
+      expectActionRequests(http.calls, 'query');
+      expect(new URL(http.calls[0]!.request.url).searchParams.get('srsearch')).toBe(
+        'river insource:/[/',
+      );
+    } finally {
+      http.restore();
+    }
+  },
+);
+
+it.each([
+  {
+    code: 'invalidtitle',
+    title: `Seine${String.fromCharCode(1)}`,
+    section_index: 0,
+    reason: 'invalid_title',
+    recovery: 'wikipedia_search_articles',
+  },
+  {
+    code: 'nosuchsection',
+    title: 'Seine',
+    section_index: 99999,
+    reason: 'invalid_section',
+    recovery: 'wikipedia_get_sections',
+  },
+  {
+    code: 'missingtitle',
+    title: 'Missing article',
+    section_index: 0,
+    reason: 'not_found',
+    recovery: 'wikipedia_search_articles',
+  },
+])(
+  'preserves $reason from the section service on both surfaces',
+  async ({ code, title, section_index, reason, recovery }) => {
+    const http = createFetchMock([
+      {
+        match: () => true,
+        respond: () => Response.json({ error: { code, info: 'Upstream refusal.' } }),
+      },
+    ]);
+    http.install();
+    try {
+      const result = await runToolContract(wikipediaGetArticle, { title, section_index });
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: { data: { reason, recovery: { hint: expect.stringContaining(recovery) } } },
+      });
+      expect(text(result)).toContain(reason);
+      expect(text(result)).toContain(recovery);
+      if (reason === 'invalid_title') expect(text(result)).not.toContain('wikipedia_get_sections');
+      expect(http.calls).toHaveLength(1);
+      expectActionRequests(http.calls, 'parse');
+      const params = new URL(http.calls[0]!.request.url).searchParams;
+      expect(params.get('page')).toBe(title);
+      expect(params.get('section')).toBe(String(section_index));
+    } finally {
+      http.restore();
+    }
+  },
+);
+
+it('passes an unrelated section ValidationError through without inventing a reason', async () => {
+  const error = new McpError(JsonRpcErrorCode.ValidationError, 'Unrelated caller refusal.', {
+    reason: 'another_input',
+    recovery: { hint: 'Correct the unrelated input and try again.' },
+  });
+  vi.spyOn(getWikipediaService(), 'getArticleSection').mockRejectedValue(error);
+  await expect(
+    wikipediaGetArticle.handler(
+      wikipediaGetArticle.input.parse({ title: 'Seine', section_index: 0 }),
+      createMockContext({ errors: wikipediaGetArticle.errors }),
+    ),
+  ).rejects.toBe(error);
+});
 
 it('characterizes full reads and lead/child structure without a TOC lookup', async () => {
   const request = vi.spyOn(getWikipediaService(), 'actionGet').mockResolvedValue({

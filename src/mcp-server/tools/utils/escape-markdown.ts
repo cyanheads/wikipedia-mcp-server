@@ -3,7 +3,7 @@
  * @module mcp-server/tools/utils/escape-markdown
  */
 
-import { splitTextBlocks, tableRow } from '@/services/wikipedia/text-blocks.js';
+import { parseTableRow, splitTextBlocks, tableRow } from '@/services/wikipedia/text-blocks.js';
 
 /**
  * Characters that open a markdown or HTML construct anywhere in a line.
@@ -77,4 +77,16 @@ export function escapeMarkdownOutsideBlocks(text: string): string {
       }
     })
     .join('\n');
+}
+
+/** Keep headerless table-page rows on separate visible lines in Markdown. */
+export function formatTablePage(text: string, continuation: boolean): string {
+  if (!continuation) return escapeMarkdownOutsideBlocks(text);
+  return text
+    .split('\n')
+    .map((line) => {
+      const cells = parseTableRow(line);
+      return escapeMarkdown(cells ? tableRow(cells, (cell) => cell) : line);
+    })
+    .join('  \n');
 }

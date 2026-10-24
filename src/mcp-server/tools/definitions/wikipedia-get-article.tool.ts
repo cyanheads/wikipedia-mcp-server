@@ -10,8 +10,10 @@ import { getServerConfig } from '@/config/server-config.js';
 import {
   escapeMarkdown,
   escapeMarkdownOutsideBlocks,
+  formatTablePage,
 } from '@/mcp-server/tools/utils/escape-markdown.js';
 import {
+  articleTableRead,
   getWikipediaService,
   isBlankTitle,
   isInvalidTitle,
@@ -25,7 +27,7 @@ import {
 export const wikipediaGetArticle = tool('wikipedia_get_article', {
   title: 'Get Wikipedia Article',
   description:
-    'Fetch article content as clean plain text. Without section_index: returns the full article with == Section == markers preserved for structure — or, when the article exceeds the size budget, a compact section outline (truncated: true) that points to wikipedia_get_sections plus a section_index read instead of the full text. With section_index (from wikipedia_get_sections): returns that section and every subsection nested under it, each heading above its own body. section_index 0 is the lead section, the text above the first heading, which is the full prose wikipedia_get_summary returns only a truncated fragment of. Section-targeted reads are faster and smaller when only part of the article is needed. Both paths keep superscripts and subscripts apart from the text beside them (10²³, H₂O), render formulas as their TeX, and render code samples as fenced blocks with their indentation intact. A section read also renders data tables as pipe-delimited rows (header row first) and infoboxes as "label: value" lines; a table too large to include leaves a "[table omitted: N rows]" marker in its place. The full-article path carries no data tables or infoboxes, so read the section for those. Tables used only for layout, such as multi-column lists, keep their content as ordinary text. Page furniture is omitted as well — maintenance banners, sister-project and library-resource boxes, portal bars, and spoken-article notices — while a hatnote naming a related article is kept. Every read returns the canonical article URL and the ID of the revision it was read from, for citation; a full read also returns that revision\'s timestamp. Redirect pages are followed automatically, and the citation fields name the target article.',
+    'Fetch article content as clean plain text. Without section_index: returns the full article with == Section == markers preserved for structure — or, when the article exceeds the size budget, a compact section outline (truncated: true) that points to wikipedia_get_sections plus a section_index read instead of the full text. With section_index (from wikipedia_get_sections): returns that section and every subsection nested under it, each heading above its own body. section_index 0 is the lead section, the text above the first heading, which is the full prose wikipedia_get_summary returns only a truncated fragment of. Section-targeted reads are faster and smaller when only part of the article is needed. Both paths keep superscripts and subscripts apart from the text beside them (10²³, H₂O), render formulas as their TeX, and render code samples as fenced blocks with their indentation intact. A section read also renders data tables as pipe-delimited rows (header row first) and infoboxes as "label: value" lines; a table too large to include leaves a "[table omitted: N rows (table T)]" marker. Pass table_index: T with section_index to read only that table in complete row pages within 40,000 UTF-8 bytes on both surfaces. Follow next_cursor as cursor with the same inputs to continue at the pinned revision; caption/header/delimiter appear once. An indivisible oversized row or first-page caption/header is returned alone with oversized_row: true. The full-article path carries no data tables or infoboxes, so read the section for those. Phylogenetic clade trees render as fenced, indented branches, with unnamed forks preserved; unparseable trees leave "[table omitted: unparseable clade]". Clade trees have no table_index. Tables used only for layout, such as multi-column lists, keep their content as ordinary text. Page furniture is omitted as well — maintenance banners, sister-project and library-resource boxes, portal bars, and spoken-article notices — while a hatnote naming a related article is kept. Every read returns the canonical article URL and the ID of the revision it was read from, for citation; a full read also returns that revision\'s timestamp. Redirect pages are followed automatically, and the citation fields name the target article.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     title: z
@@ -41,12 +43,50 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
       .describe(
         'Section index from wikipedia_get_sections. 0 reads the lead section (Introduction) — the text above the first heading. Omit for the full article. Providing this returns the targeted section plus every subsection nested under it, as plain text.',
       ),
+    table_index: z
+      .number()
+      .int()
+      .min(1)
+      .optional()
+      .describe(
+        '1-based outer wikitable or infobox ordinal in the section. Requires section_index. Returns only that table in complete row pages; nested cell tables have no ordinal.',
+      ),
+    cursor: z
+      .string()
+      .optional()
+      .describe(
+        'Opaque next_cursor from the previous table page. Keep title, language, section_index and table_index unchanged. Empty means the first page.',
+      ),
     language: z
       .string()
       .default('en')
       .describe('Wikipedia language edition code (default "en"). Examples: "fr", "de", "ja".'),
   }),
   output: z.object({
+    table_index: z.number().optional().describe('Selected table ordinal, for table reads only.'),
+    table_count: z
+      .number()
+      .optional()
+      .describe('Available outer data tables in the pinned section.'),
+    table_rows: z
+      .number()
+      .optional()
+      .describe('Total rendered rows, including the first header row.'),
+    row_offset: z.number().optional().describe('Zero-based first row position in this page.'),
+    rows_returned: z.number().optional().describe('Number of complete rows returned in this page.'),
+    table_continued: z.boolean().optional().describe('True for a headerless continuation page.'),
+    next_cursor: z
+      .string()
+      .optional()
+      .describe(
+        'Pass unchanged as cursor with the same table request to read the pinned revision. Absent on the final page.',
+      ),
+    oversized_row: z
+      .boolean()
+      .optional()
+      .describe(
+        'True when an indivisible row or first-page caption/header exceeds the 40,000-byte table-text budget and is returned alone.',
+      ),
     redirected_from: z
       .string()
       .optional()
@@ -121,6 +161,28 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
 
   errors: [
     {
+      reason: 'invalid_table',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A table selector is unavailable or section_index/table_index is missing for a table read.',
+      recovery: 'Provide section_index and a table_index within the available table count.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'invalid_cursor',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A table cursor is malformed, mismatched, or points past the pinned table.',
+      recovery:
+        'Pass the previous next_cursor unchanged with the same title, language, section_index and table_index, or omit cursor to restart.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'revision_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'The pinned table revision cannot be read or verified.',
+      recovery: 'Retry the same cursor; omit cursor only to start a new revision.',
+      thrownBy: 'service',
+    },
+    {
       reason: 'not_found',
       code: JsonRpcErrorCode.NotFound,
       when: 'No Wikipedia article exists for the given title.',
@@ -139,6 +201,7 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
       code: JsonRpcErrorCode.ValidationError,
       when: 'The section_index is out of range for this article.',
       recovery: 'Call wikipedia_get_sections first to obtain valid section_index values.',
+      thrownBy: 'service',
     },
     {
       reason: 'invalid_language',
@@ -151,6 +214,14 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
   async handler(input, ctx) {
     const { language } = input;
     const svc = getWikipediaService();
+    const tableRead = articleTableRead(
+      input.title,
+      language,
+      input.section_index,
+      input.table_index,
+      input.cursor,
+      ctx,
+    );
 
     // Validate language code eagerly so the contract reason appears in data.reason.
     if (isMalformedLanguage(language)) {
@@ -207,20 +278,15 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
       });
       let result: Awaited<ReturnType<typeof svc.getArticleSection>>;
       try {
-        result = await svc.getArticleSection(input.title, input.section_index, language, ctx);
+        result = tableRead
+          ? await svc.getArticleSection(input.title, input.section_index, language, ctx, tableRead)
+          : await svc.getArticleSection(input.title, input.section_index, language, ctx);
       } catch (err) {
         if (err instanceof McpError && err.code === JsonRpcErrorCode.NotFound) {
           throw ctx.fail('not_found', err.message, {
             title: input.title,
             language,
             recovery: { hint: 'Use wikipedia_search_articles to find the correct article title.' },
-          });
-        }
-        if (err instanceof McpError && err.code === JsonRpcErrorCode.ValidationError) {
-          throw ctx.fail('invalid_section', err.message, {
-            title: input.title,
-            sectionIndex: input.section_index,
-            recovery: { hint: 'Call wikipedia_get_sections to obtain valid section_index values.' },
           });
         }
         throw err;
@@ -234,6 +300,7 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
         title: result.title,
         pageid: result.pageid,
         content: result.content,
+        ...result.tablePage,
         section_title: result.sectionTitle,
         content_type: 'section',
         truncated: false,
@@ -408,6 +475,19 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
     if (result.url) lines.push(`**URL:** ${result.url}`);
     if (result.revision_id) lines.push(`**Revision ID:** ${result.revision_id}`);
     if (result.last_modified) lines.push(`**Last modified:** ${result.last_modified}`);
+    if (result.table_index !== undefined) lines.push(`**Table index:** ${result.table_index}`);
+    if (result.table_count !== undefined) lines.push(`**Table count:** ${result.table_count}`);
+    if (result.table_rows !== undefined) lines.push(`**Table rows:** ${result.table_rows}`);
+    if (result.row_offset !== undefined) lines.push(`**Row offset:** ${result.row_offset}`);
+    if (result.rows_returned !== undefined)
+      lines.push(`**Rows returned:** ${result.rows_returned}`);
+    if (result.table_continued !== undefined)
+      lines.push(`**Table continued:** ${result.table_continued}`);
+    if (result.next_cursor) lines.push(`**Next cursor:** ${result.next_cursor}`);
+    if (result.oversized_row !== undefined)
+      lines.push(
+        `**Oversized row:** ${result.oversized_row} — an indivisible row or caption/header is returned alone above the 40,000-byte table-text budget.`,
+      );
     // Overflow disclosure — render each field on its own presence, never as mutually-exclusive
     // branches, so format-parity's all-fields-populated sample renders every field.
     if (result.truncated) {
@@ -425,7 +505,11 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
     // Prose escapes like every other upstream string; a fenced code block and a table row's
     // delimiters are the renderer's own syntax and pass through. The outline the overflow path writes
     // rides in `content` too, so its bullets escape with the section names they carry.
-    lines.push(escapeMarkdownOutsideBlocks(result.content));
+    lines.push(
+      result.table_index !== undefined
+        ? formatTablePage(result.content, result.table_continued === true)
+        : escapeMarkdownOutsideBlocks(result.content),
+    );
     return [{ type: 'text', text: lines.join('\n') }];
   },
 });

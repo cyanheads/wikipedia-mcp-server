@@ -147,6 +147,14 @@ export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
 
   errors: [
     {
+      reason: 'invalid_query',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'CirrusSearch refuses a regex because its syntax is invalid or it is too complex.',
+      recovery:
+        'Correct or simplify the regex, or remove the insource:/…/ or intitle:/…/ operator and try again.',
+      thrownBy: 'service',
+    },
+    {
       reason: 'empty_query',
       code: JsonRpcErrorCode.ValidationError,
       when: 'The query is an empty string, which Wikipedia reads as a missing parameter.',
