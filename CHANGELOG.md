@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.7](changelog/0.2.x/0.2.7.md) — 2026-10-24
+
+Read existing pages without summaries and follow verified section navigation.
+
 ## [0.2.6](changelog/0.2.x/0.2.6.md) — 2026-10-08
 
 Framework 0.13.6 → 0.13.14: numeric strings and null optionals in tool arguments are repaired instead of rejected, error results carry a request ID and no longer expose stack traces or request context, and the server.json HTTP entry selects the HTTP transport.
