@@ -20,7 +20,7 @@ Each call reads one edition. No tool searches several editions at once, and none
 | Title | Search results, the resolved `title` of any read, `languages[].title` from wikipedia_get_languages | Belongs to one edition. The same spelling can name a different subject elsewhere: `Gift` is the present article on en (Q184303) and the poison article on de (Q40867) |
 | Edition (`language`) | `edition_code` from wikipedia_get_languages | Simple English is `simple` |
 | `section_index` | `index` from wikipedia_get_sections, or the `(section_index: N)` labels on an outlined full read | Not the `number` column. On `Seine`, index 10 is section number "6" |
-| QID (`wikibase_item`) | wikipedia_get_summary, plus every search and nearby result | The same across editions (`Seine` is Q1471 on en, fr, and simple). Output only: as a title it fails `not_found`, and as a query it matches nothing |
+| QID (`wikibase_item`) | wikipedia_get_summary, search results, and nearby results, each when present | The same across editions (`Seine` is Q1471 on en, fr, and simple). Output only: as a title it fails `not_found`, and as a query it matches nothing |
 | Coordinates | `latitude`/`longitude` on wikipedia_get_summary | Geotags belong to each edition's article. `Seine` has them on en but not on fr |
 
 ## Gates
