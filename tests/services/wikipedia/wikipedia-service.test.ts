@@ -5130,15 +5130,12 @@ describe('extractReferences — work stays linear in the payload (#72)', () => {
       (n: number) => inEntry(fill('<a class="external" href="https://doi.org/10.1%2F', n)),
     ],
     // The renderer's attribute rules, reached through the footnote text it renders.
-    ['repeated image openers, never closed', (n: number) => inEntry(`${fill('<img ', n)}>`)],
+    ['image tags in a footnote', (n: number) => inEntry(`${fill('<img ', n)}>`)],
     [
-      'repeated formula-image openers, never closed',
+      'formula images in a footnote',
       (n: number) => inEntry(`${fill('<img class="mwe-math-fallback-image-', n)}>`),
     ],
-    [
-      'repeated formula openers, never closed',
-      (n: number) => inEntry(`${fill('<math alttext="x', n)}>`),
-    ],
+    ['formulas in a footnote', (n: number) => inEntry(`${fill('<math alttext="x', n)}>`)],
     [
       'one open tag of attributes ending in a rule’s name',
       (n: number) =>

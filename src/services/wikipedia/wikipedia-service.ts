@@ -241,8 +241,7 @@ const OPEN_TAG = /<([a-z][a-z0-9]*)\b[^>]*>/i;
  * keeps the formula, which lived only inside that twin's `<annotation>` before.
  *
  * The tag's own text stops at a `<` as well as at its `>`: the parser escapes both inside attribute
- * values (`alt="{\displaystyle H&gt;0}"`), so stopping there never cuts a real tag short and keeps
- * the scan linear in the payload.
+ * values (`alt="{\displaystyle H&gt;0}"`), so stopping there never cuts a real tag short.
  */
 const MATH_FALLBACK_IMAGE =
   /<img\b[^<>]*(?<=\s)class\s*=\s*"[^"]*\bmwe-math-fallback-image-[^"]*"[^<>]*>/gi;
@@ -256,7 +255,7 @@ const ALT_ATTRIBUTE = /(?<=\s)alt\s*=\s*"([^"]*)"/i;
  * read attribute by attribute because that TeX holds a literal `>` (`\varepsilon >0`), which would
  * end a `[^>]*` match mid-attribute and spill the rest of the formula into the text. A `<` ends the
  * open tag's scan, quoted or not: TextExtracts escapes it in an attribute (`0&lt;|x-p|`), so stopping
- * there never cuts a real tag short and keeps the scan linear in the payload. The body cannot run
+ * there never cuts a real tag short. The body cannot run
  * into another `<math`, so an unclosed formula swallows nothing past the next one.
  */
 const MATH_ELEMENT = /<math\b((?:"[^"<]*"|'[^'<]*'|[^<>"'])*)>(?:(?!<math\b)[\s\S])*?<\/math\s*>/gi;
