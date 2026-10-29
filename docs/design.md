@@ -12,6 +12,7 @@
 | `wikipedia_get_sections` | Fetch the table of contents for an article — section titles, numbers, levels, and `section_index` values, led by the index-0 `Introduction` entry for the lead. Call this before `wikipedia_get_article` when only a specific section is needed. The returned `section_index` values are the identifiers for targeted section reads. | `title`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `invalid_title` (ValidationError), `no_sections` (NotFound), `invalid_language` (ValidationError) |
 | `wikipedia_search_nearby` | Find Wikipedia articles about places near a geographic coordinate. Returns articles within a radius, sorted by distance, with short descriptions and Wikidata QIDs. Useful for "what's notable near X?" research. | `latitude`, `longitude`, `radius_meters`, `limit`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `invalid_language` (ValidationError); coordinate ranges fail input validation |
 | `wikipedia_get_languages` | List the language editions available for an article. Returns each edition's language code, tool-usable subdomain code, article title, and URL. Pass `editions` to narrow the list to specific codes; unmatched ones come back under `missing`. Use for cross-language research or to find a non-English article title for a known concept. | `title`, `language`, `editions` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `invalid_title` (ValidationError), `no_other_languages` (NotFound), `invalid_language` (ValidationError) |
+| `wikipedia_get_references` | List the footnotes an article cites — its reference lists, in document order — with each footnote's text, external links (archive copies included), and DOIs. Short citations carry `work_ids`, and `works` holds the full citations they name. Pages hold whole footnotes within 40,000 UTF-8 bytes; `next_cursor` continues at the same revision. Use for the sources behind a claim; `wikipedia_get_article` drops footnote markers and reference lists. | `title`, `cursor`, `language` | `readOnlyHint: true`, `openWorldHint: true` | `not_found` (NotFound), `invalid_title` (ValidationError), `invalid_cursor` (ValidationError), `revision_unavailable` (ServiceUnavailable), `invalid_language` (ValidationError) |
 
 ### Resources
 
@@ -25,7 +26,7 @@ None. This is a pure data-access server.
 
 ## Overview
 
-Wikipedia MCP server providing encyclopedic context to AI agents via the MediaWiki REST API (`/api/rest_v1/`) and Action API (`api.php`). Covers the dominant agent knowledge workflow — "what is X?" — plus targeted section reading, full-text search, geographic search, and cross-language lookup. No auth required; polite usage policy with a custom `User-Agent` header.
+Wikipedia MCP server providing encyclopedic context to AI agents via the MediaWiki REST API (`/api/rest_v1/`) and Action API (`api.php`). Covers the dominant agent knowledge workflow — "what is X?" — plus targeted section reading, full-text search, geographic search, cross-language lookup, and an article's cited footnotes. No auth required; polite usage policy with a custom `User-Agent` header.
 
 Complements `wikidata-mcp-server` (structured triples, SPARQL, entity properties) — this server provides the human-readable prose and narrative context that structured data can't.
 
@@ -65,6 +66,7 @@ No API key needed. By default, language is a per-call parameter on every tool (d
 6. `wikipedia_get_article` — full-article path (`action=query&prop=extracts`) and section path (`action=parse&prop=text` rendered to plain text)
 7. `wikipedia_get_languages` — Action API `action=query&prop=langlinks`
 8. `wikipedia_search_nearby` — Action API `action=query&list=geosearch`, with the same geosearch as a generator in the same request for descriptions and QIDs
+9. `wikipedia_get_references` — Action API `action=parse&prop=text|revid` over the full page, footnotes extracted from the parser's HTML and paged under a revision-pinned cursor
 
 Each step is independently testable.
 
@@ -72,9 +74,27 @@ Each step is independently testable.
 
 ## Design Decisions
 
-### Tool count: 6 instead of 7
+### Tool count: 7
 
-The idea doc proposed `wikipedia_random`. Deferred — random article retrieval has no agent workflow that justifies a dedicated tool. Agents exploring Wikipedia for research or testing can use `wikipedia_search_articles` with broad queries. The Action API has `action=query&list=random` if demand warrants it later.
+Six tools cover search, summary, article and section reads, nearby search, and language editions. The seventh, `wikipedia_get_references`, exists because no other tool returns an article's cited sources: section and full reads drop footnote markers and reference lists, so a "References" section reads as its heading alone (see [`wikipedia_get_references` is a tool, not a mode of `wikipedia_get_article`](#wikipedia_get_references-is-a-tool-not-a-mode-of-wikipedia_get_article)).
+
+The idea doc also proposed `wikipedia_random`. Deferred — random article retrieval has no agent workflow that justifies a dedicated tool. Agents exploring Wikipedia for research or testing can use `wikipedia_search_articles` with broad queries. The Action API has `action=query&list=random` if demand warrants it later.
+
+### `wikipedia_get_references` is a tool, not a mode of `wikipedia_get_article`
+
+The footnotes an article cites are a different shape from article text: a list of entries with ids, labels, links, and DOIs, not one `content` string. A `mode` on `wikipedia_get_article` would add a third output shape to a tool whose contract is one text field, the same objection that keeps the summary a separate tool (see [Summary vs. article](#summary-vs-article-two-tools-with-a-clear-contract)). Decisions:
+
+- **One full-page `action=parse&prop=text|revid`, redirects followed.** A section parse cannot replace it: it renumbers footnote anchors and turns a reference defined in another section into a cite error. REST `mobile-html` was measured and rejected (larger than the parse for `Augustus`, a stale revision through the `Obama` redirect, one 404 for missing and invalid titles, and HTML the JSON fetch path rejects), as were REST `page/html` (about 1.5× the parse) and `wikitext`/`parsetree` (templates unexpanded).
+- **Entries come from the parsed HTML, not wikitext.** Each footnote's `text` is its `span.reference-text` through the shared renderer, inner markers kept as `[label]`; `urls` are every external link verbatim, archive copies included; `dois` come from `doi.org` links, percent-decoded; `group` is the list's `data-mw-group`; `label` is the in-text marker without brackets. A short citation (`{{sfn}}`) carries `work_ids`, the `CITEREF…` anchors it links to, and `works` holds the full citations those anchors resolve to, once per page. Bibliography and further-reading entries no footnote links to are not listed; a section read already returns them.
+- **The page budget is 40,000 UTF-8 bytes, measured on both surfaces.** The same figure as a data-table page (`REFERENCES_PAGE_MAX_BYTES` equals `DATA_TABLE_MAX_BYTES`), applied to the whole page as `JSON.stringify` of the output and as the `format()` text. A page holds the most whole footnotes that fit; a single footnote over budget comes back alone, so the walk always advances.
+- **The cursor pins the revision.** It binds title, language, revision, and offset, is validated before any upstream call, and continuation parses `oldid` instead of `page`, so an edit between pages cannot skip or repeat a footnote. A cursor offset at or past the pinned revision's last footnote fails `invalid_cursor`, and an unreadable pinned revision fails `revision_unavailable` rather than falling back to current content.
+- **Every page repeats the full parse.** There is no cross-page cache, so the parse gets a 25 s per-attempt timeout (`REFERENCES_PARSE_TIMEOUT_MS`) inside the 30 s `REQUEST_DEADLINE_MS` that bounds every attempt and backoff together. Other reads keep 15 s.
+- **An article with no footnotes is a successful empty result.** `references: []`, `total_references: 0`, and a notice pointing to `wikipedia_get_sections` and `wikipedia_get_article` for a bibliography or external-links section.
+- **Non-goals:** linking passages to references (article reads keep dropping markers and lists), ISBN or PMID fields (ISBNs stay in `text`, PubMed links in `urls`), and fetching or judging the external sources.
+
+### The skill is published, not only documented
+
+The server ships `skills/wikipedia-guide/SKILL.md` and serves it over MCP with `createApp({ skills: 'skills' })`, and the server `instructions` point to it. Why: the gates it carries (never carry a title across editions, `section_index` versus section number, what to check before reporting something absent) are lessons about how the tools combine, which no single tool description can state and an agent without repository access cannot otherwise reach.
 
 ### Summary vs. article: two tools with a clear contract
 
@@ -106,7 +126,8 @@ A single helper (`src/mcp-server/tools/utils/escape-markdown.ts`) backslash-esca
 
 - **CommonMark escapes, not HTML entities.** `content[]` is read raw by a model far more often than it is rendered, and `\<script\>` stays legible raw while rendering as the literal characters; `&lt;script&gt;` is noise on both surfaces.
 - **The render path only.** `structuredContent` carries the text exactly as the API returned it. The two surfaces disagree byte-for-byte on purpose — one is data, the other is a rendering of it.
-- **URLs and edition codes are left alone.** A URL is not prose and escaping it breaks the link; edition codes render inside code spans, which suppress markdown on their own.
+- **A URL renders as a link, never as escaped text.** Escaping a URL breaks the link, and a bare one is not inert: `M*A*S*H_(TV_series)` rendered `*A*` as emphasis, and a footnote URL lost the underscores of its `_-_`. Every URL field — the article `url`, each footnote and work URL, each language edition — goes through the framework's `markdownLink` as `[label](<url>)`, whose `<…>` destination reads back under CommonMark as the URL byte for byte, unbalanced parentheses, spaces, `<`, `>`, `\`, and entity-shaped `&` included; a CommonMark round-trip test pins it per tool. The label is the URL's host (`[doi.org](<https://doi.org/…>)`), short enough that a rendered line still names the source without repeating the URL — `[article]` on a language edition's line. The summary's thumbnail renders as an image, `![title](<url>)`. A URL that cannot be a link destination (a protocol-relative `//host/path`) is written as escaped text, which reads back unchanged.
+- **Edition codes are left alone.** They render inside code spans, which suppress markdown on their own.
 
 Line-leading `=` is deliberately not escaped: a line of only `=` would underline the paragraph above it as a heading, but the `== Heading ==` markers the article path emits are far more common and escaping them would mangle every one.
 
@@ -191,6 +212,7 @@ Six rendering conventions are deliberate:
 
   The full-article path is unaffected: TextExtracts strips every table upstream in HTML mode as in plain-text mode, so a section read is the only way to reach table data.
 - **Furniture boxes and bars are dropped on any tag, but the `metadata` marker alone does not select them.** The marker was originally tested only on `<table>`, so the `{{Side box}}` family — `{{Library resources box}}`, `{{Sister project links}}`, `{{Portal}}` — reached the caller as prose, because it is a `<div>`. Applying the test to every tag instead was measured against `action=parse&prop=text` for 46 articles across 12 editions (long and short, biography, science, geography, list-heavy, math-heavy): 144 elements carry `metadata`, and 47 of them are content. French Wikipedia's `{{Article détaillé}}`, the counterpart of English Wikipedia's `{{Main}}`, is `<div class="bandeau-container bandeau-section metadata bandeau-niveau-information">`, and `fr:Paris` alone carries 46 of those against 7 maintenance banners of the same shape — so a tag-agnostic `metadata` rule deletes several times more content than furniture on that edition, silently. What the furniture has in common instead is that the marker sits on a self-contained box or bar rather than on an inline pointer, so the rule pairs `metadata` with either a container class (`side-box`, `ambox`) or `role="navigation"` (`{{Portal bar}}`, `{{Sister bar}}`, the sister-project boxes). Pairing is also what keeps `{{Listen}}`, a `side-box` *without* the marker whose captions describe a recording in the article's own voice. Two other discriminators were measured and rejected: `noprint`, which MediaWiki puts on hatnotes across the Spanish, Italian, German, and Hebrew editions (108 of them in four articles), and the class-token exemption list an "every `metadata` element except hatnotes" rule needs, which only works where an edition happens to mark its pointers `hatnote` — French Wikipedia's does not. Known remaining leak: French maintenance banners, which are not separable from French hatnotes without enumerating that edition's `bandeau-niveau-*` levels. `{{Spoken Wikipedia}}` carries neither `metadata` nor `side-box` and needs its own entry; its body is a duration, the revision date the recording was read from, and a disclaimer that later edits are not reflected, none of which is reachable as audio from plain text.
+- **Hidden CS1 messages are dropped whole (`span.cs1-maint`, `span.cs1-hidden-error`), on every read path.** Citation Style 1 templates emit these editor-facing messages inside citations (`{{cite book}}: CS1 maint: ignored ISBN errors (link)`, seen in `Augustus` §59). The page hides them through TemplateStyles CSS (`.cs1-maint{display:none}`, `.cs1-hidden-error{display:none}`), not an inline `display:none`, so the hidden-element rule below never sees them and the class names are what select them. Whole class tokens match, alongside `mw-ext-cite-error`. `span.cs1-visible-error` is kept, since readers see it. Section reads, full reads, summaries, and the text of `wikipedia_get_references` entries all render through this rule.
 - **Preview warnings are dropped (`div.preview-warning`).** `action=parse` renders a section as an edit preview, so templates emit editor-only notices that the saved page never shows. Settlement infoboxes emit several per lead: "Preview warning: Page using Template:Infobox settlement with deprecated parameter settlement_type".
 - **A formula renders once, as its TeX.** A section read carries it twice — a hidden MathML twin and a fallback `<img>` whose `alt` is the TeX (next rule); the full-article extract carries only a visible `<math>`, whose `alttext` is the same TeX. Both carriers are lifted before anything else runs. The `<math>` open tag is matched attribute by attribute because the TeX in `alttext` holds a literal `>` (`\varepsilon >0`), which ends a naive open-tag match mid-attribute and spills the rest of the formula into the text.
 - **Elements the page hides are dropped, judged from `display:none` in an inline style rather than a class list.** Tag stripping alone kept the text of markup MediaWiki never renders. The Math extension emits a screen-reader MathML twin behind `display:none`, so every formula rendered twice — once as a column of one glyph per source line, then again as the `{\displaystyle …}` TeX from the twin's `<annotation>`; `{{calculator}}` gadgets are hidden until their script runs, so button labels and widget state landed mid-section. The general rule was chosen over enumerating gadget class names because the hiding is what the shapes have in common and new gadgets would each need an entry. Since the TeX lived only inside the twin, the formula is recovered from `img.mwe-math-fallback-image-*`'s `alt` before anything is dropped.
@@ -307,6 +329,7 @@ All requests: `format=json`
 | `action=query&titles={t}&prop=extracts\|info\|revisions&inprop=url&rvprop=ids\|timestamp&redirects=true` | `wikipedia_get_article` (full), and the heading fallback of `wikipedia_get_sections` |
 | `action=parse&page={t}&prop=tocdata&redirects=true` | `wikipedia_get_sections`; shared best-effort lookup for full-read redirect guidance and overflow indices |
 | `action=parse&page={t}&prop=text\|revid&section={index}` | `wikipedia_get_article` (section) |
+| `action=parse&page={t}&prop=text\|revid&redirects=true&disableeditsection=true&disabletoc=true&disablelimitreport=true` (no `section`; a continuation sends `oldid={revisionId}` in place of `page`) | `wikipedia_get_references` |
 | `action=query&titles={t}&prop=langlinks&lllimit=500` | `wikipedia_get_languages` |
 | `action=query&list=geosearch&gscoord={lat}\|{lon}&gsradius={r}&gslimit={n}&generator=geosearch&ggscoord={lat}\|{lon}&ggsradius={r}&ggslimit={n}&prop=description\|pageprops&ppprop=wikibase_item` | `wikipedia_search_nearby` |
 
@@ -395,7 +418,7 @@ Selected-table reads additionally return `table_index`, `table_count`, `table_ro
 - `invalid_section` (ValidationError) — `section_index` is out of range. Recovery: call `wikipedia_get_sections` first to obtain valid index values.
 - `invalid_table` (ValidationError) — selector is out of range, or a table read lacks section/table inputs. Recovery: supply a section and a selector within the available count.
 - `invalid_cursor` (ValidationError) — malformed, mismatched or out-of-range continuation. Recovery: pass the previous cursor unchanged with the same inputs, or omit it to start again.
-- `revision_unavailable` (ServiceUnavailable) — the pinned revision cannot be read or verified. Recovery: retry the same cursor; omit it only to start a new revision.
+- `revision_unavailable` (ServiceUnavailable) — the pinned table revision no longer exists, is hidden, or cannot be read or verified. When the parse API answers `nosuchrevid` or `permissiondenied` (revision deletion), the error carries that `upstreamCode` and a recovery to omit the cursor and start over at the current revision, since retrying cannot succeed; otherwise the recovery is to retry the same cursor first.
 - `invalid_language` (ValidationError) — unrecognized language code.
 
 **Annotations:** `readOnlyHint: true`, `openWorldHint: true`
@@ -460,6 +483,28 @@ No geotagged articles within the radius is a successful empty result with a noti
 - `not_found` (NotFound) — no article exists for the title in the specified language. Recovery: use `wikipedia_search_articles` to find the correct title.
 - `invalid_title` (ValidationError) — the title contains characters MediaWiki cannot name a page with. Recovery: use `wikipedia_search_articles` to find the exact title.
 - `no_other_languages` (NotFound) — article exists but has no other language editions. Recovery: the article may be too new or too regional to have been translated yet.
+- `invalid_language` (ValidationError) — unrecognized language code.
+
+**Annotations:** `readOnlyHint: true`, `openWorldHint: true`
+
+---
+
+### `wikipedia_get_references`
+
+**Description:** List the footnotes an article cites — its reference lists, in document order — with each footnote's text, external links (archive copies included), and DOIs. `wikipedia_get_article` drops footnote markers and reference lists, so this is the tool for the sources behind a claim. A short citation such as "Galinsky 2012, pp. 75–76" carries `work_ids`, and `works` on the same page holds the full citations they name, each once. Pages hold whole footnotes within 40,000 UTF-8 bytes on both surfaces; `next_cursor` continues at the same revision. Bibliography and further-reading entries no footnote points to are not listed. Redirects are followed.
+
+**Input:**
+- `title: string` — article title; a trailing `#fragment` is accepted and ignored, and a title MediaWiki cannot name a page with is refused before the fetch
+- `cursor?: string` — previous `next_cursor`, with unchanged title and language. Empty means the first page
+- `language?: string` — language edition code (default `"en"`)
+
+**Output:** `{ title, pageid?, url?, revision_id, redirected_from?, total_references, references[], works[], next_cursor? }`. Each `references[]` entry is `{ id, group?, label?, text, urls?, dois?, work_ids? }`: `id` is the footnote anchor (`cite_note-sandre-2`), `group` the notes list (`lower-alpha`, `N`) and absent for the main list, `label` the in-text marker without brackets. Each `works[]` entry is `{ id, text, urls?, dois? }` with a `CITEREF…` id. `total_references` counts footnotes across every list on all pages; `revision_id` is the same on every page of one read. `redirected_from` appears on the first page only, since a continuation parses by `oldid`. `url` is omitted under `WIKIPEDIA_BASE_URL`, as on section reads. Enrichment carries a `notice` when `total_references` is 0.
+
+**Errors:**
+- `not_found` (NotFound) — no article exists for the title, or the title is blank. Recovery: use `wikipedia_search_articles` to find the correct title.
+- `invalid_title` (ValidationError) — the title contains characters MediaWiki cannot name a page with. Recovery: use `wikipedia_search_articles` to find the exact title.
+- `invalid_cursor` (ValidationError) — malformed, issued for another title or language, or past the last footnote of the pinned revision. Recovery: pass the previous `next_cursor` unchanged with the same title and language, or omit it to start again.
+- `revision_unavailable` (ServiceUnavailable) — the revision the cursor is pinned to no longer exists, is hidden, or cannot be read or verified. When the parse API answers `nosuchrevid` or `permissiondenied` (revision deletion), the error carries that `upstreamCode` and a recovery to omit the cursor and start over at the current revision, since retrying cannot succeed; otherwise the recovery is to retry the same cursor first.
 - `invalid_language` (ValidationError) — unrecognized language code.
 
 **Annotations:** `readOnlyHint: true`, `openWorldHint: true`

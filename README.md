@@ -1,13 +1,13 @@
 <div align="center">
   <h1>@cyanheads/wikipedia-mcp-server</h1>
-  <p><b>Search Wikipedia articles, read summaries and full text, target sections, find nearby pages, and list language editions via MCP. STDIO or Streamable HTTP.</b>
-  <div>6 Tools</div>
+  <p><b>Search Wikipedia articles, read summaries and full text, target sections, list an article's cited references, find nearby pages, and list language editions via MCP. STDIO or Streamable HTTP.</b>
+  <div>7 Tools</div>
   </p>
 </div>
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.2.8-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/wikipedia-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/wikipedia-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/wikipedia-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.2.8-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/wikipedia-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.4.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/wikipedia-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/wikipedia-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -29,7 +29,7 @@
 
 ## Overview
 
-Wikipedia in any language edition. Search articles, read summaries or just the sections you need, find geotagged pages near a coordinate, and list an article's language editions.
+Wikipedia in any language edition. Search articles, read summaries or just the sections you need, list the footnotes an article cites, find geotagged pages near a coordinate, and list an article's language editions. Ships the `wikipedia-guide` agent skill (`skill://wikipedia-guide/SKILL.md`), which MCP clients read for the gates that span tools: switching editions, disambiguation pages, section numbers versus `section_index`, and what to check before reporting something absent.
 
 ### Tools
 
@@ -41,6 +41,7 @@ Wikipedia in any language edition. Search articles, read summaries or just the s
 | `wikipedia_get_sections` | Table of contents with `section_index` values for targeted section reads. |
 | `wikipedia_search_nearby` | Geotagged Wikipedia articles within a radius of a WGS 84 coordinate, sorted by distance, with short descriptions and Wikidata QIDs. |
 | `wikipedia_get_languages` | All language editions available for an article, with titles and URLs, or just the editions you ask for. |
+| `wikipedia_get_references` | The footnotes an article cites, in document order, with each footnote's text, external links (archive copies included), and DOIs, plus the full citations that short citations point to. |
 
 ## Capability reference
 
@@ -93,6 +94,14 @@ Wikipedia in any language edition. Search articles, read summaries or just the s
 - Takes a `title`; returns each edition's `language_code`, `edition_code`, article title, and URL, plus `source_title`, the resolved title. Pass `edition_code` — not `language_code` — as `language` on other tools; the two can differ (`gsw` vs `als`)
 - `editions` narrows the list to the codes asked for: codes with no article come back under `missing`, and `total_languages` stays the unfiltered count. Fails with `no_other_languages` when the article has no translations; a filter matching nothing is an empty list, not a failure
 
+---
+
+### `wikipedia_get_references` <sub>tool</sub>
+
+- Takes a `title`; returns `references[]` in document order across every reference list, each with `id`, `label` (the in-text marker), `group` (a notes list such as `lower-alpha`, absent for the main list), `text`, `urls` (archive copies included), and `dois` (from `doi.org` links, percent-decoded). `total_references` counts the footnotes on all pages. `wikipedia_get_article` drops footnote markers and reference lists
+- A short citation such as "Galinsky 2012, pp. 75–76" carries `work_ids`, and `works` on the same page holds the full citations they name, each once. Bibliography and further-reading entries no footnote points to are not listed — read those sections with `wikipedia_get_article`
+- Each page holds whole footnotes within 40,000 UTF-8 bytes on both surfaces; follow `next_cursor` as `cursor` with the same `title` and `language`. Continuations read the first page's `revision_id`, and a cursor past the last footnote fails `invalid_cursor`. An unreadable pinned revision fails `revision_unavailable`. An article with no footnotes returns an empty list with a `notice`, not an error
+
 ## Features
 
 Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): stdio and Streamable HTTP transports, pluggable auth (`none` / `jwt` / `oauth`), swappable storage (`in-memory`, `filesystem`, `Supabase`, `Cloudflare KV/R2/D1`), structured logging with optional OpenTelemetry tracing.
@@ -101,7 +110,7 @@ Wikipedia-specific:
 
 - Dual API integration — MediaWiki REST API (`/api/rest_v1/`) for summaries, Action API (`/w/api.php`) for search, full text, sections, geo search, and language links
 - Retry and backoff on every required request, including the transient refusals (search too busy, rate-limited, read-only) the Action API returns inside an HTTP 200 body, with an upstream `Retry-After` honored and each request's retries bounded at 30 s. The best-effort description lookup on search results gets one short attempt; `User-Agent` header per Wikimedia API policy
-- Every read path renders HTML through one renderer to the same plain-text shape — `== Heading ==` markers, one list item per line, superscripts kept, code fenced: the full article from the Action API's HTML extract, a section from the parser's own HTML for that section, the summary from the REST `extract_html`. A section read additionally carries data tables, infoboxes, and the lists inside layout tables, none of which the extract carries
+- Every read path renders HTML through one renderer to the same plain-text shape — `== Heading ==` markers, one list item per line, superscripts kept, code fenced: the full article from the Action API's HTML extract, a section from the parser's own HTML for that section, the summary from the REST `extract_html`. A section read additionally carries data tables, infoboxes, and the lists inside layout tables, none of which the extract carries. Footnote markers, reference lists, and the hidden Citation Style 1 maintenance messages (`CS1 maint: …`) are dropped on every path; `wikipedia_get_references` returns the footnotes
 - Per-call `language` parameter on every tool (default `en`) — all Wikipedia language editions accessible in a single session; every title read follows redirects
 - Language validation against a live edition registry built from the MediaWiki `action=sitematrix` endpoint (cached 24h) — catches structurally valid but nonexistent editions before they cause timeouts
 
@@ -116,115 +125,32 @@ Agent-friendly output:
 
 ## Getting started
 
-### Public Hosted Instance
+Connect to the hosted instance, no install:
 
-A public instance is available at `https://wikipedia.caseyjhand.com/mcp` — no installation required. Point any MCP client at it via Streamable HTTP:
-
-```json
-{
-  "mcpServers": {
-    "wikipedia-mcp-server": {
-      "type": "streamable-http",
-      "url": "https://wikipedia.caseyjhand.com/mcp"
-    }
-  }
-}
+```sh
+claude mcp add --transport http wikipedia-mcp-server https://wikipedia.caseyjhand.com/mcp
 ```
 
-### Self-Hosted / Local
+Or run it locally:
 
-Add the following to your MCP client configuration file.
-
-```json
-{
-  "mcpServers": {
-    "wikipedia-mcp-server": {
-      "type": "stdio",
-      "command": "bunx",
-      "args": ["@cyanheads/wikipedia-mcp-server@latest"],
-      "env": {
-        "MCP_TRANSPORT_TYPE": "stdio",
-        "MCP_LOG_LEVEL": "info"
-      }
-    }
-  }
-}
+```sh
+claude mcp add wikipedia-mcp-server -- npx -y @cyanheads/wikipedia-mcp-server
 ```
 
-Or with npx (no Bun required):
+For other clients, add this to the MCP config file:
 
 ```json
 {
   "mcpServers": {
     "wikipedia-mcp-server": {
-      "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@cyanheads/wikipedia-mcp-server@latest"],
-      "env": {
-        "MCP_TRANSPORT_TYPE": "stdio",
-        "MCP_LOG_LEVEL": "info"
-      }
+      "args": ["-y", "@cyanheads/wikipedia-mcp-server"]
     }
   }
 }
 ```
 
-Or with Docker:
-
-```json
-{
-  "mcpServers": {
-    "wikipedia-mcp-server": {
-      "type": "stdio",
-      "command": "docker",
-      "args": [
-        "run", "-i", "--rm",
-        "-e", "MCP_TRANSPORT_TYPE=stdio",
-        "ghcr.io/cyanheads/wikipedia-mcp-server:latest"
-      ]
-    }
-  }
-}
-```
-
-For Streamable HTTP, set the transport and start the server:
-
-```sh
-MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
-# Server listens at http://localhost:3010/mcp
-```
-
-### Prerequisites
-
-- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
-- No API keys required — Wikipedia's API is public.
-
-### Installation
-
-1. **Clone the repository:**
-
-```sh
-git clone https://github.com/cyanheads/wikipedia-mcp-server.git
-```
-
-2. **Navigate into the directory:**
-
-```sh
-cd wikipedia-mcp-server
-```
-
-3. **Install dependencies:**
-
-```sh
-bun install
-```
-
-4. **Configure environment (optional):**
-
-```sh
-cp .env.example .env
-# edit .env if you want to customize WIKIPEDIA_USER_AGENT or logging
-```
+No API key is required — Wikipedia's API is public. For Docker or a source build, see [Running the server](#running-the-server).
 
 ## Configuration
 
@@ -248,6 +174,16 @@ See [`.env.example`](./.env.example) for the full list of optional overrides.
 
 ### Local development
 
+Requires [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
+
+- **Clone and install:**
+
+  ```sh
+  git clone https://github.com/cyanheads/wikipedia-mcp-server.git
+  cd wikipedia-mcp-server && bun install
+  cp .env.example .env   # optional: customize WIKIPEDIA_USER_AGENT or logging
+  ```
+
 - **Build and run:**
 
   ```sh
@@ -257,7 +193,7 @@ See [`.env.example`](./.env.example) for the full list of optional overrides.
   # Run the built server
   bun run start:stdio
   # or
-  bun run start:http
+  bun run start:http   # listens at http://localhost:3010/mcp (MCP_HTTP_PORT)
   ```
 
 - **Run checks and tests:**
@@ -275,7 +211,7 @@ docker build -t wikipedia-mcp-server .
 docker run --rm -p 3010:3010 wikipedia-mcp-server
 ```
 
-The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `/var/log/wikipedia-mcp-server`. OpenTelemetry peer dependencies are installed by default — build with `--build-arg OTEL_ENABLED=false` to omit them.
+The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `/var/log/wikipedia-mcp-server`. To run the published image over stdio from an MCP client, use `"command": "docker"` with `"args": ["run", "-i", "--rm", "-e", "MCP_TRANSPORT_TYPE=stdio", "ghcr.io/cyanheads/wikipedia-mcp-server:latest"]`. OpenTelemetry peer dependencies are installed by default — build with `--build-arg OTEL_ENABLED=false` to omit them.
 
 ## Project structure
 
@@ -285,6 +221,7 @@ The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `
 | `src/config` | Server-specific environment variable parsing and validation with Zod. |
 | `src/mcp-server/tools` | Tool definitions (`*.tool.ts`) — one file per tool. |
 | `src/services/wikipedia` | WikipediaService — REST API + Action API client with retry/backoff and language validation. |
+| `skills/` | The published `wikipedia-guide` agent skill, served over MCP and shipped in the package. |
 | `tests/` | Unit and integration tests mirroring `src/`. |
 
 ## Development guide
