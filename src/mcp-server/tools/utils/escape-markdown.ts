@@ -3,7 +3,25 @@
  * @module mcp-server/tools/utils/escape-markdown
  */
 
+import { escapeMarkdownInline, markdownLink } from '@cyanheads/mcp-ts-core/utils';
 import { parseTableRow, splitTextBlocks, tableRow } from '@/services/wikipedia/text-blocks.js';
+
+/**
+ * A URL field as a Markdown link labelled with its host: `[example.org](<https://example.org/a_-_b>)`.
+ *
+ * The `<…>` destination {@link markdownLink} writes reads back under CommonMark as the URL byte for
+ * byte, `*`, `_`, unbalanced parentheses, spaces, `<`, `>`, `\`, and entity-shaped `&` included, so
+ * `content[]` carries the value `structuredContent` does. The host keeps a rendered line short and
+ * still names the source; a raw reader sees the full URL in the destination. A URL that cannot be a
+ * link destination — not absolute `http(s)`, such as a protocol-relative `//host/path`, or holding a
+ * line break — is written as escaped text, which reads back unchanged.
+ */
+export function urlLink(url: string): string {
+  const parsed = /[\r\n]/.test(url) ? null : URL.parse(url);
+  return parsed?.protocol === 'http:' || parsed?.protocol === 'https:'
+    ? markdownLink(parsed.hostname, url)
+    : escapeMarkdownInline(url);
+}
 
 /**
  * Characters that open a markdown or HTML construct anywhere in a line.

@@ -6,6 +6,7 @@
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { wikipediaGetLanguages } from '@/mcp-server/tools/definitions/wikipedia-get-languages.tool.js';
+import { parseTargets } from '../../../helpers/commonmark.js';
 import { mockWikipediaService } from '../../../helpers/wikipedia-service-mock.js';
 
 describe('wikipediaGetLanguages', () => {
@@ -76,7 +77,9 @@ describe('wikipediaGetLanguages', () => {
     expect(text).toContain('gsw');
     expect(text).toContain('als');
     expect(text).toContain('Python (Programmiersprache)');
-    expect(text).toContain('https://als.wikipedia.org');
+    expect(text).toContain(
+      '(code `gsw`): [article](<https://als.wikipedia.org/wiki/Python_(Programmiersprache)>)',
+    );
     expect(text).toContain('1 languages');
   });
 
@@ -505,9 +508,39 @@ describe('wikipediaGetLanguages', () => {
     expect(text).toContain('HTML \\<element\\>');
     expect(text).toContain('Balise \\<script\\> et \\_emphase\\_');
     expect(text).not.toContain('<script>');
-    // The URL is not prose and is left intact so the link stays followable.
-    expect(text).toContain('https://fr.wikipedia.org/wiki/HTML');
+    // The URL is not prose: it is a link destination, unescaped, so the link stays followable.
+    expect(text).toContain(': [article](<https://fr.wikipedia.org/wiki/HTML>)');
     expect(output.languages[0]?.title).toBe('Balise <script> et _emphase_');
+  });
+
+  it('links each edition so CommonMark reads its URL back byte for byte (#78)', () => {
+    // MediaWiki leaves parentheses unencoded in a URL, so a title with one unmatched paren yields a
+    // URL a bare `(…)` destination cannot hold.
+    const urls = [
+      'https://de.wikipedia.org/wiki/M*A*S*H_(Fernsehserie)',
+      'https://fr.wikipedia.org/wiki/Parenth%C3%A8se_)_seule',
+      'https://ja.wikipedia.org/wiki/%E9%A0%86_(_%E9%96%8B',
+    ];
+    const text = wikipediaGetLanguages.format!({
+      source_title: 'M*A*S*H (TV series)',
+      source_language: 'en',
+      languages: urls.map((url, i) => ({
+        language_code: `x${i}`,
+        edition_code: `x${i}`,
+        title: `T${i}`,
+        url,
+      })),
+      total_languages: urls.length,
+    })
+      .map((b) => (b.type === 'text' ? b.text : ''))
+      .join('');
+
+    expect(parseTargets(text)).toEqual(
+      urls.map((href) => ({ kind: 'link', href, text: 'article' })),
+    );
+    expect(text).toContain(
+      '- **T0** — pass `language: "x0"` (code `x0`): [article](<https://de.wikipedia.org/wiki/M*A*S*H_(Fernsehserie)>)',
+    );
   });
 
   it('non-McpError from service propagates without wrapping', async () => {

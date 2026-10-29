@@ -5,9 +5,11 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import { markdownImage } from '@cyanheads/mcp-ts-core/utils';
 import {
   escapeMarkdown,
   escapeMarkdownOutsideBlocks,
+  urlLink,
 } from '@/mcp-server/tools/utils/escape-markdown.js';
 import {
   getWikipediaService,
@@ -216,8 +218,9 @@ export const wikipediaGetSummary = tool('wikipedia_get_summary', {
     lines.push(`**Type:** ${result.page_type} | **Language:** ${result.language}`);
     if (result.pageid != null) lines.push(`**Page ID:** ${result.pageid}`);
     if (result.wikibase_item) lines.push(`**Wikidata QID:** ${result.wikibase_item}`);
-    if (result.thumbnail_url) lines.push(`**Thumbnail:** ${result.thumbnail_url}`);
-    if (result.url) lines.push(`**URL:** ${result.url}`);
+    if (result.thumbnail_url)
+      lines.push(`**Thumbnail:** ${markdownImage(result.title, result.thumbnail_url)}`);
+    if (result.url) lines.push(`**URL:** ${urlLink(result.url)}`);
     // Each coordinate renders on its own presence rather than as a pair, so format-parity's
     // all-fields-populated sample renders both and a half-populated result cannot go silent.
     if (result.latitude != null) lines.push(`**Latitude:** ${result.latitude}`);

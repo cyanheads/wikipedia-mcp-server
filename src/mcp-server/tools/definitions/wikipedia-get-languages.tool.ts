@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import { markdownLink } from '@cyanheads/mcp-ts-core/utils';
 import { escapeMarkdown } from '@/mcp-server/tools/utils/escape-markdown.js';
 import {
   getWikipediaService,
@@ -264,8 +265,8 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
   },
 
   // Upstream titles are escaped on the way into the markdown; structuredContent keeps them raw.
-  // Edition codes stay in code spans, which suppress markdown on their own, and a URL is left
-  // intact so the link stays followable.
+  // Edition codes stay in code spans, which suppress markdown on their own, and a URL goes in a
+  // `<…>` link destination, which reads back as the URL even with an unmatched parenthesis.
   format: (result) => {
     // `missing` is present exactly when the caller passed `editions`, so it is also what says
     // whether the list below is the whole set or the slice that was asked for.
@@ -290,7 +291,7 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
       const target = lang.edition_code
         ? `pass \`language: "${lang.edition_code}"\``
         : 'edition subdomain unavailable';
-      const link = lang.url ? `: [article](${lang.url})` : ' (no URL available)';
+      const link = lang.url ? `: ${markdownLink('article', lang.url)}` : ' (no URL available)';
       lines.push(
         `- **${escapeMarkdown(lang.title)}** — ${target} (code \`${lang.language_code}\`)${link}`,
       );

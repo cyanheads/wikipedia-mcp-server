@@ -14,6 +14,7 @@ import {
   initWikipediaService,
   redirectInfo,
 } from '@/services/wikipedia/wikipedia-service.js';
+import { parseTargets } from '../../../helpers/commonmark.js';
 import { mockWikipediaService } from '../../../helpers/wikipedia-service-mock.js';
 
 describe('wikipediaGetArticle', () => {
@@ -530,6 +531,31 @@ describe('wikipediaGetArticle', () => {
     expect(section).not.toHaveProperty('last_modified');
   });
 
+  it('links the URL so CommonMark reads it back byte for byte (#78)', async () => {
+    vi.restoreAllMocks();
+    initWikipediaService({} as AppConfig, fakeStorage(), 'wikipedia-mcp-server/test');
+    const svc = getWikipediaService();
+    vi.spyOn(svc, 'fetchEditionIndex').mockResolvedValue({
+      hosts: { en: 'https://en.wikipedia.org' },
+      fetchedAt: '2026-09-22T00:00:00.000Z',
+    });
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
+      parse: { title: 'M*A*S*H (TV series)', pageid: 7, revid: 42, text: '<p>Lead.</p>' },
+    });
+    const result = wikipediaGetArticle.output.parse(
+      await wikipediaGetArticle.handler(
+        wikipediaGetArticle.input.parse({ title: 'M*A*S*H (TV series)', section_index: 0 }),
+        createMockContext({ errors: wikipediaGetArticle.errors }),
+      ),
+    );
+
+    const url = 'https://en.wikipedia.org/wiki/M*A*S*H_(TV_series)';
+    expect(result.url).toBe(url);
+    const text = renderText(result);
+    expect(parseTargets(text)).toEqual([{ kind: 'link', href: url, text: 'en.wikipedia.org' }]);
+    expect(text).toContain(`\n**URL:** [en.wikipedia.org](<${url}>)\n`);
+  });
+
   it('omits the citation lines from format() when the fields are absent (issue #53)', () => {
     const text = renderText({
       title: 'Python',
@@ -664,7 +690,7 @@ describe('wikipediaGetArticle', () => {
       expect(result.url).toBe('https://en.wikipedia.org/wiki/Sample');
       expect(result).not.toHaveProperty('last_modified');
       const text = renderText(result);
-      expect(text).toContain('**URL:** https://en.wikipedia.org/wiki/Sample');
+      expect(text).toContain('**URL:** [en.wikipedia.org](<https://en.wikipedia.org/wiki/Sample>)');
       expect(text).toContain('**Revision ID:** 1376082128');
       expect(text).not.toContain('Last modified');
     });
@@ -864,7 +890,9 @@ describe('wikipediaGetArticle — full read end to end through the real renderer
     expect(result.revision_id).toBe('1376082128');
     expect(result.last_modified).toBe('2026-09-21T23:42:01Z');
     const text = renderText(result);
-    expect(text).toContain('**URL:** https://en.wikipedia.org/wiki/New_York_City');
+    expect(text).toContain(
+      '**URL:** [en.wikipedia.org](<https://en.wikipedia.org/wiki/New_York_City>)',
+    );
     expect(text).toContain('**Revision ID:** 1376082128');
     expect(text).toContain('**Last modified:** 2026-09-21T23:42:01Z');
   });

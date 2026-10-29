@@ -12,6 +12,7 @@ import {
   getWikipediaService,
   initWikipediaService,
 } from '@/services/wikipedia/wikipedia-service.js';
+import { parseTargets } from '../../../helpers/commonmark.js';
 import { mockWikipediaService } from '../../../helpers/wikipedia-service-mock.js';
 
 /** The joined text of every text block format() returns. */
@@ -170,7 +171,7 @@ describe('wikipediaGetSummary', () => {
     expect(text).toContain('Q28865');
     expect(text).toContain('23862');
     expect(text).toContain('Python is a language.');
-    expect(text).toContain('https://example.com/img.png');
+    expect(text).toContain('**Thumbnail:** ![Python](<https://example.com/img.png>)');
   });
 
   it('format renders correctly without optional fields', () => {
@@ -400,7 +401,9 @@ describe('wikipediaGetSummary', () => {
 
       expect(text).toContain('48.85822222');
       expect(text).toContain('2.2945');
-      expect(text).toContain('https://en.wikipedia.org/wiki/Eiffel_Tower');
+      expect(text).toContain(
+        '\n**URL:** [en.wikipedia.org](<https://en.wikipedia.org/wiki/Eiffel_Tower>)\n',
+      );
       expect(text).toContain('1374916289');
       expect(text).toContain('2026-09-14T20:37:52Z');
       expect(text).toContain('wikipedia_search_nearby');
@@ -422,7 +425,9 @@ describe('wikipediaGetSummary', () => {
       expect(text).not.toContain('Latitude');
       expect(text).not.toContain('Longitude');
       expect(text).not.toContain('wikipedia_search_nearby');
-      expect(text).toContain('https://en.wikipedia.org/wiki/Vantablack');
+      expect(text).toContain(
+        '\n**URL:** [en.wikipedia.org](<https://en.wikipedia.org/wiki/Vantablack>)\n',
+      );
     });
 
     it('names wikipedia_search_nearby in both coordinate descriptions', () => {
@@ -523,8 +528,8 @@ describe('wikipediaGetSummary', () => {
           '**Type:** standard | **Language:** en',
           '**Page ID:** 9232',
           '**Wikidata QID:** Q243',
-          '**Thumbnail:** https://upload.wikimedia.org/eiffel.jpg',
-          '**URL:** https://en.wikipedia.org/wiki/Eiffel_Tower',
+          '**Thumbnail:** ![Eiffel Tower](<https://upload.wikimedia.org/eiffel.jpg>)',
+          '**URL:** [en.wikipedia.org](<https://en.wikipedia.org/wiki/Eiffel_Tower>)',
           '**Latitude:** 48.85822222',
           '**Longitude:** 2.2945',
           '**Nearby:** pass latitude and longitude to wikipedia_search_nearby for other notable articles around this point.',
@@ -588,6 +593,34 @@ describe('wikipediaGetSummary', () => {
       language: 'en',
     });
     expect(text).toContain('A \\<tiny\\> program:\n\n```\nif n < 0:\n    x *= 2\n```');
+  });
+
+  it('links the URL and shows the thumbnail so CommonMark reads both back byte for byte (#78)', async () => {
+    const url = 'https://en.wikipedia.org/wiki/M*A*S*H_(TV_series)';
+    const thumbnail =
+      'https://upload.wikimedia.org/wikipedia/en/thumb/0/0f/M*A*S*H_-_title_card.jpg/330px-M*A*S*H_-_title_card.jpg';
+    mockWikipediaService({
+      getSummary: vi.fn().mockResolvedValue({
+        title: 'M*A*S*H (TV series)',
+        pageType: 'standard',
+        extract: 'M*A*S*H is an American war comedy television series.',
+        thumbnailUrl: thumbnail,
+        url,
+      }),
+    });
+    const ctx = createMockContext({ errors: wikipediaGetSummary.errors });
+    const input = wikipediaGetSummary.input.parse({ title: 'M*A*S*H (TV series)' });
+    const result = wikipediaGetSummary.output.parse(await wikipediaGetSummary.handler(input, ctx));
+
+    expect(result.url).toBe(url);
+    expect(result.thumbnail_url).toBe(thumbnail);
+    const text = renderText(result);
+    expect(parseTargets(text)).toEqual([
+      { kind: 'image', href: thumbnail, text: 'M*A*S*H (TV series)' },
+      { kind: 'link', href: url, text: 'en.wikipedia.org' },
+    ]);
+    expect(text).toContain(`**Thumbnail:** ![M\\*A\\*S\\*H (TV series)](<${thumbnail}>)\n`);
+    expect(text).toContain(`**URL:** [en.wikipedia.org](<${url}>)\n`);
   });
 
   it('non-McpError from service propagates without wrapping', async () => {

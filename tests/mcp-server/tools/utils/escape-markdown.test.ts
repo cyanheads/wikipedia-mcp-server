@@ -8,8 +8,10 @@ import {
   escapeMarkdown,
   escapeMarkdownOutsideBlocks,
   formatTablePage,
+  urlLink,
 } from '@/mcp-server/tools/utils/escape-markdown.js';
 import { htmlSectionToPlainText } from '@/services/wikipedia/wikipedia-service.js';
+import { parseInlineText, parseTargets } from '../../../helpers/commonmark.js';
 
 describe('escapeMarkdown', () => {
   it('backslash-escapes every inline markdown-active character', () => {
@@ -128,5 +130,26 @@ describe('escapeMarkdownOutsideBlocks (issues #49, #50)', () => {
     expect(escapeMarkdownOutsideBlocks(plain)).toBe(
       'Intro \\<b\\>\n\n````\n```\n| <i> |\n```\n````\n\n| \\`\\`\\` | a \\| b |\n| --- | --- |\n| \\<script\\> | \\| --- \\| |',
     );
+  });
+});
+
+describe('urlLink (#78)', () => {
+  it('links an absolute http(s) URL under its host, read back byte for byte', () => {
+    const url = 'https://example.org/a_-_b*c*(d <e> \\f &copy;';
+    expect(urlLink(url)).toBe(
+      '[example.org](<https://example.org/a_-_b*c*(d \\<e\\> \\\\f \\&copy;>)',
+    );
+    expect(parseTargets(urlLink(url))).toEqual([{ kind: 'link', href: url, text: 'example.org' }]);
+  });
+
+  it.each([
+    'ftp://example.org/a_-_b_c',
+    'mailto:a_b_c@example.org',
+    '//example.org/a_-_b_c',
+    'https://example.org/a_b\nc_d',
+    'not a url *at* all',
+  ])('writes %j, which cannot be a link destination, as text that reads back unchanged', (url) => {
+    expect(parseTargets(urlLink(url))).toEqual([]);
+    expect(parseInlineText(urlLink(url))).toEqual([url]);
   });
 });

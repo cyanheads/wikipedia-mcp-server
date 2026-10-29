@@ -11,6 +11,7 @@ import {
   escapeMarkdown,
   escapeMarkdownOutsideBlocks,
   formatTablePage,
+  urlLink,
 } from '@/mcp-server/tools/utils/escape-markdown.js';
 import {
   articleTableRead,
@@ -27,7 +28,7 @@ import {
 export const wikipediaGetArticle = tool('wikipedia_get_article', {
   title: 'Get Wikipedia Article',
   description:
-    'Fetch article content as clean plain text. Without section_index: returns the full article with == Section == markers preserved for structure — or, when the article exceeds the size budget, a compact section outline (truncated: true) that points to wikipedia_get_sections plus a section_index read instead of the full text. With section_index (from wikipedia_get_sections): returns that section and every subsection nested under it, each heading above its own body. section_index 0 is the lead section, the text above the first heading, which is the full prose wikipedia_get_summary returns only a truncated fragment of. Section-targeted reads are faster and smaller when only part of the article is needed. Both paths keep superscripts and subscripts apart from the text beside them (10²³, H₂O), render formulas as their TeX, and render code samples as fenced blocks with their indentation intact. A section read also renders data tables as pipe-delimited rows (header row first) and infoboxes as "label: value" lines; a table too large to include leaves a "[table omitted: N rows (table T)]" marker. Pass table_index: T with section_index to read only that table in complete row pages whose table text fits within 40,000 UTF-8 bytes on both surfaces. Follow next_cursor as cursor with the same inputs to continue at the pinned revision; caption/header/delimiter appear once. An indivisible oversized row or first-page caption/header is returned alone with oversized_row: true. The full-article path carries no data tables or infoboxes, so read the section for those. Phylogenetic clade trees render as fenced, indented branches, with unnamed forks preserved; unparseable trees leave "[table omitted: unparseable clade]". Clade trees have no table_index. Tables used only for layout, such as multi-column lists, keep their content as ordinary text. Page furniture is omitted as well — maintenance banners, sister-project and library-resource boxes, portal bars, and spoken-article notices — while a hatnote naming a related article is kept. Every read returns the canonical article URL and the ID of the revision it was read from, for citation; a full read also returns that revision\'s timestamp. Redirect pages are followed automatically, and the citation fields name the target article.',
+    'Fetch article content as clean plain text. Without section_index: returns the full article with == Section == markers preserved for structure — or, when the article exceeds the size budget, a compact section outline (truncated: true) that points to wikipedia_get_sections plus a section_index read instead of the full text. With section_index (from wikipedia_get_sections): returns that section and every subsection nested under it, each heading above its own body. section_index 0 is the lead section, the text above the first heading, which is the full prose wikipedia_get_summary returns only a truncated fragment of. Section-targeted reads are faster and smaller when only part of the article is needed. Both paths keep superscripts and subscripts apart from the text beside them (10²³, H₂O), render formulas as their TeX, and render code samples as fenced blocks with their indentation intact. A section read also renders data tables as pipe-delimited rows (header row first) and infoboxes as "label: value" lines; a table too large to include leaves a "[table omitted: N rows (table T)]" marker. Pass table_index: T with section_index to read only that table in complete row pages whose table text fits within 40,000 UTF-8 bytes on both surfaces. Follow next_cursor as cursor with the same inputs to continue at the pinned revision; caption/header/delimiter appear once. An indivisible oversized row or first-page caption/header is returned alone with oversized_row: true. The full-article path carries no data tables or infoboxes, so read the section for those. Phylogenetic clade trees render as fenced, indented branches, with unnamed forks preserved; unparseable trees leave "[table omitted: unparseable clade]". Clade trees have no table_index. In a section read, tables used only for layout, such as multi-column lists, keep their content as ordinary text; the full-article path drops them, so read the section for those lists. Page furniture is omitted as well — maintenance banners, sister-project and library-resource boxes, portal bars, and spoken-article notices — while a hatnote naming a related article is kept. Every read returns the canonical article URL and the ID of the revision it was read from, for citation; a full read also returns that revision\'s timestamp. Redirect pages are followed automatically, and the citation fields name the target article.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     title: z
@@ -178,8 +179,9 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
     {
       reason: 'revision_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'The pinned table revision cannot be read or verified.',
-      recovery: 'Retry the same cursor; omit cursor only to start a new revision.',
+      when: 'The table revision the cursor is pinned to no longer exists, is hidden, or cannot be read or verified.',
+      recovery:
+        'Retry the same cursor if the failure was transient; if the pinned revision no longer exists or is hidden, omit cursor to start over at the current revision.',
       thrownBy: 'service',
     },
     {
@@ -472,7 +474,7 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
       lines.push(`**Redirected from:** ${escapeMarkdown(result.redirected_from)}`);
     if (result.redirect_section)
       lines.push(`**Redirect section:** ${escapeMarkdown(result.redirect_section)}`);
-    if (result.url) lines.push(`**URL:** ${result.url}`);
+    if (result.url) lines.push(`**URL:** ${urlLink(result.url)}`);
     if (result.revision_id) lines.push(`**Revision ID:** ${result.revision_id}`);
     if (result.last_modified) lines.push(`**Last modified:** ${result.last_modified}`);
     if (result.table_index !== undefined) lines.push(`**Table index:** ${result.table_index}`);
