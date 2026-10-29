@@ -578,7 +578,8 @@ describe('wikipediaSearchArticles — spelling suggestion (issue #51)', () => {
       'No Wikipedia articles found for "albert einstien relativty" in language "en". Try different keywords or a broader query. Did you mean "albert einstein relativity"? Re-run with that query.',
     );
     const text = contentText(result);
-    expect(text).toContain('**Did you mean:** albert einstein relativity');
+    // The framework renders a generic trailer value as a code span, so the copied query carries no escapes.
+    expect(text).toContain('\n**Did you mean:** `albert einstein relativity`\n');
     expect(text).toContain('Did you mean "albert einstein relativity"?');
   });
 
@@ -598,7 +599,7 @@ describe('wikipediaSearchArticles — spelling suggestion (issue #51)', () => {
     const structured = result.structuredContent as Record<string, unknown>;
     expect(structured.suggestion).toBe('einstein');
     expect(structured.notice).toBeUndefined();
-    expect(contentText(result)).toContain('**Did you mean:** einstein');
+    expect(contentText(result)).toMatch(/\n\*\*Did you mean:\*\* `einstein`$/);
   });
 
   it('leaves the end-of-results notice alone past offset 0 even when a suggestion arrives', async () => {

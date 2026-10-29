@@ -1,7 +1,7 @@
 {
   "name": "@cyanheads/wikipedia-mcp-server",
   "version": "0.2.8",
-  "description": "Search Wikipedia articles, read summaries and full text, target sections, find nearby pages, and list language editions via MCP. STDIO or Streamable HTTP.",
+  "description": "Search Wikipedia articles, read summaries and full text, target sections, list an article's cited references, find nearby pages, and list language editions via MCP. STDIO or Streamable HTTP.",
   "mcpName": "io.github.cyanheads/wikipedia-mcp-server",
   "type": "module",
   "main": "dist/index.js",
@@ -18,7 +18,8 @@
     "CLAUDE.md",
     "AGENTS.md",
     "Dockerfile",
-    "server.json"
+    "server.json",
+    "skills/"
   ],
   "scripts": {
     "build": "bun run scripts/build.ts",
@@ -82,17 +83,18 @@
     "access": "public"
   },
   "dependencies": {
-    "@cyanheads/mcp-ts-core": "^0.13.15",
+    "@cyanheads/mcp-ts-core": "^0.13.18",
     "pino-pretty": "^13.2.0",
     "zod": "^4.6.7"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.6.2",
+    "@biomejs/biome": "^2.6.3",
     "@socketsecurity/bun-security-scanner": "^1.1.3",
-    "@types/node": "^26.6.5",
+    "@types/node": "^26.6.6",
     "depcheck": "^1.4.7",
-    "ignore": "^7.0.13",
-    "tsc-alias": "^1.9.8",
+    "ignore": "^7.0.14",
+    "markdown-it": "15.0.3",
+    "tsc-alias": "^1.9.9",
     "typescript": "^7.0.2",
     "vitest": "^5.0.5"
   }
