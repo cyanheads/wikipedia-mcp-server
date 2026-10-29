@@ -1,7 +1,7 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 title: wikipedia-mcp-server
-abstract: "Model Context Protocol (MCP) server for Wikipedia, providing article search, summaries, full text, section targeting, nearby pages, and language edition discovery."
+abstract: "Model Context Protocol (MCP) server for Wikipedia, providing article search, summaries, full text, section targeting, an article's cited references, nearby pages, and language edition discovery."
 type: software
 authors:
   - family-names: Hand
