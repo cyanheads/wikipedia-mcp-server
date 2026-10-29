@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-10-29
+
+Adds wikipedia_get_references for an article's footnotes and publishes the wikipedia-guide agent skill; URLs in content[] render as CommonMark links.
+
 ## [0.2.8](changelog/0.2.x/0.2.8.md) — 2026-10-24
 
 Read omitted table rows and preserve scientific article structure.

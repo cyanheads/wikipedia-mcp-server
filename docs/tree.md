@@ -1,6 +1,6 @@
 # wikipedia-mcp-server - Directory Structure
 
-Generated on: 2026-10-24 07:55:13
+Generated on: 2026-10-29 19:45:03
 
 ```text
 wikipedia-mcp-server/
@@ -26,6 +26,7 @@ wikipedia-mcp-server/
 ├── changelog/
 │   ├── 0.1.x/
 │   ├── 0.2.x/
+│   ├── 0.3.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -38,6 +39,8 @@ wikipedia-mcp-server/
 │   ├── add-resource/
 │   │   └── SKILL.md
 │   ├── add-service/
+│   │   └── SKILL.md
+│   ├── add-skill/
 │   │   └── SKILL.md
 │   ├── add-test/
 │   │   └── SKILL.md
@@ -135,6 +138,9 @@ wikipedia-mcp-server/
 │   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   └── tree.ts
+├── skills/
+│   └── wikipedia-guide/
+│       └── SKILL.md
 ├── src/
 │   ├── config/
 │   │   └── server-config.ts
@@ -148,6 +154,7 @@ wikipedia-mcp-server/
 │   │       │   ├── index.ts
 │   │       │   ├── wikipedia-get-article.tool.ts
 │   │       │   ├── wikipedia-get-languages.tool.ts
+│   │       │   ├── wikipedia-get-references.tool.ts
 │   │       │   ├── wikipedia-get-sections.tool.ts
 │   │       │   ├── wikipedia-get-summary.tool.ts
 │   │       │   ├── wikipedia-search-articles.tool.ts
@@ -161,13 +168,24 @@ wikipedia-mcp-server/
 │   │       └── wikipedia-service.ts
 │   └── index.ts
 ├── tests/
+│   ├── fixtures/
+│   │   └── references/
+│   │       ├── anne-hathaway.json
+│   │       ├── augustus.json
+│   │       ├── barack-obama.json
+│   │       ├── districts-of-algeria.json
+│   │       ├── fr-seine.json
+│   │       ├── seine.json
+│   │       └── simple-seine.json
 │   ├── helpers/
+│   │   ├── commonmark.ts
 │   │   └── wikipedia-service-mock.ts
 │   ├── mcp-server/
 │   │   └── tools/
 │   │       ├── definitions/
 │   │       │   ├── wikipedia-get-article.tool.test.ts
 │   │       │   ├── wikipedia-get-languages.tool.test.ts
+│   │       │   ├── wikipedia-get-references.tool.test.ts
 │   │       │   ├── wikipedia-get-sections.tool.test.ts
 │   │       │   ├── wikipedia-get-summary.tool.test.ts
 │   │       │   ├── wikipedia-read-search-contracts.tool.test.ts
@@ -177,6 +195,8 @@ wikipedia-mcp-server/
 │   │           └── escape-markdown.test.ts
 │   ├── prompts/
 │   ├── resources/
+│   ├── scripts/
+│   │   └── agent-doc-entry.test.ts
 │   ├── services/
 │   │   └── wikipedia/
 │   │       ├── text-blocks.test.ts
@@ -198,7 +218,9 @@ wikipedia-mcp-server/
 ├── Dockerfile
 ├── LICENSE
 ├── manifest.json
+├── mcp.json
 ├── package.json
+├── plugin.json
 ├── README.md
 ├── server.json
 ├── tsconfig.build.json
