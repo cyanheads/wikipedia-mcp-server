@@ -16,6 +16,7 @@ import {
   buildBaseUrl,
   DATA_TABLE_MAX_BYTES,
   type EditionIndex,
+  extractReferences,
   GEOSEARCH_MAX_LIMIT,
   getWikipediaService,
   htmlSectionToPlainText,
@@ -2830,6 +2831,47 @@ describe('htmlSectionToPlainText — parse-preview warnings (issue #57)', () => 
   });
 });
 
+describe('htmlSectionToPlainText — hidden CS1 messages (issue #75)', () => {
+  /**
+   * A "Modern sources" bibliography entry from Augustus, `action=parse` at revision 1382367536
+   * (captured 2026-10-29), trimmed to the one `<li>`. The page's TemplateStyles hide `.cs1-maint`
+   * and `.cs1-hidden-error` (`display:none`) and colour `.cs1-visible-error` without hiding it.
+   */
+  const CITATION =
+    '<link rel="mw-deduplicated-inline-style" href="mw-data:TemplateStyles:r1333433106" /><cite id="CITEREFRowell1962" class="citation book cs1">Rowell, Henry Thompson (1962). <a rel="nofollow" class="external text" href="https://books.google.com/books?id=mGJecvVJ4aUC"><i>Rome in the Augustan Age</i></a>. The Centers of Civilization Series. Vol.&#160;5. Norman, Oklahoma: University of Oklahoma Press. <a href="/wiki/ISBN_(identifier)" class="mw-redirect" title="ISBN (identifier)">ISBN</a>&#160;<a href="/wiki/Special:BookSources/0-8061-0956-4" title="Special:BookSources/0-8061-0956-4"><bdi>0-8061-0956-4</bdi></a>.</cite><span title="ctx&#95;ver=Z39.88-2004&amp;rft.genre=book" class="Z3988"></span>';
+  const MAINT =
+    '<span class="cs1-maint citation-comment"><code class="cs1-code">{{<a href="/wiki/Template:Cite_book" title="Template:Cite book">cite book</a>}}</code>:  CS1 maint: ignored ISBN errors (<a href="/wiki/Category:CS1_maint:_ignored_ISBN_errors" title="Category:CS1 maint: ignored ISBN errors">link</a>)</span>';
+  const ROWELL =
+    'Rowell, Henry Thompson (1962). Rome in the Augustan Age. The Centers of Civilization Series. Vol. 5. Norman, Oklahoma: University of Oklahoma Press. ISBN 0-8061-0956-4.';
+
+  it('drops the hidden maintenance message from the captured Augustus entry', () => {
+    const text = htmlSectionToPlainText(`<ul><li>${CITATION}${MAINT}</li></ul>`);
+    expect(text).not.toContain('CS1 maint');
+    expect(text).not.toContain('{{cite book}}');
+    expect(text).toBe(ROWELL);
+  });
+
+  it('leaves the citation text around a hidden message byte-identical', () => {
+    expect(htmlSectionToPlainText(`<ul><li>${CITATION}${MAINT}</li></ul>`)).toBe(
+      htmlSectionToPlainText(`<ul><li>${CITATION}</li></ul>`),
+    );
+  });
+
+  it('drops a hidden CS1 error message', () => {
+    const hidden =
+      '<span class="cs1-hidden-error citation-comment"><code class="cs1-code">{{cite web}}</code>: Unknown parameter <code class="cs1-code">&#124;agency=</code> ignored</span>';
+    expect(htmlSectionToPlainText(`<p>${CITATION}${hidden}</p>`)).toBe(ROWELL);
+  });
+
+  it('keeps a visible CS1 error, which readers see', () => {
+    const visible =
+      '<span class="cs1-visible-error citation-comment"><code class="cs1-code">{{cite web}}</code>: </span><span class="cs1-visible-error citation-comment">Missing or empty <code class="cs1-code">&#124;title=</code> (<a href="/wiki/Help:CS1_errors#citation_missing_title">help</a>)</span>';
+    expect(htmlSectionToPlainText(`<p>${CITATION}${visible}</p>`)).toBe(
+      `${ROWELL}{{cite web}}: Missing or empty |title= (help)`,
+    );
+  });
+});
+
 describe('WikipediaService.getArticleSection — rendered section reads (issue #28)', () => {
   beforeEach(() => {
     initService();
@@ -4710,5 +4752,424 @@ describe('shared scientific heading normalization (#71)', () => {
   ])('agrees with article headings for %s', (html, expected) => {
     expect(tocLineToPlainText(html)).toBe(expected);
     expect(htmlSectionToPlainText(`<h2>${html}</h2>`)).toBe(`== ${expected} ==`);
+  });
+});
+
+/**
+ * MediaWiki passes an editor's `data-*` attributes through to parser HTML, and `\b` matches after a
+ * hyphen, so an attribute rule must not read `data-x-class` as `class` or `data-x-style` as `style`.
+ * Each case puts the lookalike beside or before the real attribute, or in place of it.
+ */
+describe('htmlSectionToPlainText — attribute names read whole, never after a hyphen', () => {
+  it.each([
+    [
+      'HIDDEN_BY_STYLE',
+      '<p>Keep <span data-x-style="display:none">this</span> text.</p>',
+      'Keep this text.',
+    ],
+    [
+      'NOT_CONTENT',
+      '<div class="side-box" data-x-class="metadata">Boxed prose.</div>',
+      'Boxed prose.',
+    ],
+    [
+      'FURNITURE_BOX',
+      '<div class="metadata" data-x-class="side-box">Pointer prose.</div>',
+      'Pointer prose.',
+    ],
+    [
+      'NAVIGATION_ROLE',
+      '<div class="metadata" data-x-role="navigation">Nav prose.</div>',
+      'Nav prose.',
+    ],
+    [
+      'PRESENTATION_ROLE',
+      '<p>Before.</p><table data-x-role="presentation"><tr><td>Chart cell</td></tr></table>',
+      'Before.',
+    ],
+    [
+      'CLASS_ATTRIBUTE',
+      '<table data-x-class="infobox" class="wikitable"><tr><th>H</th></tr><tr><td>v</td></tr></table>',
+      '| H |\n| --- |\n| v |',
+    ],
+    ['hasClass', '<p>10<sup data-x-class="reference" class="x">2</sup> m</p>', '10² m'],
+    [
+      'MATH_FALLBACK_IMAGE',
+      '<p>See <img data-x-class="mwe-math-fallback-image-inline" class="photo" alt="caption"> here.</p>',
+      'See here.',
+    ],
+    [
+      'ALT_ATTRIBUTE',
+      '<p>Let <img class="mwe-math-fallback-image-inline" data-x-alt="wrong" alt="{\\displaystyle x}"> be.</p>',
+      'Let {\\displaystyle x} be.',
+    ],
+    [
+      'ALTTEXT_ATTRIBUTE',
+      '<p>Let <math data-x-alttext="wrong" alttext="y^{2}"><mi>y</mi></math> be.</p>',
+      'Let y^{2} be.',
+    ],
+    [
+      'colspan',
+      '<table class="wikitable"><tr><th>A</th><th>B</th></tr><tr><td data-x-colspan="2">a</td><td>b</td></tr></table>',
+      '| A | B |\n| --- | --- |\n| a | b |',
+    ],
+    [
+      'rowspan',
+      '<table class="wikitable"><tr><th>A</th><th>B</th></tr><tr><td data-x-rowspan="2">a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table>',
+      '| A | B |\n| --- | --- |\n| a | b |\n| c | d |',
+    ],
+  ])('%s ignores a data- attribute ending in its name', (_rule, html, expected) => {
+    expect(htmlSectionToPlainText(html)).toBe(expected);
+  });
+});
+
+/** A footnote list entry as legacy parser HTML writes it: escaped id, backlink, reference text. */
+const footnote = (id: string, body: string) =>
+  `<li id="${id.replaceAll('_', '&#95;')}"><span class="mw-cite-backlink"><b><a href="#cite_ref-${id}">^</a></b></span> <span class="reference-text">${body}</span></li>`;
+const marker = (id: string, label: string) =>
+  `<sup id="cite_ref-${id}" class="reference"><a href="#${id}"><span class="cite-bracket">&#91;</span>${label}<span class="cite-bracket">&#93;</span></a></sup>`;
+
+describe('extractReferences — footnote shapes (#72)', () => {
+  it('reads ids, groups, and labels across lists in document order', () => {
+    const html = `<p>Claim.${marker('cite_note-a_1-1', 'a')} Other.${marker('cite_note-2', '1')}</p><ol class="references" data-mw-group="note&#95;group">${footnote('cite_note-a_1-1', 'A note.')}</ol><ol class="references">${footnote('cite_note-2', 'Main source.')}</ol>`;
+    expect(extractReferences(html).references).toEqual([
+      { id: 'cite_note-a_1-1', group: 'note_group', label: 'a', text: 'A note.' },
+      { id: 'cite_note-2', label: '1', text: 'Main source.' },
+    ]);
+  });
+
+  it('labels a footnote cited only inside another, and keeps that marker in the citing text', () => {
+    const html = `<p>Claim.${marker('cite_note-1', 'a')}</p><ol class="references" data-mw-group="lower-alpha">${footnote('cite_note-1', `See both.${marker('cite_note-2', '1')}${marker('cite_note-3', '2')}`)}</ol><ol class="references">${footnote('cite_note-2', 'First.')}${footnote('cite_note-3', 'Second.')}</ol>`;
+    const { references } = extractReferences(html);
+    expect(references.map((entry) => [entry.id, entry.label, entry.text])).toEqual([
+      ['cite_note-1', 'a', 'See both.[1][2]'],
+      ['cite_note-2', '1', 'First.'],
+      ['cite_note-3', '2', 'Second.'],
+    ]);
+  });
+
+  it('trims the whitespace around a marker from its label', () => {
+    const html = `<p>Claim.<sup id="cite_ref-1" class="reference">&#8202; <a href="#cite_note-1"><span class="cite-bracket">&#91;</span>7<span class="cite-bracket">&#93;</span></a>&#8202; </sup></p><ol class="references">${footnote('cite_note-1', 'Source.')}</ol>`;
+    expect(extractReferences(html).references).toEqual([
+      { id: 'cite_note-1', label: '7', text: 'Source.' },
+    ]);
+  });
+
+  /**
+   * `cite_note-TrumpMakesClaimsOfElectionFraud-294` and its first in-text marker from Joe Biden,
+   * revision 1382315866, verbatim. Each `{{rp}}` page number (`sup.reference.nowrap`) is set off by
+   * hair spaces, which the page shows as "[288]: 3–4 [289]".
+   */
+  const BIDEN_RP_FOOTNOTE =
+    '<p>Claim.<sup id="cite&#95;ref-TrumpMakesClaimsOfElectionFraud&#95;294-0" class="reference"><a href="#cite_note-TrumpMakesClaimsOfElectionFraud-294"><span class="cite-bracket">&#91;</span>e<span class="cite-bracket">&#93;</span></a></sup></p><ol class="references" data-mw-group="lower-alpha"><li id="cite&#95;note-TrumpMakesClaimsOfElectionFraud-294"><span class="mw-cite-backlink"><b><a href="#cite_ref-TrumpMakesClaimsOfElectionFraud_294-0">^</a></b></span> <span class="reference-text">Attributed to multiple references:<sup id="cite&#95;ref-JackSmithReportVol1&#95;292-0" class="reference"><a href="#cite_note-JackSmithReportVol1-292"><span class="cite-bracket">&#91;</span>288<span class="cite-bracket">&#93;</span></a></sup><sup class="reference nowrap"><span title="Pages: 3–4">&#58;&#8202;3–4&#8202;</span></sup><sup id="cite&#95;ref-JanuarySixFinalReport&#95;293-0" class="reference"><a href="#cite_note-JanuarySixFinalReport-293"><span class="cite-bracket">&#91;</span>289<span class="cite-bracket">&#93;</span></a></sup><sup class="reference nowrap"><span title="Pages: 195–233">&#58;&#8202;195–233&#8202;</span></sup></span>\n</li></ol>';
+
+  it('keeps the space that ends an {{rp}} page number before the next marker (Joe Biden)', () => {
+    expect(extractReferences(BIDEN_RP_FOOTNOTE).references).toEqual([
+      {
+        id: 'cite_note-TrumpMakesClaimsOfElectionFraud-294',
+        group: 'lower-alpha',
+        label: 'e',
+        text: 'Attributed to multiple references:[288]: 3–4 [289]: 195–233',
+      },
+    ]);
+  });
+
+  it('leaves the label out when no marker links to a footnote', () => {
+    const html = `<ol class="references">${footnote('cite_note-orphan-1', 'Unused.')}</ol>`;
+    expect(extractReferences(html).references).toEqual([
+      { id: 'cite_note-orphan-1', text: 'Unused.' },
+    ]);
+  });
+
+  // A reference list nested in a footnote is not a footnote list of its own: the renderer drops it
+  // with every other `ol.references`, and its entries are not listed twice.
+  it('treats a list inside a footnote as its text, not as more footnotes', () => {
+    const html = `<ol class="references">${footnote('cite_note-1', 'Two sources:<ul><li>One.</li><li>Two.</li></ul>')}<li id="cite_note-2"><span class="reference-text">Next.<ol class="references"><li id="cite_note-inner">Nested.</li></ol></span></li></ol>`;
+    expect(extractReferences(html).references.map((entry) => [entry.id, entry.text])).toEqual([
+      ['cite_note-1', 'Two sources:\n\nOne.\nTwo.'],
+      ['cite_note-2', 'Next.'],
+    ]);
+  });
+
+  it('falls back to the whole entry when it has no reference-text span', () => {
+    const html = '<ol class="references"><li id="cite_note-9">Bare <i>entry</i>.</li></ol>';
+    expect(extractReferences(html).references).toEqual([
+      { id: 'cite_note-9', text: 'Bare entry.' },
+    ]);
+  });
+
+  it('keeps each external link once and verbatim, and reads DOIs from doi.org links', () => {
+    const body = [
+      '<a rel="nofollow" class="external text" href="https://example.org/a?x=1&amp;y=2">A</a>',
+      '<a rel="nofollow" class="external text" href="https://web.archive.org/web/2020/https://example.org/a?x=1&amp;y=2">Archived</a>',
+      '<a rel="nofollow" class="external text" href="https://example.org/a?x=1&amp;y=2">again</a>',
+      '<a rel="nofollow" class="external text" href="https://doi.org/10.1017%2FCBO9781316412299">10.1017/CBO9781316412299</a>',
+      '<a rel="nofollow" class="external text" href="https://dx.doi.org/10.4000/physio-geo.2181">x</a>',
+      '<a rel="nofollow" class="external text" href="https://doi.org/10.1000/bad%E0%A4%A">bad</a>',
+      '<a rel="nofollow" class="external text" href="https://doi.org/">root</a>',
+      '<a rel="nofollow" class="external free" href="https://notdoi.org/10.1/x">x</a>',
+      '<a href="/wiki/Digital_object_identifier" title="Digital object identifier">doi</a>',
+      // The parser upgrades links to HSTS hosts and keeps the editor's URL in an earlier attribute.
+      '<a rel="nofollow" class="external text" data-mw-original-href="http://www.pewglobal.org/2016/x/" href="https://www.pewglobal.org/2016/x/">Pew</a>',
+    ].join(' ');
+    const [entry] = extractReferences(
+      `<ol class="references">${footnote('cite_note-1', body)}</ol>`,
+    ).references;
+    expect(entry?.urls).toEqual([
+      'https://example.org/a?x=1&y=2',
+      'https://web.archive.org/web/2020/https://example.org/a?x=1&y=2',
+      'https://doi.org/10.1017%2FCBO9781316412299',
+      'https://dx.doi.org/10.4000/physio-geo.2181',
+      'https://doi.org/10.1000/bad%E0%A4%A',
+      'https://doi.org/',
+      'https://notdoi.org/10.1/x',
+      'https://www.pewglobal.org/2016/x/',
+    ]);
+    expect(entry?.dois).toEqual([
+      '10.1017/CBO9781316412299',
+      '10.4000/physio-geo.2181',
+      '10.1000/bad%E0%A4%A',
+    ]);
+  });
+
+  it('resolves short citations to the anchored full citations, once each', () => {
+    const html = `<ol class="references">${footnote('cite_note-1', '<a href="#CITEREFSmith&#95;2000">Smith 2000</a>, p. 1; <a href="#CITEREFLost1999">Lost 1999</a>.')}${footnote('cite_note-2', '<a href="#CITEREFSmith_2000">Smith 2000</a>, p. 2.')}</ol><ul><li><cite id="CITEREFSmith&#95;2000" class="citation book cs1">Smith, J. (2000). <i>Title</i>. <a rel="nofollow" class="external text" href="https://doi.org/10.1%2Fx">doi</a>.</cite><span class="cs1-maint citation-comment">CS1 maint: extra text</span></li><li><cite id="CITEREFUnused" class="citation">Unused.</cite></li></ul>`;
+    const { references, works } = extractReferences(html);
+    expect(references.map((entry) => entry.work_ids)).toEqual([
+      ['CITEREFSmith_2000', 'CITEREFLost1999'],
+      ['CITEREFSmith_2000'],
+    ]);
+    expect([...works.values()]).toEqual([
+      {
+        id: 'CITEREFSmith_2000',
+        text: 'Smith, J. (2000). Title. doi.',
+        urls: ['https://doi.org/10.1%2Fx'],
+        dois: ['10.1/x'],
+      },
+    ]);
+  });
+
+  it('drops hidden CS1 messages from footnote text and keeps visible ones (#75)', () => {
+    const body =
+      '<cite class="citation web cs1">"Title".</cite><span class="cs1-maint citation-comment"><code class="cs1-code">{{cite web}}</code>: CS1 maint: url-status (<a href="/wiki/Category:CS1_maint:_url-status">link</a>)</span><span class="cs1-visible-error citation-comment">Missing or empty |url=</span>';
+    expect(
+      extractReferences(`<ol class="references">${footnote('cite_note-1', body)}</ol>`)
+        .references[0]?.text,
+    ).toBe('"Title".Missing or empty |url=');
+  });
+
+  it('keeps reading to the end of the payload when the last list or entry is unclosed', () => {
+    const html = `<p>${marker('cite_note-1', '1')}</p><ol class="references">${footnote('cite_note-1', 'Closed.')}<li id="cite_note-2"><span class="reference-text">Unclosed <b>text`;
+    expect(extractReferences(html).references.map((entry) => [entry.id, entry.text])).toEqual([
+      ['cite_note-1', 'Closed.'],
+      ['cite_note-2', 'Unclosed'],
+    ]);
+  });
+
+  it('finds no footnotes in an article without a reference list', () => {
+    expect(extractReferences('<p>Prose only.</p><ul><li>Item</li></ul>')).toEqual({
+      references: [],
+      works: new Map(),
+    });
+  });
+});
+
+describe('WikipediaService.getReferences — one deadline across attempts (#72)', () => {
+  beforeEach(() => {
+    initService();
+    useFakeClock();
+  });
+
+  const PARSE = {
+    parse: {
+      title: 'Seine',
+      pageid: 1,
+      revid: 5,
+      text: `<p>${marker('cite_note-1', '1')}</p><ol class="references">${footnote('cite_note-1', 'Source.')}</ol>`,
+    },
+  };
+
+  /** A fetch that answers after `delayMs`, or rejects when its signal aborts first. */
+  function delayedFetch(delayMs: number) {
+    let requests = 0;
+    const spy = vi.spyOn(globalThis, 'fetch').mockImplementation((input, init) => {
+      requests++;
+      expect(new URL(String(input instanceof Request ? input.url : input)).hostname).toBe(
+        'en.wikipedia.org',
+      );
+      return new Promise<Response>((resolve, reject) => {
+        // An infinite delay never answers: setTimeout would clamp it to 1 ms.
+        const timer = Number.isFinite(delayMs)
+          ? setTimeout(() => resolve(Response.json(PARSE)), delayMs)
+          : undefined;
+        init?.signal?.addEventListener(
+          'abort',
+          () => {
+            clearTimeout(timer);
+            reject(init.signal?.reason);
+          },
+          { once: true },
+        );
+      });
+    });
+    onTestFinished(() => {
+      spy.mockRestore();
+    });
+    return () => requests;
+  }
+
+  it('lets one slow full-page parse finish past the default 15 s attempt timeout', async () => {
+    const requests = delayedFetch(20_000);
+    const startedAt = Date.now();
+    const { value, error } = await settle(
+      getWikipediaService().getReferences('Seine', 'en', createMockContext()),
+    );
+    expect(error).toBeUndefined();
+    expect(value?.references).toEqual([{ id: 'cite_note-1', label: '1', text: 'Source.' }]);
+    expect(requests()).toBe(1);
+    expect(Date.now() - startedAt).toBe(20_000);
+  });
+
+  it('bounds a stalled parse at the 30 s request deadline, retry included', async () => {
+    const requests = delayedFetch(Number.POSITIVE_INFINITY);
+    const startedAt = Date.now();
+    const { error } = await settle(
+      getWikipediaService().getReferences('Seine', 'en', createMockContext()),
+    );
+    expect(Date.now() - startedAt).toBeLessThanOrEqual(30_000);
+    expect(requests()).toBe(2);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.Timeout,
+      data: { reason: 'retry_deadline_exceeded', deadlineMs: 30_000 },
+    });
+  });
+
+  it('rethrows the caller’s cancellation mid-parse without retrying', async () => {
+    const requests = delayedFetch(Number.POSITIVE_INFINITY);
+    const controller = new AbortController();
+    const outcome = capture(
+      getWikipediaService().getReferences(
+        'Seine',
+        'en',
+        createMockContext({ signal: controller.signal }),
+      ),
+    );
+    await vi.advanceTimersByTimeAsync(5_000);
+    controller.abort();
+    await vi.runAllTimersAsync();
+    expect(requests()).toBe(1);
+    expect((await outcome).error).toMatchObject({
+      code: JsonRpcErrorCode.RequestCancelled,
+      message: expect.stringContaining('was aborted'),
+    });
+  });
+});
+
+describe('extractReferences — work stays linear in the payload (#72)', () => {
+  beforeEach(() => vi.restoreAllMocks());
+
+  /** Fastest of five runs, in milliseconds of this thread's CPU time. */
+  function cpuMs(html: string): number {
+    extractReferences(html);
+    let fastest = Number.POSITIVE_INFINITY;
+    for (let run = 0; run < 5; run++) {
+      const started = process.threadCpuUsage();
+      extractReferences(html);
+      const used = process.threadCpuUsage(started);
+      fastest = Math.min(fastest, (used.user + used.system) / 1000);
+    }
+    return fastest;
+  }
+
+  /** `size` characters of `unit` repeated, so every shape grows by the same count. */
+  const fill = (unit: string, size: number) => unit.repeat(Math.ceil(size / unit.length));
+  const inEntry = (inner: string) =>
+    `<ol class="references"><li id="cite_note-1"><span class="reference-text">${inner}</span></li></ol>`;
+
+  /**
+   * Grow `shape` by doubling across a 64× span and bound each size before running the next, so a
+   * quadratic regression fails at the first oversized step instead of hanging on the largest. The
+   * full-span ratio stays under 256: linear work grows 64×, quadratic 4096×.
+   */
+  function expectLinear(shape: (size: number) => string, from: number): void {
+    const samples: number[] = [];
+    for (let size = from; size <= from * 64; size *= 2) {
+      const ms = cpuMs(shape(size));
+      expect(ms).toBeLessThan(1_000);
+      samples.push(ms);
+    }
+    expect((samples.at(-1) as number) / Math.max(samples[0] as number, 0.05)).toBeLessThan(256);
+  }
+
+  // Shapes that reach a regex scan start at 1,250 characters, so their 64× span ends at 80,000,
+  // below the size where Bun's regex engine changes mode. The digit run carries 5,000 → 320,000.
+  it.each([
+    ['one long line ending in a break', (n: number) => `${fill('§1 x', n)}\ny`],
+    ['breaks throughout', (n: number) => fill('  \r\n', n)],
+    ['a long line inside a footnote', (n: number) => inEntry(`${fill('§1 x', n)}\ny`)],
+    ['breaks throughout a footnote', (n: number) => inEntry(fill('  \r\n', n))],
+    ['repeated list openers, never closed', (n: number) => fill('<ol class="references">', n)],
+    [
+      'repeated entry openers in an open list',
+      (n: number) => `<ol class="references">${fill('<li id="cite_note-1">', n)}`,
+    ],
+    ['repeated marker openers, never closed', (n: number) => fill('<sup class="reference">', n)],
+    [
+      'repeated marker prefixes',
+      (n: number) => `${fill('<sup class="reference"><a href="#cite_note-', n)}>`,
+    ],
+    [
+      'repeated work anchors, never closed',
+      (n: number) =>
+        `${inEntry(fill('<a href="#CITEREFa">a</a>', n / 2))}${fill('<cite id="CITEREFa">', n / 2)}`,
+    ],
+    ['nested openers', (n: number) => `${fill('<a', n / 2)}${fill('>', n / 2)}`],
+    ['nested list openers', (n: number) => `${fill('<ol', n / 2)}${fill('>', n / 2)}`],
+    [
+      'repeated external links in a footnote',
+      (n: number) => inEntry(fill('<a class="external" href="https://doi.org/10.1%2F', n)),
+    ],
+    // The renderer's attribute rules, reached through the footnote text it renders.
+    ['repeated image openers, never closed', (n: number) => inEntry(`${fill('<img ', n)}>`)],
+    [
+      'repeated formula-image openers, never closed',
+      (n: number) => inEntry(`${fill('<img class="mwe-math-fallback-image-', n)}>`),
+    ],
+    [
+      'repeated formula openers, never closed',
+      (n: number) => inEntry(`${fill('<math alttext="x', n)}>`),
+    ],
+    [
+      'one open tag of attributes ending in a rule’s name',
+      (n: number) =>
+        inEntry(
+          `<span${fill(' data-x-class="metadata side-box" data-x-style="display:none" data-x-role="navigation" data-x-alt="a"', n)} class="x">t</span>`,
+        ),
+    ],
+    [
+      'one open tag of attribute names without values',
+      (n: number) => inEntry(`<div${fill(' class style role alt alttext', n)}>t</div>`),
+    ],
+    [
+      'one class value of near-miss tokens',
+      (n: number) => inEntry(`<div class="${fill('metadatax side-boxy referencex ', n)}">t</div>`),
+    ],
+    [
+      'one style value of near-misses',
+      (n: number) => inEntry(`<span style="${fill('display: displa ', n)}">t</span>`),
+    ],
+    [
+      'one table cell of span lookalikes',
+      (n: number) =>
+        inEntry(
+          `<table class="wikitable"><tr><td${fill(' data-x-colspan="2" rowspan', n)}>a</td></tr></table>`,
+        ),
+    ],
+  ])('stays linear on %s', (_name, shape) => {
+    expectLinear(shape, 1_250);
+  });
+
+  it('stays linear on a long digit run inside a footnote, 5,000 to 320,000 characters', () => {
+    expectLinear((n) => inEntry(fill('1', n)), 5_000);
   });
 });

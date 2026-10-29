@@ -5,6 +5,7 @@
 
 import { wikipediaGetArticle } from './wikipedia-get-article.tool.js';
 import { wikipediaGetLanguages } from './wikipedia-get-languages.tool.js';
+import { wikipediaGetReferences } from './wikipedia-get-references.tool.js';
 import { wikipediaGetSections } from './wikipedia-get-sections.tool.js';
 import { wikipediaGetSummary } from './wikipedia-get-summary.tool.js';
 import { wikipediaSearchArticles } from './wikipedia-search-articles.tool.js';
@@ -17,4 +18,5 @@ export const allToolDefinitions = [
   wikipediaGetSections,
   wikipediaSearchNearby,
   wikipediaGetLanguages,
+  wikipediaGetReferences,
 ];

@@ -1,0 +1,14 @@
+{
+  "source": {
+    "url": "https://en.wikipedia.org/w/api.php?action=parse&format=json&formatversion=2&prop=text|revid&redirects=true&disableeditsection=true&disabletoc=true&disablelimitreport=true&page=Districts_of_Algeria",
+    "revid": 1339511627,
+    "captured": "2026-10-29T17:43:01Z",
+    "trimmed": "The first in-text sup.reference marker per footnote (its id attribute removed), every ol.references list, and every CITEREF-anchored citation outside those lists; article prose and empty COinS (span.Z3988) metadata removed."
+  },
+  "parse": {
+    "title": "Districts of Algeria",
+    "pageid": 14176457,
+    "revid": 1339511627,
+    "text": "<p></p>\n"
+  }
+}

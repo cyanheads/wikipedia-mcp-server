@@ -52,12 +52,22 @@ import type {
  */
 const HEADING_LINE = /^(={2,6})\s*(.+?)\s*\1\s*$/gm;
 
+/*
+ * Every open-tag attribute rule in this file reads an attribute name only where whitespace precedes
+ * it, `(?<=\s)class`. A `\b` boundary also matches after a hyphen, and MediaWiki passes an editor's
+ * `data-*` attributes through, so `\bclass` or `\bstyle` would read a `data-x-class` or `data-x-style`
+ * standing before the real attribute, or in place of it.
+ */
+
 /**
  * Open-tag test for any of the given class tokens, compiled once per rule. A token matches whole, so
  * `navbar` does not reach `navbar-ct-mini`, the title beside a navbar's edit links.
  */
 function hasClass(...tokens: string[]): (openTag: string) => boolean {
-  const re = new RegExp(`class\\s*=\\s*"(?:[^"]*\\s)?(?:${tokens.join('|')})(?=[\\s"])`, 'i');
+  const re = new RegExp(
+    `(?<=\\s)class\\s*=\\s*"(?:[^"]*\\s)?(?:${tokens.join('|')})(?=[\\s"])`,
+    'i',
+  );
   return (openTag) => re.test(openTag);
 }
 
@@ -66,7 +76,7 @@ function hasClass(...tokens: string[]): (openTag: string) => boolean {
  * one holding data — set by `{{col-begin}}`, succession boxes, and the other layout templates — so
  * it tracks new layout templates instead of a hand-maintained class list.
  */
-const PRESENTATION_ROLE = /\brole\s*=\s*"presentation"/i;
+const PRESENTATION_ROLE = /(?<=\s)role\s*=\s*"presentation"/i;
 
 /**
  * MediaWiki's marker for page furniture that is not article content. Maintenance banners
@@ -76,7 +86,7 @@ const PRESENTATION_ROLE = /\brole\s*=\s*"presentation"/i;
  *
  * On its own it does not establish that an element is furniture — see {@link isFurniture}.
  */
-const NOT_CONTENT = /\bclass\s*=\s*"[^"]*\bmetadata\b/i;
+const NOT_CONTENT = /(?<=\s)class\s*=\s*"[^"]*\bmetadata\b/i;
 
 /** Whether a table lays out article content, and so must survive rather than be dropped. */
 function isLayoutTable(openTag: string): boolean {
@@ -84,7 +94,7 @@ function isLayoutTable(openTag: string): boolean {
 }
 
 /** An open tag's `class` attribute value. */
-const CLASS_ATTRIBUTE = /\bclass\s*=\s*"([^"]*)"/i;
+const CLASS_ATTRIBUTE = /(?<=\s)class\s*=\s*"([^"]*)"/i;
 
 /** Phylogenetic trees carry article content, independently of selectable data tables. */
 const isClade = hasClass('clade');
@@ -106,7 +116,7 @@ function dataTableKind(openTag: string): 'grid' | 'infobox' | undefined {
 }
 
 /** The parser's marker for an element that points elsewhere rather than carrying prose. */
-const NAVIGATION_ROLE = /\brole\s*=\s*"navigation"/i;
+const NAVIGATION_ROLE = /(?<=\s)role\s*=\s*"navigation"/i;
 
 /**
  * Container families whose entire body is furniture, on whatever tag they are emitted.
@@ -120,7 +130,7 @@ const NAVIGATION_ROLE = /\brole\s*=\s*"navigation"/i;
  * without the marker — whose captions describe the recording in the article's own voice and are
  * prose, not chrome.
  */
-const FURNITURE_BOX = /\bclass\s*=\s*"[^"]*\b(?:side-box|ambox)\b/i;
+const FURNITURE_BOX = /(?<=\s)class\s*=\s*"[^"]*\b(?:side-box|ambox)\b/i;
 
 /**
  * Whether an element is page furniture, judged from its open tag whatever its tag name.
@@ -144,7 +154,7 @@ function isFurniture(openTag: string): boolean {
 }
 
 /** An element MediaWiki hides from the rendered page with an inline style. */
-const HIDDEN_BY_STYLE = /\bstyle\s*=\s*"[^"]*display\s*:\s*none/i;
+const HIDDEN_BY_STYLE = /(?<=\s)style\s*=\s*"[^"]*display\s*:\s*none/i;
 
 /**
  * Links for editing the page or its Wikidata item rather than content: `Module:Navbar`'s `navbar`
@@ -171,6 +181,10 @@ const isEditLinks = hasClass('navbar', 'wikidata-link');
  * so {@link isFurniture} does not reach it. `div.infobox-caption` is an infobox image's or map's
  * caption, which a rendered infobox would otherwise print as a stray line between the title and the
  * first field — dropped for the same reason `figure` is: it describes a picture the text cannot carry.
+ * `span.cs1-maint` and `span.cs1-hidden-error` are Citation Style 1's editor-facing messages
+ * ("{{cite book}}: CS1 maint: ignored ISBN errors"), which the page hides through TemplateStyles CSS
+ * rather than an inline style, so {@link HIDDEN_BY_STYLE} never sees them. `span.cs1-visible-error`
+ * stays: readers see it.
  *
  * The rest are artifacts of asking the parser for one section in isolation: for a section that cites
  * something, `sup.reference` is the `[1]` footnote marker whose target is not in the payload,
@@ -190,7 +204,7 @@ const DROP_RULES: Readonly<Record<string, (openTag: string) => boolean>> = {
   div: hasClass('spoken-wikipedia', 'infobox-caption', 'preview-warning'),
   sup: hasClass('reference'),
   ol: hasClass('references'),
-  span: hasClass('mw-ext-cite-error'),
+  span: hasClass('mw-ext-cite-error', 'cs1-maint', 'cs1-hidden-error'),
 };
 
 /**
@@ -225,24 +239,30 @@ const OPEN_TAG = /<([a-z][a-z0-9]*)\b[^>]*>/i;
  * `<img>` whose `alt` carries the TeX the article itself stores. Dropping the hidden twin removes
  * the MathML leaf text that otherwise renders as a column of single glyphs; recovering the `alt`
  * keeps the formula, which lived only inside that twin's `<annotation>` before.
+ *
+ * The tag's own text stops at a `<` as well as at its `>`: the parser escapes both inside attribute
+ * values (`alt="{\displaystyle H&gt;0}"`), so stopping there never cuts a real tag short and keeps
+ * the scan linear in the payload.
  */
 const MATH_FALLBACK_IMAGE =
-  /<img\b[^>]*\bclass\s*=\s*"[^"]*\bmwe-math-fallback-image-[^"]*"[^>]*>/gi;
+  /<img\b[^<>]*(?<=\s)class\s*=\s*"[^"]*\bmwe-math-fallback-image-[^"]*"[^<>]*>/gi;
 
 /** The `alt` attribute of a single tag, still HTML-escaped as the parser emitted it. */
-const ALT_ATTRIBUTE = /\balt\s*=\s*"([^"]*)"/i;
+const ALT_ATTRIBUTE = /(?<=\s)alt\s*=\s*"([^"]*)"/i;
 
 /**
  * A MathML formula, visible — the form TextExtracts' HTML mode emits, with no fallback image and no
  * hidden twin. Group 1 is the open tag's attributes, whose `alttext` carries the TeX. The open tag is
  * read attribute by attribute because that TeX holds a literal `>` (`\varepsilon >0`), which would
- * end a `[^>]*` match mid-attribute and spill the rest of the formula into the text. The body cannot
- * run into another `<math`, so an unclosed formula swallows nothing past the next one.
+ * end a `[^>]*` match mid-attribute and spill the rest of the formula into the text. A `<` ends the
+ * open tag's scan, quoted or not: TextExtracts escapes it in an attribute (`0&lt;|x-p|`), so stopping
+ * there never cuts a real tag short and keeps the scan linear in the payload. The body cannot run
+ * into another `<math`, so an unclosed formula swallows nothing past the next one.
  */
-const MATH_ELEMENT = /<math\b((?:"[^"]*"|'[^']*'|[^>"'])*)>(?:(?!<math\b)[\s\S])*?<\/math\s*>/gi;
+const MATH_ELEMENT = /<math\b((?:"[^"<]*"|'[^'<]*'|[^<>"'])*)>(?:(?!<math\b)[\s\S])*?<\/math\s*>/gi;
 
 /** The `alttext` attribute of a `<math>` open tag, still HTML-escaped. */
-const ALTTEXT_ATTRIBUTE = /\balttext\s*=\s*"([^"]*)"/i;
+const ALTTEXT_ATTRIBUTE = /(?<=\s)alttext\s*=\s*"([^"]*)"/i;
 
 /** Named HTML entities the MediaWiki parser emits, beyond the numeric escapes handled generically. */
 const NAMED_ENTITIES: Readonly<Record<string, string>> = {
@@ -563,6 +583,73 @@ export function articleTableRead(
   return { index: tableIndex, continuation: parsed.data };
 }
 
+/**
+ * Largest reference page, in UTF-8 bytes on each surface — the `structuredContent` JSON and the
+ * `content[]` text. Pages hold whole entries, so the budget matches a table page's.
+ */
+export const REFERENCES_PAGE_MAX_BYTES = DATA_TABLE_MAX_BYTES;
+
+/** Revision and entry position bound to the exact references request. */
+const ReferencesCursorSchema = z.strictObject({
+  kind: z.literal('wikipedia_references_v1'),
+  offset: z.number().int().positive(),
+  limit: z.literal(REFERENCES_PAGE_MAX_BYTES),
+  title: z.string(),
+  language: z.string(),
+  revisionId: z.number().int().positive(),
+});
+
+/** A validated references continuation: the pinned revision and the first entry of the next page. */
+export type ReferencesCursor = z.infer<typeof ReferencesCursorSchema>;
+
+/**
+ * Decode a references cursor, rejecting a malformed one or one minted for another title or language
+ * before any edition or article lookup. An empty cursor is the first page.
+ */
+export function referencesContinuation(
+  title: string,
+  language: string,
+  cursor: string | undefined,
+  ctx: RequestContext,
+): ReferencesCursor | undefined {
+  if (!cursor) return;
+  let decoded: unknown;
+  try {
+    decoded = decodeCursor(cursor, ctx);
+  } catch (error) {
+    if (!(error instanceof McpError) || error.data?.reason !== 'invalid_cursor') throw error;
+    throw validationError(
+      'The references cursor is malformed. Pass the previous next_cursor unchanged.',
+      { reason: 'invalid_cursor' },
+      { cause: error },
+    );
+  }
+  const parsed = ReferencesCursorSchema.safeParse(decoded);
+  if (!parsed.success || parsed.data.title !== title || parsed.data.language !== language) {
+    throw validationError('The references cursor does not match this article or language.', {
+      reason: 'invalid_cursor',
+    });
+  }
+  return parsed.data;
+}
+
+/** The opaque `next_cursor` continuing a references read at `offset` of the pinned revision. */
+export function referencesCursor(
+  title: string,
+  language: string,
+  revisionId: number,
+  offset: number,
+): string {
+  return encodeCursor({
+    kind: 'wikipedia_references_v1',
+    title,
+    language,
+    revisionId,
+    offset,
+    limit: REFERENCES_PAGE_MAX_BYTES,
+  } satisfies ReferencesCursor);
+}
+
 /** Selected-table metadata; `truncated` remains reserved for full-article outlining. */
 type TablePage = {
   table_index: number;
@@ -590,7 +677,9 @@ const CELL_LINE_BREAK =
 
 /** A `colspan`/`rowspan` value; a missing, zero, or non-numeric one spans a single cell. */
 function spanAttribute(openTag: string, name: 'colspan' | 'rowspan'): number {
-  const value = Number(new RegExp(`\\b${name}\\s*=\\s*"?(\\d+)`, 'i').exec(openTag)?.[1] ?? '1');
+  const value = Number(
+    new RegExp(`(?<=\\s)${name}\\s*=\\s*"?(\\d+)`, 'i').exec(openTag)?.[1] ?? '1',
+  );
   return Math.max(value, 1);
 }
 
@@ -1049,6 +1138,264 @@ function renderSectionHtml(html: string, render: typeof renderTable): string {
     .trim();
 
   return parked.restore(text);
+}
+
+// ---------------------------------------------------------------------------
+// Reference lists
+// ---------------------------------------------------------------------------
+
+/** One footnote of an article's reference lists, in the shape `wikipedia_get_references` returns. */
+export type ReferenceEntry = {
+  id: string;
+  group?: string;
+  label?: string;
+  text: string;
+  urls?: string[];
+  dois?: string[];
+  work_ids?: string[];
+};
+
+/** A full citation a short citation (`{{sfn}}`) links to through its `CITEREF…` anchor. */
+export type ReferenceWork = { id: string; text: string; urls?: string[]; dois?: string[] };
+
+/** An in-text footnote marker, `[2]`; the same class the renderer drops it by. */
+const isFootnoteMarker = hasClass('reference');
+
+/** A rendered reference list, `<references/>` or `{{reflist}}`. */
+const isReferenceList = hasClass('references');
+
+/** A list entry's citation body, without the backlinks beside it. */
+const isReferenceText = hasClass('reference-text');
+
+/** A link leaving the wiki: `external text`, `external free`, or `external autonumber`. */
+const isExternalLink = hasClass('external');
+
+/**
+ * An open tag's `id`, `href`, and reference-list group attributes, still HTML-escaped. Each name
+ * must follow whitespace: `\b` also matches after a hyphen, so `\bhref` would read the
+ * `data-mw-original-href` that precedes `href` on a link the parser rewrote from http to https.
+ */
+const ID_ATTRIBUTE = /(?<=\s)id\s*=\s*"([^"]*)"/i;
+const HREF_ATTRIBUTE = /(?<=\s)href\s*=\s*"([^"]*)"/i;
+const GROUP_ATTRIBUTE = /(?<=\s)data-mw-group\s*=\s*"([^"]*)"/i;
+
+/** The id prefix CS1 and Harvard templates give a full citation that short citations link to. */
+const WORK_ANCHOR_PREFIX = 'CITEREF';
+
+/** Hosts whose path is a DOI: `{{doi}}` and CS1 `doi=` link `doi.org`; some editions `dx.doi.org`. */
+const DOI_HOSTS: ReadonlySet<string> = new Set(['doi.org', 'dx.doi.org']);
+
+/** `html` cut after its last `>`, so a tag scan never runs `[^>]*` off the end of the payload. */
+function taggedPrefix(html: string): string {
+  return html.slice(0, html.lastIndexOf('>') + 1);
+}
+
+/**
+ * A footnote marker's visible text, `[2]` or `[N 1]`, read from its body, each whitespace run one
+ * space. Untrimmed: an `{{rp}}` page number (`: 3–4`) ends in a hair space that separates it from
+ * the next marker. A label trims it.
+ */
+function markerText(body: string): string {
+  return decodeEntities(stripTags(body)).replace(/\s+/g, ' ');
+}
+
+/**
+ * Turn every footnote marker in `html` into its visible text, so a note citing other notes keeps
+ * them (`Attributed to multiple references:[1][2][3]`) instead of the renderer dropping them, and an
+ * `{{rp}}` page number keeps the space after it (`[288]: 3–4 [289]`). The text goes back in
+ * HTML-escaped, for the renderer's one decode pass.
+ */
+function markersToText(html: string): string {
+  const tagged = taggedPrefix(html);
+  const supTag = /<sup\b[^>]*>/gi;
+  let kept = '';
+  let cursor = 0;
+  for (let open = supTag.exec(tagged); open; open = supTag.exec(tagged)) {
+    if (!isFootnoteMarker(open[0])) continue;
+    const bodyStart = open.index + open[0].length;
+    const end = elementEnd(tagged, 'sup', bodyStart);
+    const visible = markerText(tagged.slice(bodyStart, end))
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;');
+    kept += html.slice(cursor, open.index) + visible;
+    cursor = end;
+    supTag.lastIndex = end;
+  }
+  return kept + html.slice(cursor);
+}
+
+/** The DOI a `doi.org` link names, percent-decoded; `undefined` for any other URL. */
+function doiOf(url: string): string | undefined {
+  const parsed = URL.parse(url);
+  if (!parsed || !DOI_HOSTS.has(parsed.hostname)) return;
+  const path = parsed.pathname.slice(1);
+  if (!path) return;
+  try {
+    return decodeURIComponent(path);
+  } catch {
+    // A malformed escape cannot be decoded; the path as linked is still the DOI the page cites.
+    return path;
+  }
+}
+
+/**
+ * A citation's rendered text, its external links (each once, verbatim, archive copies included), the
+ * DOIs among them, and the `CITEREF…` anchors it links to.
+ */
+function citationParts(html: string): {
+  text: string;
+  urls: string[];
+  dois: string[];
+  workIds: string[];
+} {
+  const urls = new Set<string>();
+  const workIds = new Set<string>();
+  const linkTag = /<a\b[^>]*>/gi;
+  const tagged = taggedPrefix(html);
+  for (let open = linkTag.exec(tagged); open; open = linkTag.exec(tagged)) {
+    const href = HREF_ATTRIBUTE.exec(open[0])?.[1];
+    if (href === undefined) continue;
+    const target = decodeEntities(href);
+    if (isExternalLink(open[0])) urls.add(target);
+    else if (target.startsWith(`#${WORK_ANCHOR_PREFIX}`)) workIds.add(target.slice(1));
+  }
+  const dois = new Set<string>();
+  for (const url of urls) {
+    const doi = doiOf(url);
+    if (doi) dois.add(doi);
+  }
+  return {
+    text: htmlSectionToPlainText(markersToText(html)),
+    urls: [...urls],
+    dois: [...dois],
+    workIds: [...workIds],
+  };
+}
+
+/** The body of the first `tagName` element in `html` its open tag passes `test` for. */
+function firstElementBody(
+  html: string,
+  tagName: string,
+  test: (openTag: string) => boolean,
+): string | undefined {
+  const tagged = taggedPrefix(html);
+  const openTag = new RegExp(`<${tagName}\\b[^>]*>`, 'gi');
+  for (let open = openTag.exec(tagged); open; open = openTag.exec(tagged)) {
+    if (!test(open[0])) continue;
+    const bodyStart = open.index + open[0].length;
+    return tagged.slice(bodyStart, elementEnd(tagged, tagName, bodyStart));
+  }
+  return;
+}
+
+/**
+ * Every footnote in a page's parser HTML (`action=parse&prop=text` for the whole page), in document
+ * order across its reference lists, plus the full citations its short citations link to.
+ *
+ * One walk over the open tags collects the three things a footnote is assembled from: each
+ * `ol.references` list with its `data-mw-group`; the first in-text marker naming each footnote,
+ * whose text is the footnote's label; and each element whose `id` is a `CITEREF…` anchor. List
+ * entries are then read in order — the `id` decoded from the parser's entity-escaped form
+ * (`cite&#95;note-sandre-2`), the citation body from `span.reference-text`, rendered through
+ * {@link htmlSectionToPlainText} with any marker inside it kept as text. Only a work some entry links
+ * to is rendered.
+ *
+ * Every scan jumps past the element it consumed and every tag scan stops at the last `>`, so the work
+ * stays linear in the payload — up to 1.6 MB for the largest articles — whatever the nesting.
+ */
+export function extractReferences(html: string): {
+  references: ReferenceEntry[];
+  works: Map<string, ReferenceWork>;
+} {
+  const tagged = taggedPrefix(html);
+  const labels = new Map<string, string>();
+  const anchors = new Map<string, string>();
+  const lists: Array<{ body: string; group?: string }> = [];
+
+  const openTag = new RegExp(OPEN_TAG.source, 'gi');
+  let listEnd = 0;
+  for (let open = openTag.exec(tagged); open; open = openTag.exec(tagged)) {
+    const tagName = (open[1] as string).toLowerCase();
+    if (VOID_TAGS.has(tagName)) continue;
+    const bodyStart = open.index + open[0].length;
+
+    if (tagName === 'sup' && isFootnoteMarker(open[0])) {
+      const end = elementEnd(tagged, 'sup', bodyStart);
+      const body = tagged.slice(bodyStart, end);
+      const href = HREF_ATTRIBUTE.exec(body)?.[1];
+      const target = href?.startsWith('#') ? decodeEntities(href.slice(1)) : undefined;
+      if (target !== undefined && !labels.has(target)) {
+        labels.set(
+          target,
+          markerText(body)
+            .trim()
+            .replace(/^\[([\s\S]*)\]$/, '$1'),
+        );
+      }
+      openTag.lastIndex = end;
+      continue;
+    }
+
+    if (tagName === 'ol' && open.index >= listEnd && isReferenceList(open[0])) {
+      listEnd = elementEnd(tagged, 'ol', bodyStart);
+      const group = GROUP_ATTRIBUTE.exec(open[0])?.[1];
+      lists.push({
+        body: tagged.slice(bodyStart, listEnd),
+        ...(group && { group: decodeEntities(group) }),
+      });
+      continue;
+    }
+
+    const rawId = ID_ATTRIBUTE.exec(open[0])?.[1];
+    const id = rawId === undefined ? undefined : decodeEntities(rawId);
+    if (id?.startsWith(WORK_ANCHOR_PREFIX)) {
+      const end = elementEnd(tagged, tagName, bodyStart);
+      if (!anchors.has(id)) anchors.set(id, tagged.slice(bodyStart, end));
+      openTag.lastIndex = end;
+    }
+  }
+
+  const references: ReferenceEntry[] = [];
+  const linked = new Set<string>();
+  for (const list of lists) {
+    const itemTag = /<li\b[^>]*>/gi;
+    for (let open = itemTag.exec(list.body); open; open = itemTag.exec(list.body)) {
+      const bodyStart = open.index + open[0].length;
+      const end = elementEnd(list.body, 'li', bodyStart);
+      itemTag.lastIndex = end;
+      const rawId = ID_ATTRIBUTE.exec(open[0])?.[1];
+      if (rawId === undefined) continue;
+      const id = decodeEntities(rawId);
+      const item = list.body.slice(bodyStart, end);
+      const parts = citationParts(firstElementBody(item, 'span', isReferenceText) ?? item);
+      for (const workId of parts.workIds) linked.add(workId);
+      const label = labels.get(id);
+      references.push({
+        id,
+        ...(list.group && { group: list.group }),
+        ...(label && { label }),
+        text: parts.text,
+        ...(parts.urls.length && { urls: parts.urls }),
+        ...(parts.dois.length && { dois: parts.dois }),
+        ...(parts.workIds.length && { work_ids: parts.workIds }),
+      });
+    }
+  }
+
+  const works = new Map<string, ReferenceWork>();
+  for (const id of linked) {
+    const body = anchors.get(id);
+    if (body === undefined) continue;
+    const parts = citationParts(body);
+    works.set(id, {
+      id,
+      text: parts.text,
+      ...(parts.urls.length && { urls: parts.urls }),
+      ...(parts.dois.length && { dois: parts.dois }),
+    });
+  }
+  return { references, works };
 }
 
 /**
@@ -1614,6 +1961,44 @@ function actionApiError(error: ActionApiErrorRaw, language: string, title?: stri
 }
 
 /**
+ * Action API codes for a pinned `oldid` that will never be readable again: `nosuchrevid` for a
+ * revision that does not exist (its page was deleted, or it never did) and `permissiondenied` for
+ * one whose text was hidden by revision deletion.
+ */
+const REVISION_GONE_CODES: ReadonlySet<string> = new Set(['nosuchrevid', 'permissiondenied']);
+
+/**
+ * The `revision_unavailable` failure for an error envelope answering a continuation's pinned
+ * `oldid`, with the envelope's code as `upstreamCode`. A gone or hidden revision carries its own
+ * recovery, since retrying the cursor cannot succeed; any other envelope leaves the tool's declared
+ * recovery, which tries the cursor again first.
+ */
+function pinnedRevisionError(
+  cursorKind: 'table' | 'references',
+  revisionId: number,
+  error: ActionApiErrorRaw,
+): McpError {
+  const upstreamCode = error.code;
+  if (upstreamCode && REVISION_GONE_CODES.has(upstreamCode)) {
+    return serviceUnavailable(
+      `The ${cursorKind} cursor is pinned to revision ${revisionId}, which no longer exists or is hidden (${upstreamCode}).`,
+      {
+        reason: 'revision_unavailable',
+        revisionId,
+        upstreamCode,
+        recovery: {
+          hint: 'Omit cursor to start over at the current revision; retrying this cursor cannot succeed.',
+        },
+      },
+    );
+  }
+  return serviceUnavailable(
+    `The pinned ${cursorKind} revision ${revisionId} could not be read${upstreamCode ? ` (${upstreamCode})` : ''}.`,
+    { reason: 'revision_unavailable', revisionId, ...(upstreamCode && { upstreamCode }) },
+  );
+}
+
+/**
  * Action API error codes for a condition that clears on its own, which the API reports inside an
  * HTTP 200 body rather than as a 429 or 503. `ratelimited` and `readonly` are MediaWiki core's codes;
  * the two CirrusSearch codes are its search pool counter's queue being full — the regex variant is
@@ -1650,6 +2035,14 @@ function transientEnvelopeError(body: unknown, response: Response): McpError | u
  * see a transport timeout instead of this server's classified error.
  */
 const REQUEST_DEADLINE_MS = 30_000;
+
+/**
+ * Per-attempt timeout for a references read, which parses the whole page on every call. A cold parse
+ * of a large article runs past the default 15 s (Barack Obama at an unparsed revision took 13.9 s),
+ * so the one attempt that can finish gets most of {@link REQUEST_DEADLINE_MS}; the deadline still
+ * bounds the attempt and any retry together.
+ */
+const REFERENCES_PARSE_TIMEOUT_MS = 25_000;
 
 /**
  * Build an {@link EditionIndex} from an `action=sitematrix` response.
@@ -2366,10 +2759,7 @@ export class WikipediaService {
 
     if (raw.error) {
       if (tableRead?.continuation) {
-        throw serviceUnavailable(
-          'The pinned table revision could not be read. Retry this cursor; omit it only to start a new revision.',
-          { reason: 'revision_unavailable', revisionId: tableRead.continuation.revisionId },
-        );
+        throw pinnedRevisionError('table', tableRead.continuation.revisionId, raw.error);
       }
       if (raw.error.code === 'nosuchsection') {
         throw validationError(
@@ -2464,6 +2854,86 @@ export class WikipediaService {
         resolvedTitle && !this.baseUrl
           ? articleUrl(await this.resolveBaseUrl(language, ctx), resolvedTitle)
           : undefined,
+    };
+  }
+
+  /**
+   * Read an article's footnotes from one full-page parse ({@link extractReferences}).
+   *
+   * A section parse cannot stand in: it renumbers footnote anchors and reports a footnote defined in
+   * another section as a cite error. A continuation reads the cursor's pinned revision by `oldid`, so
+   * an edit between pages cannot shift entries across a page boundary; a revision that cannot be
+   * read or does not match fails as `revision_unavailable` rather than falling back to the current
+   * text, and an offset past the revision's last entry fails as `invalid_cursor`. Nothing is cached
+   * between pages — each one repeats the parse, under {@link REFERENCES_PARSE_TIMEOUT_MS}.
+   */
+  async getReferences(
+    title: string,
+    language: string,
+    ctx: ServiceContext,
+    continuation?: ReferencesCursor,
+  ): Promise<{
+    title: string;
+    pageid: number | undefined;
+    revisionId: number;
+    url: string | undefined;
+    redirect?: RedirectInfo;
+    references: ReferenceEntry[];
+    works: Map<string, ReferenceWork>;
+  }> {
+    const raw = await this.actionGet<ActionParseTextRaw>(
+      language,
+      {
+        action: 'parse',
+        ...(continuation ? { oldid: String(continuation.revisionId) } : { page: title }),
+        prop: 'text|revid',
+        disableeditsection: 'true',
+        disabletoc: 'true',
+        disablelimitreport: 'true',
+        redirects: 'true',
+      },
+      ctx,
+      { timeoutMs: REFERENCES_PARSE_TIMEOUT_MS },
+    );
+
+    if (raw.error) {
+      if (continuation) throw pinnedRevisionError('references', continuation.revisionId, raw.error);
+      throw actionApiError(raw.error, language, title);
+    }
+
+    const revisionId = raw.parse?.revid;
+    const html = raw.parse?.text;
+    if (
+      !revisionId ||
+      typeof html !== 'string' ||
+      (continuation && revisionId !== continuation.revisionId)
+    ) {
+      throw serviceUnavailable(
+        'The references response did not contain the requested revision and HTML. Retry the same request.',
+        { reason: 'revision_unavailable' },
+      );
+    }
+
+    const { references, works } = extractReferences(html);
+    if (continuation && continuation.offset >= references.length) {
+      throw validationError(
+        'The references cursor offset is past the last entry of the pinned revision.',
+        { reason: 'invalid_cursor' },
+      );
+    }
+
+    const resolvedTitle = raw.parse?.title;
+    return {
+      title: resolvedTitle ?? title,
+      pageid: raw.parse?.pageid,
+      revisionId,
+      url:
+        resolvedTitle && !this.baseUrl
+          ? articleUrl(await this.resolveBaseUrl(language, ctx), resolvedTitle)
+          : undefined,
+      ...(raw.parse?.redirects?.length && { redirect: redirectInfo(raw.parse.redirects) }),
+      references,
+      works,
     };
   }
 

@@ -169,6 +169,119 @@ it.each([
   },
 );
 
+/** Retrying a cursor pinned to a gone or hidden revision never succeeds; a transient miss may. */
+const TABLE_RETRY_OR_RESTART =
+  'Retry the same cursor if the failure was transient; if the pinned revision no longer exists or is hidden, omit cursor to start over at the current revision.';
+
+it.each([
+  { upstreamCode: 'nosuchrevid', info: 'There is no revision with ID 42.' },
+  {
+    upstreamCode: 'permissiondenied',
+    info: "You don't have permission to view deleted text or changes between deleted revisions.",
+  },
+])(
+  'tells the caller to start over, not retry, when the pinned table revision is gone ($upstreamCode)',
+  async ({ upstreamCode, info }) => {
+    const http = createFetchMock([
+      {
+        match: () => true,
+        respond: (request) =>
+          Response.json(
+            new URL(request.url).searchParams.has('oldid')
+              ? { error: { code: upstreamCode, info } }
+              : {
+                  parse: {
+                    title: 'Tables',
+                    revid: 43,
+                    text: '<table class="wikitable"><tr><th>H</th></tr></table>',
+                  },
+                },
+          ),
+      },
+    ]);
+    http.install();
+    try {
+      const result = await runToolContract(wikipediaGetArticle, {
+        ...tableRequest,
+        cursor: encodeCursor(tableCursor),
+      });
+      const hint =
+        'Omit cursor to start over at the current revision; retrying this cursor cannot succeed.';
+      expect(result.structuredContent).toEqual({
+        error: {
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          message: `The table cursor is pinned to revision 42, which no longer exists or is hidden (${upstreamCode}).`,
+          data: {
+            reason: 'revision_unavailable',
+            revisionId: 42,
+            upstreamCode,
+            recovery: { hint },
+          },
+        },
+      });
+      expect(text(result)).toContain(`Recovery: ${hint}`);
+      expect(text(result)).not.toContain('Retry');
+
+      // Following the hint works: the same request without the cursor reads the current revision.
+      const restarted = await runToolContract(wikipediaGetArticle, tableRequest);
+      expect(restarted.structuredContent).toMatchObject({ revision_id: '43', table_index: 1 });
+    } finally {
+      http.restore();
+    }
+  },
+);
+
+it.each([
+  {
+    name: 'another error envelope',
+    response: { error: { code: 'internal_api_error_DBQueryError', info: 'Database error' } },
+    message: 'The pinned table revision 42 could not be read (internal_api_error_DBQueryError).',
+    data: { revisionId: 42, upstreamCode: 'internal_api_error_DBQueryError' },
+  },
+  {
+    name: 'no HTML',
+    response: { parse: { title: 'Tables', revid: 42 } },
+    message:
+      'The table response did not contain the requested revision and HTML. Retry the same request.',
+    data: {},
+  },
+])(
+  'keeps retry first when the pinned table revision may still be readable ($name)',
+  async ({ response, message, data }) => {
+    const http = createFetchMock([{ match: () => true, respond: () => Response.json(response) }]);
+    http.install();
+    try {
+      const result = await runToolContract(wikipediaGetArticle, {
+        ...tableRequest,
+        cursor: encodeCursor(tableCursor),
+      });
+      expect(result.structuredContent).toEqual({
+        error: {
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          message,
+          data: {
+            reason: 'revision_unavailable',
+            ...data,
+            recovery: { hint: TABLE_RETRY_OR_RESTART },
+          },
+        },
+      });
+      expect(text(result)).toContain(`Recovery: ${TABLE_RETRY_OR_RESTART}`);
+    } finally {
+      http.restore();
+    }
+  },
+);
+
+it('declares the table revision_unavailable with a recovery true for a gone and a transient revision', () => {
+  expect(
+    wikipediaGetArticle.errors?.find((entry) => entry.reason === 'revision_unavailable'),
+  ).toMatchObject({
+    when: 'The table revision the cursor is pinned to no longer exists, is hidden, or cannot be read or verified.',
+    recovery: TABLE_RETRY_OR_RESTART,
+  });
+});
+
 it('carries paged rows, revision, cursor and oversize disclosure on both surfaces (#67)', async () => {
   const value = 'é_*'.repeat(7000);
   const html = `<table class="wikitable"><caption>Cap</caption><tr><th>H</th></tr><tr><td>${value}</td></tr><tr><td>tail</td></tr></table>`;
