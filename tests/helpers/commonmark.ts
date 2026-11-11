@@ -41,16 +41,40 @@ export function parseTargets(markdown: string): ParsedTarget[] {
   return targets;
 }
 
+type Token = ReturnType<typeof md.parse>[number];
+
+/** The text a reader sees in one inline token, its line breaks kept. */
+function inlineText(token: Token): string {
+  return (token.children ?? [])
+    .map((child) =>
+      child.type === 'softbreak' || child.type === 'hardbreak' ? '\n' : child.content,
+    )
+    .join('');
+}
+
 /** The visible text of `markdown`'s inline content, one string per paragraph or heading. */
 export function parseInlineText(markdown: string): string[] {
   return md
     .parse(markdown, {})
     .filter((token) => token.type === 'inline')
-    .map((token) =>
-      (token.children ?? [])
-        .map((child) =>
-          child.type === 'softbreak' || child.type === 'hardbreak' ? '\n' : child.content,
-        )
-        .join(''),
-    );
+    .map(inlineText);
+}
+
+/**
+ * The text a CommonMark reader takes from `markdown`, block by block — each paragraph's or heading's
+ * inline text and each code block's content — joined by a blank line, the paragraph break the
+ * article renderer writes. A rendered `content[]` article reads back equal to its `structuredContent`
+ * text exactly when every character, line break, and indent survives the parse.
+ */
+export function readBackText(markdown: string): string {
+  return md
+    .parse(markdown, {})
+    .flatMap((token) => {
+      if (token.type === 'inline') return [inlineText(token)];
+      if (token.type === 'fence' || token.type === 'code_block') {
+        return [token.content.replace(/\n$/, '')];
+      }
+      return [];
+    })
+    .join('\n\n');
 }

@@ -47,9 +47,9 @@ Wikipedia in any language edition. Search articles, read summaries or just the s
 
 ### `wikipedia_search_articles` <sub>tool</sub>
 
-- Free-text `query` (an empty one fails with `empty_query`), positive integer `limit` (default 10, clamped to 50), and `offset` paging, passing back enrichment `nextOffset`. Only a clamped call carries `requestedLimit`, `appliedLimit`, and a clamp notice. Wikipedia serves no result past the 10,000th: an `offset` at or beyond it fails with `offset_too_large`, and a page ending on that window carries enrichment `truncated`
-- CirrusSearch operators include `incategory:"1648 treaties"`, `morelike:Peace of Westphalia`, `intitle:Python`, `hastemplate:Infobox`, and `insource:Python` (support depends on the installation). `sort` defaults to `relevance`; alternatives are `last_edit_desc`, `create_timestamp_desc`, `incoming_links_desc`, and `title_natural_asc`. Enrichment echoes `sort`; keep it and `query` unchanged when paging
-- Each result carries a plain-text snippet, page ID, word count, and — when the article has them — its short `description` and Wikidata QID (`wikibase_item`); enrichment `suggestion` carries Wikipedia's spelling correction (`einstien` → `einstein`)
+- Free-text `query` (an empty one fails with `empty_query`), positive integer `limit` (default 10, clamped to 500), and `offset` paging, passing back enrichment `nextOffset`. Only a clamped call carries `requestedLimit`, `appliedLimit`, and a clamp notice. Wikipedia serves no result past the 10,000th: an `offset` at or beyond it fails with `offset_too_large`, and a page ending on that window carries enrichment `truncated`
+- CirrusSearch operators include `incategory:"1648 treaties"` (`wikipedia_get_sections` returns an article's category names), `morelike:Peace of Westphalia`, `intitle:Python`, `hastemplate:Infobox`, and `insource:Python` (support depends on the installation). `sort` defaults to `relevance`; alternatives are `last_edit_desc`, `create_timestamp_desc`, `incoming_links_desc`, and `title_natural_asc`. Enrichment echoes `sort`; keep it and `query` unchanged when paging
+- Each result carries a plain-text snippet, page ID, word count, and — when the article has them — its short `description` and Wikidata QID (`wikibase_item`); enrichment `suggestion` carries Wikipedia's spelling correction (`einstien` → `einstein`). A page whose descriptions and QIDs could not all be loaded returns those results without either field, with a `notice`; `wikipedia_get_summary` returns both for any one title
 - Invalid or over-complex `insource:/…/` and `intitle:/…/` regexes fail once with `invalid_query`, the `upstreamCode`, and guidance to correct or simplify the regex or remove the operator. A busy regex search remains retryable
 
 ---
@@ -57,7 +57,8 @@ Wikipedia in any language edition. Search articles, read summaries or just the s
 ### `wikipedia_get_summary` <sub>tool</sub>
 
 - Takes a `title`; returns the REST summary extract — a fragment from the start of the lead (`wikipedia_get_article` with `section_index: 0` reads the whole lead) — plus the short description, thumbnail URL, Wikidata QID (`wikibase_item`), and, for a geotagged article, `latitude` / `longitude` to pass straight to `wikipedia_search_nearby`
-- `page_type` discriminates `standard` / `disambiguation` / `no-extract` (on `disambiguation`, re-query with `wikipedia_search_articles`); `url`, `revision_id`, and `last_modified` name the revision read, and `?oldid=<revision_id>` is a permanent link to it
+- `page_type` discriminates `standard` / `disambiguation` / `mainpage` (the edition's Main Page) / `no-extract` (outside the article namespace, or non-wikitext content); on `disambiguation`, re-query with `wikipedia_search_articles`. `url`, `revision_id`, and `last_modified` name the revision read, and `?oldid=<revision_id>` is a permanent link to it
+- Redirects are followed and reported in `redirected_from`, and in `redirect_section` when the alias points into a section, with a notice naming the `section_index` to read once the table of contents confirms the heading (otherwise pointing to `wikipedia_get_sections`); the extract still covers the whole article. The redirect lookup is best-effort: when it fails the summary returns without the fields and a notice says so
 - An existing page without a summary extract succeeds with metadata, an empty `extract`, and guidance to open the canonical URL or try `section_index: 0`. Namespace pages may contain documentation rather than article prose. An empty description is absent; a missing title still fails with `not_found`
 
 ---
@@ -67,6 +68,8 @@ Wikipedia in any language edition. Search articles, read summaries or just the s
 - Without `section_index`: the full article with `== Section ==` markers, or a section outline (`truncated: true`) when it exceeds `WIKIPEDIA_ARTICLE_OVERFLOW_BYTES` (default 80,000 bytes). With a `section_index` from `wikipedia_get_sections` (`0` is the lead): that section plus its nested subsections
 - Outline entries include verified `section_index` values where available, including 0 for the lead. Ambiguous or unindexed headings retain the section-list fallback. TOC verification gets one short attempt; unavailable verification is disclosed
 - Redirects expose `redirected_from` and, for a section target, `redirect_section`. A full read remains full and includes targeted-read guidance; an explicit `section_index`, including 0, takes precedence
+- `page_type: "disambiguation"` appears only on a disambiguation page, on full, outline, section, and table reads. Full and outline reads take it from their own request; on section and table reads it comes from a best-effort lookup beside the parse, and when that fails the read returns unflagged with a notice pointing to `wikipedia_get_summary`
+- List items render as `- ` or numbered `N.` lines (an `<ol>`'s `start`, `reversed`, and item `value` honored), indented two spaces per nesting level up to 16 levels
 - Every read returns `url` and `revision_id` (`?oldid=<revision_id>` is a permanent link to the text read); a full read, outline included, also returns `last_modified`. With `WIKIPEDIA_BASE_URL` set, a section read omits `url`
 - Section reads render phylogenetic clade trees as fenced, indented branches, pairing each row’s label with its leaf and preserving unnamed forks. An unparseable tree leaves `[table omitted: unparseable clade]`; trees have no `table_index`
 - Section reads also carry data tables as pipe-delimited rows and infoboxes as `label: value` lines, which the full-article extract strips; a table over 40,000 rendered bytes leaves a `[table omitted: N rows (table T)]` marker. Pass `table_index: T` with the section to read that table in complete row pages, then follow `next_cursor` as `cursor` with the same inputs. Continuations read the first page’s revision; caption and header appear once. Each page's table text fits 40,000 UTF-8 bytes on both surfaces, except an indivisible oversized row or first-page caption/header returned alone with `oversized_row: true`
@@ -77,14 +80,15 @@ Wikipedia in any language edition. Search articles, read summaries or just the s
 
 - Takes a `title`; returns section titles, heading levels, hierarchical numbering (e.g. `"2.1"`), and the `section_index` to pass to `wikipedia_get_article` — the first entry is the lead (`index: 0`, titled `Introduction`)
 - Heading titles use the article renderer’s script, formula, whitespace and single-pass entity normalization, so `CO₂` stays identical across the section list, article reads and verified outline entries
-- Fails with `no_sections` on a stub or very short article — read it with `wikipedia_get_article` instead
+- Returns `categories`, the article's visible categories in upstream order, without the namespace prefix; pass one to `wikipedia_search_articles` as `incategory:"<name>"`. `page_type: "disambiguation"` appears only on a disambiguation page, with a notice
+- Fails with `no_sections` on a stub, a very short article, or a disambiguation page with no headings — read a stub with `wikipedia_get_article`, and search for the intended article from a disambiguation page
 - Redirect aliases expose `redirected_from` and optional `redirect_section`; `redirect_section_index` appears only when a unique anchor matches a real numeric TOC index
 
 ---
 
 ### `wikipedia_search_nearby` <sub>tool</sub>
 
-- `latitude` −90…90 / `longitude` −180…180 (WGS 84), `radius_meters` 10–10,000 (default 1000), and positive integer `limit` (default 10, clamped to 500), with no pagination past `limit`; enrichment `truncated` flags more matches than `limit` allowed — at 500, Wikipedia's ceiling, sweep narrower radii instead. Only a clamped call carries `requestedLimit`, `appliedLimit`, and a clamp notice
+- `latitude` −90…90 / `longitude` −180…180 (WGS 84), `radius_meters` 10–10,000 (default 1000; a larger value is clamped to 10,000, with `requestedRadiusMeters` beside `radiusMetersUsed` and a notice to search from adjacent points), and positive integer `limit` (default 10, clamped to 500), with no pagination past `limit`; enrichment `truncated` flags more matches than `limit` allowed — at 500, Wikipedia's ceiling, sweep narrower radii instead. Only a clamped call carries `requestedLimit`, `appliedLimit`, and a clamp notice
 - Returns articles sorted by `distance_meters`, with coordinates, short `description`, and Wikidata QID (`wikibase_item`). Each is placed by the article's own GeoData coordinate tag, not its Wikidata item's coordinate, so a mistagged article appears where the tag puts it
 
 ---
@@ -92,13 +96,14 @@ Wikipedia in any language edition. Search articles, read summaries or just the s
 ### `wikipedia_get_languages` <sub>tool</sub>
 
 - Takes a `title`; returns each edition's `language_code`, `edition_code`, article title, and URL, plus `source_title`, the resolved title. Pass `edition_code` — not `language_code` — as `language` on other tools; the two can differ (`gsw` vs `als`)
-- `editions` narrows the list to the codes asked for: codes with no article come back under `missing`, and `total_languages` stays the unfiltered count. Fails with `no_other_languages` when the article has no translations; a filter matching nothing is an empty list, not a failure
+- `editions` narrows the list to the codes asked for, and `total_languages` stays the unfiltered count. Every code lands in one place: its `languages` entry; `source_editions` when it names the queried edition (`als` and `gsw` alike); `unknown_editions` when it names no Wikipedia edition (`jp` for `ja`; never reported while the edition registry is unavailable); or `missing` when the edition has no article. Legacy codes `nb`, `be-x-old`, and `egl` match their editions (`no`, `be-tarask`, `eml`)
+- Fails with `no_other_languages` when an unfiltered call finds no translations; with `editions` given, an article with none succeeds with `languages: []`
 
 ---
 
 ### `wikipedia_get_references` <sub>tool</sub>
 
-- Takes a `title`; returns `references[]` in document order across every reference list, each with `id`, `label` (the in-text marker), `group` (a notes list such as `lower-alpha`, absent for the main list), `text`, `urls` (archive copies included), and `dois` (from `doi.org` links, percent-decoded). `total_references` counts the footnotes on all pages. `wikipedia_get_article` drops footnote markers and reference lists
+- Takes a `title`; returns `references[]` in document order across every reference list, each with `id`, `label` (the in-text marker), `group` (a notes list such as `lower-alpha`, absent for the main list), `text`, `urls` (archive copies included), and `dois` (from `doi.org` links, percent-decoded). `total_references` counts the footnotes on all pages. `wikipedia_get_article` drops footnote markers and reference lists. Redirects expose `redirected_from` and, for a section target, `redirect_section`
 - A short citation such as "Galinsky 2012, pp. 75–76" carries `work_ids`, and `works` on the same page holds the full citations they name, each once. Bibliography and further-reading entries no footnote points to are not listed — read those sections with `wikipedia_get_article`
 - Each page holds whole footnotes within 40,000 UTF-8 bytes on both surfaces; follow `next_cursor` as `cursor` with the same `title` and `language`. Continuations read the first page's `revision_id`, and a cursor past the last footnote fails `invalid_cursor`. An unreadable pinned revision fails `revision_unavailable`. An article with no footnotes returns an empty list with a `notice`, not an error
 
@@ -110,17 +115,17 @@ Wikipedia-specific:
 
 - Dual API integration — MediaWiki REST API (`/api/rest_v1/`) for summaries, Action API (`/w/api.php`) for search, full text, sections, geo search, and language links
 - Retry and backoff on every required request, including the transient refusals (search too busy, rate-limited, read-only) the Action API returns inside an HTTP 200 body, with an upstream `Retry-After` honored and each request's retries bounded at 30 s. The best-effort description lookup on search results gets one short attempt; `User-Agent` header per Wikimedia API policy
-- Every read path renders HTML through one renderer to the same plain-text shape — `== Heading ==` markers, one list item per line, superscripts kept, code fenced: the full article from the Action API's HTML extract, a section from the parser's own HTML for that section, the summary from the REST `extract_html`. A section read additionally carries data tables, infoboxes, and the lists inside layout tables, none of which the extract carries. Footnote markers, reference lists, and the hidden Citation Style 1 maintenance messages (`CS1 maint: …`) are dropped on every path; `wikipedia_get_references` returns the footnotes
+- Every read path renders HTML through one renderer to the same plain-text shape — `== Heading ==` markers, list items as `- ` / `N.` lines kept at their nesting, superscripts kept, code fenced: the full article from the Action API's HTML extract, a section from the parser's own HTML for that section, the summary from the REST `extract_html`. A section read additionally carries data tables, infoboxes, and the lists inside layout tables, none of which the extract carries. Footnote markers, reference lists, and the hidden Citation Style 1 maintenance messages (`CS1 maint: …`) are dropped on every path; `wikipedia_get_references` returns the footnotes
 - Per-call `language` parameter on every tool (default `en`) — all Wikipedia language editions accessible in a single session; every title read follows redirects
 - Language validation against a live edition registry built from the MediaWiki `action=sitematrix` endpoint (cached 24h) — catches structurally valid but nonexistent editions before they cause timeouts
 
 Agent-friendly output:
 
-- `page_type` on summaries discriminates `standard` / `disambiguation` / `no-extract` — no string parsing needed
+- `page_type` on summaries discriminates `standard` / `disambiguation` / `mainpage` / `no-extract` — no string parsing needed — and article and section reads flag a disambiguation page the same way
 - `wikibase_item` (Wikidata QID) on summaries and on search and nearby results enables direct cross-referencing with wikidata-mcp-server
-- Article text, snippets, and titles are backslash-escaped on the way into the markdown `content[]` render, so an article that writes about markup or markdown syntax reads as itself instead of being interpreted by the client; `structuredContent` carries the same text unescaped. Fenced code blocks and table-row delimiters pass through unescaped, while table cells stay escaped
+- Article text, snippets, and titles are backslash-escaped on the way into the markdown `content[]` render, so an article that writes about markup or markdown syntax reads as itself instead of being interpreted by the client; `structuredContent` carries the same text unescaped. Fenced code blocks and table-row delimiters pass through unescaped, while table cells stay escaped. A nested list is fenced in `content[]` so its indentation survives a markdown read, and a notice that quotes a title or query is block-quoted and escaped there, raw in `structuredContent`
 - `section_index` on table-of-contents entries links directly to the targeted-read parameter on `wikipedia_get_article`, index 0 included
-- Titles MediaWiki cannot name a page with — `< > [ ] { }`, the `|` multi-title separator, percent escapes, magic tildes, relative paths — are refused before any request, with `invalid_title`; a trailing `#fragment` is accepted and resolves normally
+- Titles MediaWiki cannot name a page with — `< > [ ] { }`, the `|` multi-title separator, percent escapes, magic tildes, relative paths — are refused before any request, with `invalid_title`; a trailing `#fragment` is accepted and resolves normally. Titles that name no page are refused with `invalid_title` on every read tool: `Special:` and `Media:` titles in any edition's spelling, special pages and files that do not exist, interwiki links such as `wikt:cat` or `fr:Chat`, and invalid entries such as `Talk:`
 - Recovery hints on every error type — callers get actionable next steps (e.g., "use `wikipedia_search_articles` to find the correct title")
 
 ## Getting started
@@ -174,7 +179,7 @@ See [`.env.example`](./.env.example) for the full list of optional overrides.
 
 ### Local development
 
-Requires [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
+Requires [Bun v1.4.4](https://bun.sh/) or higher (or Node.js v24+).
 
 - **Clone and install:**
 

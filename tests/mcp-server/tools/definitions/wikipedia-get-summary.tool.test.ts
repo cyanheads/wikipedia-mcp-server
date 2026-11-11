@@ -4,15 +4,21 @@
  */
 
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  createFetchMock,
+  createMockContext,
+  runToolContract,
+} from '@cyanheads/mcp-ts-core/testing';
+import { beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { wikipediaGetSummary } from '@/mcp-server/tools/definitions/wikipedia-get-summary.tool.js';
 import {
   getWikipediaService,
   initWikipediaService,
 } from '@/services/wikipedia/wikipedia-service.js';
-import { parseTargets } from '../../../helpers/commonmark.js';
+import { parseTargets, readBackText } from '../../../helpers/commonmark.js';
+import { mercurySummary } from '../../../helpers/list-fixtures.js';
 import { mockWikipediaService } from '../../../helpers/wikipedia-service-mock.js';
 
 /** The joined text of every text block format() returns. */
@@ -36,6 +42,7 @@ const mockSummary = {
   extract: 'Python is a high-level, general-purpose programming language.',
   thumbnailUrl:
     'https://upload.wikimedia.org/wikipedia/commons/thumb/c/c3/Python-logo-notext.svg/100px-Python-logo-notext.svg.png',
+  redirect: { kind: 'none' },
 };
 
 describe('wikipediaGetSummary', () => {
@@ -342,6 +349,7 @@ describe('wikipediaGetSummary', () => {
       url: 'https://en.wikipedia.org/wiki/Eiffel_Tower',
       revisionId: '1374916289',
       lastModified: '2026-09-14T20:37:52Z',
+      redirect: { kind: 'none' },
     };
 
     it('surfaces all five fields on the structured result', async () => {
@@ -585,6 +593,36 @@ describe('wikipediaGetSummary', () => {
     });
   });
 
+  describe('a disambiguation list from extract_html (#81)', () => {
+    beforeEach(() => {
+      vi.restoreAllMocks();
+      initWikipediaService({} as AppConfig, fakeStorage(), 'wikipedia-mcp-server/test');
+      const svc = getWikipediaService();
+      vi.spyOn(svc, 'fetchEditionIndex').mockResolvedValue({
+        hosts: { en: 'https://en.wikipedia.org' },
+        fetchedAt: '2026-09-22T00:00:00.000Z',
+      });
+      vi.spyOn(svc, 'restGet').mockResolvedValue(mercurySummary());
+    });
+
+    it('keeps each entry behind its bullet in structuredContent, escaped in content[]', async () => {
+      const ctx = createMockContext({ errors: wikipediaGetSummary.errors });
+      const input = wikipediaGetSummary.input.parse({ title: 'Mercury' });
+      const result = wikipediaGetSummary.output.parse(
+        await wikipediaGetSummary.handler(input, ctx),
+      );
+
+      const list =
+        '- Mercury (planet), the closest planet to the Sun\n- Mercury (element), a chemical element\n- Mercury (mythology), a Roman deity';
+      expect(result.extract).toBe(`Mercury most commonly refers to:\n\n${list}`);
+      const text = renderText(result);
+      expect(text).toContain(
+        `\nMercury most commonly refers to:\n\n${list.replaceAll('- ', '\\- ')}`,
+      );
+      expect(readBackText(text.slice(text.indexOf('Mercury most commonly')))).toBe(result.extract);
+    });
+  });
+
   it('passes a fenced code block the renderer wrote into content[] raw, escaping the prose around it', () => {
     const text = renderText({
       title: 'Hello',
@@ -606,6 +644,7 @@ describe('wikipediaGetSummary', () => {
         extract: 'M*A*S*H is an American war comedy television series.',
         thumbnailUrl: thumbnail,
         url,
+        redirect: { kind: 'none' },
       }),
     });
     const ctx = createMockContext({ errors: wikipediaGetSummary.errors });
@@ -634,4 +673,432 @@ describe('wikipediaGetSummary', () => {
       'Unexpected upstream shape',
     );
   });
+});
+
+describe('wikipedia_get_summary — redirects through the real service (issue #86)', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    initWikipediaService({} as AppConfig, fakeStorage(), 'wikipedia-mcp-server/test');
+    vi.spyOn(getWikipediaService(), 'fetchEditionIndex').mockResolvedValue({
+      hosts: { en: 'https://en.wikipedia.org' },
+      fetchedAt: '2026-11-11T00:00:00.000Z',
+    });
+  });
+
+  /** REST's summary of Seine, trimmed from a live capture — its answer for an alias of Seine too. */
+  const SEINE_REST = {
+    type: 'standard',
+    title: 'Seine',
+    pageid: 54006,
+    wikibase_item: 'Q1471',
+    description: 'Major river in northern France',
+    extract: 'The Seine is a river in northern France.',
+    extract_html: '<p>The <b>Seine</b> is a river in northern France.</p>',
+    coordinates: { lat: 49.43388889, lon: 0.20666667 },
+    content_urls: { desktop: { page: 'https://en.wikipedia.org/wiki/Seine' } },
+    revision: '1384649318',
+    timestamp: '2026-11-09T09:42:16Z',
+  };
+
+  /** The tool's answer for SEINE_REST before redirects were reported, on each surface. */
+  const SEINE_OUTPUT = {
+    title: 'Seine',
+    page_type: 'standard',
+    pageid: 54006,
+    wikibase_item: 'Q1471',
+    description: 'Major river in northern France',
+    extract: 'The Seine is a river in northern France.',
+    latitude: 49.43388889,
+    longitude: 0.20666667,
+    url: 'https://en.wikipedia.org/wiki/Seine',
+    revision_id: '1384649318',
+    last_modified: '2026-11-09T09:42:16Z',
+    language: 'en',
+  };
+  const SEINE_HEAD = [
+    '# Seine',
+    '*Major river in northern France*',
+    '**Type:** standard | **Language:** en',
+  ];
+  const SEINE_TAIL = [
+    '**Page ID:** 54006',
+    '**Wikidata QID:** Q1471',
+    '**URL:** [en.wikipedia.org](<https://en.wikipedia.org/wiki/Seine>)',
+    '**Latitude:** 49.43388889',
+    '**Longitude:** 0.20666667',
+    '**Nearby:** pass latitude and longitude to wikipedia_search_nearby for other notable articles around this point.',
+    '**Revision ID:** 1384649318',
+    '**Last modified:** 2026-11-09T09:42:16Z',
+    '',
+    'The Seine is a river in northern France.',
+  ];
+  const SEINE_TEXT = [...SEINE_HEAD, ...SEINE_TAIL].join('\n');
+
+  /** The lookup's answer for `2018 Paris flood`, trimmed from a live `prop=tocdata` capture. */
+  const PARIS_FLOOD_TOC = {
+    parse: {
+      title: 'Seine',
+      pageid: 54006,
+      redirects: [{ from: '2018 Paris flood', to: 'Seine', tofragment: '2018 Paris flood' }],
+      tocdata: {
+        sections: [
+          { tocLevel: 1, hLevel: 2, line: 'Course', number: '2', index: '2', anchor: 'Course' },
+          {
+            tocLevel: 2,
+            hLevel: 3,
+            line: '2018 Paris flood',
+            number: '4.2',
+            index: '7',
+            anchor: '2018_Paris_flood',
+          },
+        ],
+      },
+    },
+  };
+
+  const UNCHECKED =
+    'The redirect could not be checked because the lookup was unavailable, so redirected_from and redirect_section may be missing. Call wikipedia_get_sections with the same title to see the redirect.';
+  const SECTION_LEAD =
+    'This title redirects to a section of the article, named in redirect_section; the extract summarizes the whole article.';
+
+  /** Answer the REST summary with `rest` and the redirect lookup with `lookup`, at the fetch seam. */
+  function stub(rest: unknown, lookup: (request: Request) => Response | Promise<Response>) {
+    const http = createFetchMock([
+      {
+        match: (request) => new URL(request.url).pathname.startsWith('/api/rest_v1/page/summary/'),
+        respond: () => Response.json(rest),
+      },
+      {
+        match: (request) => {
+          const url = new URL(request.url);
+          return url.pathname === '/w/api.php' && url.searchParams.get('action') === 'parse';
+        },
+        respond: lookup,
+      },
+    ]);
+    http.install();
+    onTestFinished(() => {
+      http.restore();
+    });
+    return http;
+  }
+
+  const contentText = (result: Awaited<ReturnType<typeof runToolContract>>) =>
+    result.content.map((block) => ('text' in block ? block.text : '')).join('');
+
+  it('answers an ordinary title with the one REST request and no redirect fields (characterization)', async () => {
+    const http = stub(SEINE_REST, () => Response.json(PARIS_FLOOD_TOC));
+    const result = await runToolContract(wikipediaGetSummary, { title: 'Seine' });
+    expect(result.structuredContent).toEqual(SEINE_OUTPUT);
+    expect(contentText(result)).toBe(SEINE_TEXT);
+    expect(http.calls).toHaveLength(1);
+  });
+
+  it('reports a section redirect and the section_index to read it on both surfaces', async () => {
+    const http = stub(SEINE_REST, () => Response.json(PARIS_FLOOD_TOC));
+    const result = await runToolContract(wikipediaGetSummary, { title: '2018 Paris flood' });
+    const notice = `${SECTION_LEAD} Read that section with wikipedia_get_article and section_index: 7.`;
+
+    expect(result.structuredContent).toEqual({
+      ...SEINE_OUTPUT,
+      redirected_from: '2018 Paris flood',
+      redirect_section: '2018 Paris flood',
+      notice,
+    });
+    expect(contentText(result)).toBe(
+      `${[...SEINE_HEAD, '**Redirected from:** 2018 Paris flood', '**Redirect section:** 2018 Paris flood', ...SEINE_TAIL].join('\n')}\n\n> ${notice}`,
+    );
+    expect(http.calls).toHaveLength(2);
+  });
+
+  it('points to wikipedia_get_sections, naming no index, when no anchor matches the fragment', async () => {
+    stub(SEINE_REST, () =>
+      Response.json({
+        parse: {
+          ...PARIS_FLOOD_TOC.parse,
+          redirects: [{ from: 'Seine in art', to: 'Seine', tofragment: 'The *Seine* in art' }],
+        },
+      }),
+    );
+    const result = await runToolContract(wikipediaGetSummary, { title: 'Seine in art' });
+    const notice = `${SECTION_LEAD} Call wikipedia_get_sections to find that section's section_index.`;
+
+    expect(result.structuredContent).toEqual({
+      ...SEINE_OUTPUT,
+      redirected_from: 'Seine in art',
+      redirect_section: 'The *Seine* in art',
+      notice,
+    });
+    expect(notice).not.toMatch(/section_index: \d/);
+    expect(result.structuredContent).not.toHaveProperty('redirect_section_index');
+    // The fragment is upstream text: escaped in content[], raw in structuredContent.
+    expect(contentText(result)).toContain('\n**Redirect section:** The \\*Seine\\* in art\n');
+    expect(contentText(result)).toContain(`\n\n> ${notice}`);
+  });
+
+  it('reports a plain redirect with no section field and no notice', async () => {
+    stub(
+      {
+        type: 'standard',
+        title: 'New York City',
+        pageid: 645042,
+        extract: 'New York City is the most populous city in the United States.',
+        content_urls: { desktop: { page: 'https://en.wikipedia.org/wiki/New_York_City' } },
+      },
+      () =>
+        Response.json({
+          parse: { title: 'New York City', redirects: [{ from: 'NYC', to: 'New York City' }] },
+        }),
+    );
+    const result = await runToolContract(wikipediaGetSummary, { title: 'NYC' });
+    expect(result.structuredContent).toEqual({
+      title: 'New York City',
+      redirected_from: 'NYC',
+      page_type: 'standard',
+      pageid: 645042,
+      extract: 'New York City is the most populous city in the United States.',
+      url: 'https://en.wikipedia.org/wiki/New_York_City',
+      language: 'en',
+    });
+    expect(contentText(result)).toContain(
+      '**Type:** standard | **Language:** en\n**Redirected from:** NYC\n**Page ID:** 645042\n',
+    );
+    expect(contentText(result)).not.toContain('Redirect section');
+  });
+
+  it('joins the empty-extract and unchecked-redirect notices into one', async () => {
+    stub(
+      {
+        type: 'no-extract',
+        title: 'Category:Physics',
+        pageid: 44,
+        extract: '',
+        content_urls: { desktop: { page: 'https://en.wikipedia.org/wiki/Category%3APhysics' } },
+      },
+      () => new Response('Service Unavailable', { status: 503 }),
+    ).route({
+      // A colon title is checked for a namespace that holds no pages before REST (issue #87).
+      match: (request) => new URL(request.url).searchParams.get('action') === 'query',
+      respond: () =>
+        Response.json({ query: { pages: [{ pageid: 44, ns: 14, title: 'Category:Physics' }] } }),
+    });
+    const result = await runToolContract(wikipediaGetSummary, { title: 'category:physics' });
+    const notice = `This page has no summary extract. Open its canonical URL, or try wikipedia_get_article with section_index: 0. Namespace pages may contain documentation or descriptive text rather than article prose; a readable lead is not guaranteed. ${UNCHECKED}`;
+
+    expect(result.structuredContent).toEqual({
+      title: 'Category:Physics',
+      page_type: 'no-extract',
+      pageid: 44,
+      extract: '',
+      url: 'https://en.wikipedia.org/wiki/Category:Physics',
+      language: 'en',
+      notice,
+    });
+    expect(contentText(result)).toContain(`\n\n> ${notice}`);
+  });
+
+  /**
+   * Every way the best-effort lookup can fail. Each leaves the summary as it was before redirects
+   * were reported, plus the one notice — never an error, and never the article reported missing.
+   */
+  const LOOKUP_FAILURES: Array<{ name: string; respond: () => Response | Promise<Response> }> = [
+    { name: 'HTTP 404', respond: () => new Response('Not Found', { status: 404 }) },
+    { name: 'HTTP 403', respond: () => new Response('Forbidden', { status: 403 }) },
+    {
+      name: 'HTTP 429 with a long Retry-After',
+      respond: () =>
+        new Response('Too Many Requests', { status: 429, headers: { 'retry-after': '120' } }),
+    },
+    { name: 'HTTP 400', respond: () => new Response('Bad Request', { status: 400 }) },
+    { name: 'HTTP 410', respond: () => new Response('Gone', { status: 410 }) },
+    { name: 'HTTP 422', respond: () => new Response('Unprocessable Content', { status: 422 }) },
+    { name: 'HTTP 500', respond: () => new Response('Internal Server Error', { status: 500 }) },
+    { name: 'HTTP 503', respond: () => new Response('Service Unavailable', { status: 503 }) },
+    { name: 'HTTP 504', respond: () => new Response('Gateway Timeout', { status: 504 }) },
+    { name: 'a network failure', respond: () => Promise.reject(new TypeError('fetch failed')) },
+    {
+      name: 'an HTML error page',
+      respond: () =>
+        new Response('<!DOCTYPE html><html><body>Wikimedia Error</body></html>', {
+          headers: { 'content-type': 'text/html' },
+        }),
+    },
+    {
+      name: 'a body that is not JSON',
+      respond: () =>
+        new Response('upstream hiccup', { headers: { 'content-type': 'application/json' } }),
+    },
+    { name: 'a JSON null body', respond: () => Response.json(null) },
+    { name: 'a JSON array body', respond: () => Response.json([]) },
+    { name: 'a parse that is a string', respond: () => Response.json({ parse: 'Seine' }) },
+    {
+      name: 'a parse with no title',
+      respond: () => Response.json({ parse: { redirects: PARIS_FLOOD_TOC.parse.redirects } }),
+    },
+    {
+      name: 'a null redirect hop',
+      respond: () => Response.json({ parse: { title: 'Seine', redirects: [null] } }),
+    },
+    {
+      name: 'redirects that are a string',
+      respond: () => Response.json({ parse: { title: 'Seine', redirects: '2018 Paris flood' } }),
+    },
+    {
+      name: 'a numeric alias',
+      respond: () =>
+        Response.json({ parse: { title: 'Seine', redirects: [{ from: 2018, to: 'Seine' }] } }),
+    },
+    {
+      name: 'a numeric fragment',
+      respond: () =>
+        Response.json({
+          parse: {
+            title: 'Seine',
+            redirects: [{ from: '2018 Paris flood', to: 'Seine', tofragment: 2018 }],
+          },
+        }),
+    },
+    {
+      name: 'TOC sections that are a string',
+      respond: () =>
+        Response.json({ parse: { ...PARIS_FLOOD_TOC.parse, tocdata: { sections: 'none' } } }),
+    },
+    {
+      name: 'a missingtitle envelope',
+      respond: () =>
+        Response.json({
+          error: { code: 'missingtitle', info: "The page you specified doesn't exist." },
+        }),
+    },
+    {
+      name: 'an invalidtitle envelope',
+      respond: () =>
+        Response.json({ error: { code: 'invalidtitle', info: 'Bad title "2018 Paris flood".' } }),
+    },
+    {
+      name: 'a ratelimited envelope',
+      respond: () => Response.json({ error: { code: 'ratelimited', info: 'Too fast.' } }),
+    },
+    {
+      name: 'an unrecognized envelope',
+      respond: () =>
+        Response.json({
+          error: { code: 'internal_api_error_DBQueryError', info: 'A database query error.' },
+        }),
+    },
+    {
+      name: 'an answer for another page',
+      respond: () =>
+        Response.json({
+          parse: { title: 'Paris', redirects: [{ from: '2018 Paris flood', to: 'Paris' }] },
+        }),
+    },
+  ];
+
+  it.each(LOOKUP_FAILURES)(
+    'returns the summary as before plus only the unchecked notice on $name',
+    async ({ respond }) => {
+      const http = stub(SEINE_REST, respond);
+      const result = await runToolContract(wikipediaGetSummary, { title: '2018 Paris flood' });
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toEqual({ ...SEINE_OUTPUT, notice: UNCHECKED });
+      expect(contentText(result)).toBe(`${SEINE_TEXT}\n\n> ${UNCHECKED}`);
+      expect(http.calls).toHaveLength(2);
+    },
+  );
+
+  it('propagates the caller’s cancellation from inside the lookup as RequestCancelled', async () => {
+    const caller = new AbortController();
+    const http = stub(SEINE_REST, () => {
+      caller.abort();
+      return Promise.reject(new DOMException('The operation was aborted.', 'AbortError'));
+    });
+    const result = await runToolContract(
+      wikipediaGetSummary,
+      { title: '2018 Paris flood' },
+      { context: { signal: caller.signal } },
+    );
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: { code: JsonRpcErrorCode.RequestCancelled },
+    });
+    expect(contentText(result)).toContain('was aborted');
+    expect(http.calls).toHaveLength(2);
+  });
+});
+
+describe('wikipedia_get_summary — titles that name no page through the real service (issue #87)', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    initWikipediaService({} as AppConfig, fakeStorage(), 'wikipedia-mcp-server/test');
+    vi.spyOn(getWikipediaService(), 'fetchEditionIndex').mockResolvedValue({
+      hosts: { en: 'https://en.wikipedia.org' },
+      fetchedAt: '2026-11-11T00:00:00.000Z',
+    });
+  });
+
+  const RECOVERY =
+    'Use wikipedia_search_articles to find the exact article title and pass it verbatim.';
+
+  /** Answer the pre-check with `query` and REST the way it answers this title: with `restStatus`. */
+  function upstream(query: unknown, restStatus: number) {
+    const http = createFetchMock([
+      {
+        match: (request) => new URL(request.url).searchParams.get('action') === 'query',
+        respond: () => Response.json(query),
+      },
+      {
+        match: (request) => new URL(request.url).pathname.startsWith('/api/rest_v1/page/summary/'),
+        respond: () =>
+          Response.json({ status: restStatus, type: 'Internal error' }, { status: restStatus }),
+      },
+    ]);
+    http.install();
+    onTestFinished(() => {
+      http.restore();
+    });
+    return http;
+  }
+
+  const text = (result: Awaited<ReturnType<typeof runToolContract>>) =>
+    result.content.map((block) => ('text' in block ? block.text : '')).join('');
+
+  it.each([
+    {
+      title: 'Media:Example.jpg',
+      query: { query: { pages: [{ ns: -2, title: 'Media:Example.jpg', special: true }] } },
+      restStatus: 500,
+      detail:
+        "Special: and Media: titles, in any edition's spelling, name no page; a file's description page is in the File: namespace.",
+    },
+    {
+      title: 'wikt:cat',
+      query: { query: { interwiki: [{ title: 'wikt:cat', iw: 'wikt' }] } },
+      restStatus: 504,
+      detail:
+        "It begins with an interwiki prefix, which links to another wiki. For another Wikipedia edition, pass the title without the prefix and the edition's code as language.",
+    },
+  ])(
+    'refuses $title as invalid_title with the declared recovery on both surfaces, before REST',
+    async ({ title, query, restStatus, detail }) => {
+      const http = upstream(query, restStatus);
+      const result = await runToolContract(wikipediaGetSummary, { title });
+      const message = `"${title}" is not a valid Wikipedia page name. ${detail}`;
+
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toEqual({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          message,
+          data: { title, reason: 'invalid_title', recovery: { hint: RECOVERY } },
+        },
+      });
+      expect(text(result)).toBe(
+        `Error: ${message}\n\nRecovery: ${RECOVERY}\n\n(reason invalid_title)`,
+      );
+      expect(
+        http.calls.map((call) => new URL(call.request.url).searchParams.get('action')),
+      ).toEqual(['query']);
+    },
+  );
 });

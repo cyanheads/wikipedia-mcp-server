@@ -44,6 +44,22 @@ function expectActionRequests(calls: readonly { request: Request }[], action: st
   }
 }
 
+/** The calls one `action` made: a section read sends its `parse` beside a `query` page-prop lookup. */
+function callsFor(calls: readonly { request: Request }[], action: string): { request: Request }[] {
+  return calls.filter(({ request }) => new URL(request.url).searchParams.get('action') === action);
+}
+
+/** A section read's page-property lookup: one `action=query` for the page's disambiguation flag. */
+function expectPagePropLookup(calls: readonly { request: Request }[], title: string): void {
+  const lookups = callsFor(calls, 'query');
+  expect(lookups).toHaveLength(1);
+  expectActionRequests(lookups, 'query');
+  const params = new URL(lookups[0]!.request.url).searchParams;
+  expect(params.get('titles')).toBe(title);
+  expect(params.get('prop')).toBe('pageprops');
+  expect(params.get('ppprop')).toBe('disambiguation');
+}
+
 const tableRequest = { title: 'Tables', language: 'en', section_index: 1, table_index: 1 };
 const tableCursor = {
   kind: 'wikipedia_table_v1',
@@ -79,9 +95,12 @@ it('propagates caller cancellation through a pinned table fetch without restarti
       error: { code: JsonRpcErrorCode.RequestCancelled },
     });
     expect(text(result)).toContain('was aborted');
-    expect(http.calls).toHaveLength(1);
-    expectActionRequests(http.calls, 'parse');
-    expect(new URL(http.calls[0]!.request.url).searchParams.get('oldid')).toBe('42');
+    const parses = callsFor(http.calls, 'parse');
+    expect(parses).toHaveLength(1);
+    expectActionRequests(parses, 'parse');
+    expect(new URL(parses[0]!.request.url).searchParams.get('oldid')).toBe('42');
+    expectPagePropLookup(http.calls, 'Tables');
+    expect(http.calls).toHaveLength(2);
   } finally {
     http.restore();
   }
@@ -160,9 +179,12 @@ it.each([
       });
       expect(text(result)).toContain(reason);
       expect(text(result)).toContain('Recovery:');
-      expect(http.calls).toHaveLength(1);
-      expectActionRequests(http.calls, 'parse');
-      expect(new URL(http.calls[0]!.request.url).searchParams.get('section')).toBe('1');
+      const parses = callsFor(http.calls, 'parse');
+      expect(parses).toHaveLength(1);
+      expectActionRequests(parses, 'parse');
+      expect(new URL(parses[0]!.request.url).searchParams.get('section')).toBe('1');
+      expectPagePropLookup(http.calls, 'Tables');
+      expect(http.calls).toHaveLength(2);
     } finally {
       http.restore();
     }
@@ -327,10 +349,14 @@ it('carries paged rows, revision, cursor and oversize disclosure on both surface
     });
     expect(last.structuredContent).not.toHaveProperty('next_cursor');
     expect(text(last)).toContain('\\| tail \\|');
-    expect(http.calls).toHaveLength(3);
-    expectActionRequests(http.calls, 'parse');
-    expect(new URL(http.calls[0]!.request.url).searchParams.get('page')).toBe('Tables');
-    for (const { request } of http.calls.slice(1)) {
+    // Three pages, each a parse beside its own page-property lookup.
+    const parses = callsFor(http.calls, 'parse');
+    expect(parses).toHaveLength(3);
+    expect(callsFor(http.calls, 'query')).toHaveLength(3);
+    expect(http.calls).toHaveLength(6);
+    expectActionRequests(parses, 'parse');
+    expect(new URL(parses[0]!.request.url).searchParams.get('page')).toBe('Tables');
+    for (const { request } of parses.slice(1)) {
       const params = new URL(request.url).searchParams;
       expect(params.get('oldid')).toBe('42');
       expect(params.has('page')).toBe(false);
@@ -447,11 +473,14 @@ it.each([
       expect(text(result)).toContain(reason);
       expect(text(result)).toContain(recovery);
       if (reason === 'invalid_title') expect(text(result)).not.toContain('wikipedia_get_sections');
-      expect(http.calls).toHaveLength(1);
-      expectActionRequests(http.calls, 'parse');
-      const params = new URL(http.calls[0]!.request.url).searchParams;
+      const parses = callsFor(http.calls, 'parse');
+      expect(parses).toHaveLength(1);
+      expectActionRequests(parses, 'parse');
+      const params = new URL(parses[0]!.request.url).searchParams;
       expect(params.get('page')).toBe(title);
       expect(params.get('section')).toBe(String(section_index));
+      expectPagePropLookup(http.calls, title);
+      expect(http.calls).toHaveLength(2);
     } finally {
       http.restore();
     }
@@ -496,6 +525,10 @@ it('characterizes full reads and lead/child structure without a TOC lookup', asy
 it.each(['standard', 'no-extract'])(
   'returns empty %s summaries with metadata and guidance',
   async (type) => {
+    // A colon title costs one action=query check before REST; it names a real page here.
+    const titleCheck = vi.spyOn(getWikipediaService(), 'actionGet').mockResolvedValue({
+      query: { pages: [{ ns: 14, title: 'Category:Physics', pageid: 44 }] },
+    });
     vi.spyOn(getWikipediaService(), 'restGet').mockResolvedValue({
       type,
       title: 'Category:Physics',
@@ -518,6 +551,8 @@ it.each(['standard', 'no-extract'])(
       expect.stringContaining('section_index: 0'),
     );
     expect(text(result)).toContain('section_index: 0');
+    expect(titleCheck).toHaveBeenCalledTimes(1);
+    expect(titleCheck.mock.calls[0]?.[1]).toEqual({ action: 'query', titles: 'Category:Physics' });
   },
 );
 
@@ -601,23 +636,23 @@ it.each([
   expect(text(result)).toContain(sort);
 });
 
-it.each([49, 50, 51])(
-  'applies the search limit %s with disclosed clamping only above 50',
+it.each([499, 500, 501])(
+  'applies the search limit %s with disclosed clamping only above 500',
   async (limit) => {
     const request = vi
       .spyOn(getWikipediaService(), 'actionGet')
       .mockResolvedValue({ query: { search: [] } });
     const result = await runToolContract(wikipediaSearchArticles, { query: 'Physics', limit });
     expect(result.isError).toBeFalsy();
-    expect(request.mock.calls[0]?.[1]).toMatchObject({ srlimit: String(Math.min(limit, 50)) });
-    if (limit > 50)
-      expect(result.structuredContent).toMatchObject({ requestedLimit: limit, appliedLimit: 50 });
+    expect(request.mock.calls[0]?.[1]).toMatchObject({ srlimit: String(Math.min(limit, 500)) });
+    if (limit > 500)
+      expect(result.structuredContent).toMatchObject({ requestedLimit: limit, appliedLimit: 500 });
     else {
       expect(result.structuredContent).not.toHaveProperty('requestedLimit');
       expect(result.structuredContent).not.toHaveProperty('appliedLimit');
     }
-    if (limit > 50)
-      expect(text(result)).toContain('Requested limit 51 was clamped to 50 results per page.');
+    if (limit > 500)
+      expect(text(result)).toContain('Requested limit 501 was clamped to 500 results per page.');
   },
 );
 
@@ -710,7 +745,9 @@ it.each([0, 3])(
     });
     expect(request.mock.calls[0]?.[1]).toMatchObject({ section: String(sectionIndex) });
     expect(text(result)).toContain('Other\\_heading');
-    expect(request).toHaveBeenCalledTimes(1);
+    // The parse and its page-property lookup; no tocdata request follows.
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(request.mock.calls[1]?.[1]).toMatchObject({ action: 'query', prop: 'pageprops' });
   },
 );
 
@@ -914,7 +951,7 @@ it('preserves internal failures before the optional TOC request is constructed',
   }
 });
 
-it('propagates an upstream input refusal from the optional TOC request', async () => {
+it('keeps an upstream input refusal of the optional TOC request best-effort', async () => {
   vi.useFakeTimers();
   const http = createFetchMock([
     { match: () => true, respond: new Response('Bad request', { status: 400 }) },
@@ -923,7 +960,7 @@ it('propagates an upstream input refusal from the optional TOC request', async (
   try {
     await expect(
       getWikipediaService().getArticleToc('Target', 'en', createMockContext()),
-    ).rejects.toMatchObject({ code: JsonRpcErrorCode.InvalidParams });
+    ).resolves.toBeUndefined();
     expect(http.calls).toHaveLength(1);
     expect(vi.getTimerCount()).toBe(0);
   } finally {
@@ -1175,16 +1212,16 @@ it('composes search clamp, unavailable metadata, and window disclosure on both s
   });
   const result = await runToolContract(wikipediaSearchArticles, {
     query: 'Physics',
-    limit: 51,
+    limit: 501,
     offset: 9999,
   });
   expect(result.structuredContent).toMatchObject({
-    requestedLimit: 51,
-    appliedLimit: 50,
+    requestedLimit: 501,
+    appliedLimit: 500,
     truncated: true,
     cap: 10000,
   });
-  for (const segment of ['51', 'clamped', 'Descriptions and Wikidata', '10,000']) {
+  for (const segment of ['501', 'clamped', 'Descriptions and Wikidata', '10,000']) {
     expect(result.structuredContent).toHaveProperty('notice', expect.stringContaining(segment));
     expect(text(result)).toContain(segment);
   }

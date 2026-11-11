@@ -15,6 +15,7 @@ import {
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import type { RequestContext } from '@cyanheads/mcp-ts-core/utils';
 import {
+  createPacer,
   decodeCursor,
   encodeCursor,
   fetchWithTimeout,
@@ -23,11 +24,12 @@ import {
   withRetry,
 } from '@cyanheads/mcp-ts-core/utils';
 import { formatTablePage } from '@/mcp-server/tools/utils/escape-markdown.js';
-import { fenceCodeBlock, tableDelimiterRow, tableRow } from './text-blocks.js';
+import { fenceCodeBlock, listLine, tableDelimiterRow, tableRow } from './text-blocks.js';
 import type {
   ActionApiErrorRaw,
   ActionExtractsRaw,
   ActionGeoSearchRaw,
+  ActionInterwikiRaw,
   ActionLangLinksRaw,
   ActionPageMetaQueryRaw,
   ActionPageMetaRaw,
@@ -38,6 +40,7 @@ import type {
   RestSummaryRaw,
   SiteMatrixLanguage,
   SiteMatrixRaw,
+  UnnameablePageRaw,
 } from './types.js';
 
 // ---------------------------------------------------------------------------
@@ -263,6 +266,12 @@ const MATH_ELEMENT = /<math\b((?:"[^"<]*"|'[^'<]*'|[^<>"'])*)>(?:(?!<math\b)[\s\
 /** The `alttext` attribute of a `<math>` open tag, still HTML-escaped. */
 const ALTTEXT_ATTRIBUTE = /(?<=\s)alttext\s*=\s*"([^"]*)"/i;
 
+/**
+ * A display formula's mark, on the fallback image (its `-display` class) or a visible `<math>` (its
+ * `display="block"`). A browser lays a display formula out on a line of its own, so its TeX gets one.
+ */
+const DISPLAY_FORMULA = /\bmwe-math-fallback-image-display\b|(?<=\s)display\s*=\s*["']?block\b/i;
+
 /** Named HTML entities the MediaWiki parser emits, beyond the numeric escapes handled generically. */
 const NAMED_ENTITIES: Readonly<Record<string, string>> = {
   amp: '&',
@@ -403,11 +412,20 @@ const PARKED_BLOCK = /\uFFFF(\d+)\uFFFF/g;
 class ParkedBlocks {
   private readonly blocks: string[] = [];
 
-  /** Set `block` aside and return its placeholder, or a bare paragraph break for an empty block. */
+  /**
+   * Set `block` aside and return its placeholder, or an empty paragraph for an empty block — a tag,
+   * since the prose passes read a raw line break as a space.
+   */
   park(block: string): string {
-    if (!block) return '\n\n';
+    if (!block) return '<p></p>';
     this.blocks.push(block);
     return `\n\n${BLOCK_MARK}${this.blocks.length - 1}${BLOCK_MARK}\n\n`;
+  }
+
+  /** The block `line` is the placeholder of, or `undefined` for any other line. */
+  blockAt(line: string): string | undefined {
+    const index = /^￿(\d+)￿$/.exec(line)?.[1];
+    return index === undefined ? undefined : this.blocks[Number(index)];
   }
 
   /** Put every parked block back in place of its placeholder. */
@@ -1035,7 +1053,7 @@ function renderClade(body: string): string {
 
 /**
  * Convert article HTML into the plain-text shape every read path returns: `== Heading ==` markers in
- * document order, paragraphs separated by a blank line, list items one per line. It renders all three
+ * document order, paragraphs separated by a blank line, list items as marked lines. It renders all three
  * HTML sources the read paths fetch — the parser's HTML for one section (`action=parse&prop=text`),
  * TextExtracts' HTML-mode full-article extract (`prop=extracts` without `explaintext`), and the REST
  * summary's `extract_html` — so a superscript, a formula, or a code sample reads the same on each.
@@ -1044,22 +1062,25 @@ function renderClade(body: string): string {
  * survive — `{{code|if}}` reaches this function already expanded to `if`, where a wikitext stripper
  * has to re-implement the template grammar and drops what it cannot expand.
  *
- * Two constructs carry syntax of their own, written by `text-blocks.ts`. A `<pre>` sample becomes a
- * fenced code block that keeps its line breaks and indentation while everything around it is
+ * Several constructs carry syntax of their own, written by `text-blocks.ts`. A `<pre>` sample becomes
+ * a fenced code block that keeps its line breaks and indentation while everything around it is
  * collapsed, because in a code sample indentation is syntax. A data table becomes pipe rows, and an
  * infobox `label: value` lines. A clade tree uses a fence to preserve branch indentation on both
- * surfaces. Superscripts and subscripts stay distinct from their neighbours
+ * surfaces. A list keeps its markers and nesting: `- ` or `N.` item lines, two spaces deeper per
+ * level ({@link renderLists}). Superscripts and subscripts stay distinct from their neighbours
  * ({@link renderScripts}).
  *
  * Pass order is what keeps each pass's input intact. Furniture, hidden elements, and footnote markers
  * go first, so no later pass renders them. Scripts render next, so a table cell or a heading reads
  * `10²³` the way prose does. Tables render before code is parked, so a `<pre>` inside a cell is
- * flattened onto that cell's line. Both are parked before the prose passes, which would otherwise
- * decode their text a second time and strip any tag it quotes. Unbalanced input — which TextExtracts
- * warns its HTML mode may emit — loses nothing for being unclosed beyond what a drop rule selects: an
- * unclosed table renders to the end of the input, an unclosed `<pre>`, `<sup>`, or `<math>` reads as
- * ordinary text, and an unclosed script cannot reach past a block boundary, nor an unclosed formula
- * past the next formula, to borrow a later close tag.
+ * flattened onto that cell's line. Lists render after both, so a table or code sample inside an item
+ * keeps its lines under the item's indent. All three are parked before the prose passes, which would
+ * otherwise decode their text a second time and strip any tag it quotes. Unbalanced input — which
+ * TextExtracts warns its HTML mode may emit — loses nothing for being unclosed beyond what a drop rule
+ * selects: an unclosed table renders to the end of the input, an unclosed list closes where HTML
+ * would close it, an unclosed heading, `<pre>`, `<sup>`, or `<math>` reads as ordinary text, and an
+ * unclosed script cannot reach past a block boundary, nor an unclosed formula past the next formula,
+ * to borrow a later close tag.
  *
  * Pure and exported for unit testing.
  */
@@ -1069,21 +1090,23 @@ export function htmlSectionToPlainText(html: string): string {
 
 /** Preserve formulas and scripts before any caller strips tags or decodes entities. */
 function prepareInlineHtml(html: string): string {
-  let text = html.replace(/<!--[\s\S]*?-->/g, '');
+  let text = dropComments(html);
 
   // Lift each formula out of its `<img alt>` before anything is dropped, so the TeX survives the
   // removal of the hidden MathML twin that used to be its only carrier. A visible `<math>` — the
   // full-article extract's only form — becomes its `alttext` the same way; the hidden twin a section
   // read carries becomes its TeX too, and is then dropped whole with the element hiding it. Both are
-  // inserted still escaped, so the single decode pass below reads each exactly once.
+  // inserted still escaped, so the single decode pass below reads each exactly once. A display
+  // formula's TeX sits between line breaks, an inline one's in its sentence.
+  const formula = (tag: string, tex: string): string =>
+    tex && DISPLAY_FORMULA.test(tag) ? `<br>${tex}<br>` : tex;
   const end = text.lastIndexOf('>') + 1;
   text =
     text
       .slice(0, end)
-      .replace(MATH_FALLBACK_IMAGE, (match) => ALT_ATTRIBUTE.exec(match)?.[1] ?? '')
-      .replace(
-        MATH_ELEMENT,
-        (_match, attributes: string) => ALTTEXT_ATTRIBUTE.exec(attributes)?.[1] ?? '',
+      .replace(MATH_FALLBACK_IMAGE, (match) => formula(match, ALT_ATTRIBUTE.exec(match)?.[1] ?? ''))
+      .replace(MATH_ELEMENT, (_match, attributes: string) =>
+        formula(attributes, ALTTEXT_ATTRIBUTE.exec(attributes)?.[1] ?? ''),
       ) + text.slice(end);
 
   return renderScripts(dropElements(text));
@@ -1098,7 +1121,7 @@ function renderSectionHtml(html: string, render: typeof renderTable): string {
 
   // A table parked inside a `<pre>` is restored into the code before the fence is sized, so no
   // backtick run in it can close the fence early.
-  text = text.replace(/<pre\b[^>]*>([\s\S]*?)<\/pre\s*>/gi, (_match, body: string) => {
+  text = replaceElements(text, 'pre', (_tagName, body) => {
     const code = parked
       .restore(decodeEntities(stripTags(body)))
       .replace(/[^\S\n]+$/gm, '')
@@ -1106,37 +1129,318 @@ function renderSectionHtml(html: string, render: typeof renderTable): string {
     return parked.park(code && fenceCodeBlock(code));
   });
 
-  // Headings become the `== Heading ==` markers both read paths use for structure.
-  text = text.replace(
-    /<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1\s*>/gi,
-    (_match, level: string, inner: string) => {
-      const bar = '='.repeat(Math.max(2, Number(level)));
-      return `\n\n${bar} ${stripTags(inner).trim()} ${bar}\n\n`;
-    },
-  );
+  text = renderLists(text, parked);
+  return parked.restore(renderProse(text));
+}
 
-  // A list item is one line; every other block boundary is a paragraph break. `tr`/`td`/`th` are
-  // boundaries because a layout table's cells reach here — without them two columns of a
-  // `{{col-begin}}` list concatenate into one line.
-  text = decodeEntities(
-    stripTags(
-      text
-        // Closing tag first, consuming the newline that follows it, so consecutive items land on
-        // consecutive lines instead of being separated by a blank one.
-        .replace(/<\/li\s*>\s*/gi, '')
-        .replace(/<li\b[^>]*>/gi, '\n')
-        .replace(/<br\s*\/?>/gi, '\n')
-        .replace(/<\/?(p|div|ul|ol|dl|dd|dt|blockquote|section|tr|td|th)\b[^>]*>/gi, '\n\n'),
-    ),
-  );
+/** A parked block's placeholder, captured, for splitting text around it. */
+const PARKED_PLACEHOLDER = /(￿\d+￿)/;
 
-  text = text
+/**
+ * A source line break, with the spaces and tabs around it, between two wide East Asian characters
+ * (Han, kana, CJK punctuation, fullwidth forms; Hangul excluded). A browser removes such a break
+ * rather than showing it as a space (CSS Text's segment-break rule), so `ください。` and the next
+ * line's `後述` read as one run.
+ */
+const WIDE_SEGMENT_BREAK =
+  /(?<=[\p{sc=Han}\p{sc=Hiragana}\p{sc=Katakana}　-〿！-｠￠-￦])[ \t\r]*\n[ \t\r\n]*(?=[\p{sc=Han}\p{sc=Hiragana}\p{sc=Katakana}　-〿！-｠￠-￦])/gu;
+
+/**
+ * The prose passes, over HTML whose code samples, tables, and lists are parked. Every whitespace run
+ * becomes one space first — a source line break inside a paragraph is a space, as a browser renders
+ * it, except between two wide East Asian characters ({@link WIDE_SEGMENT_BREAK}), where it is
+ * dropped — while each placeholder keeps a paragraph of its own. Then headings become `== Heading ==`
+ * markers, `<br>` a line break, and every other block boundary a paragraph break; `tr`/`td`/`th` are
+ * boundaries because a layout table's cells reach here, and without them two columns of a
+ * `{{col-begin}}` list run into one line. Tags and entities go last.
+ */
+function renderProse(html: string): string {
+  let text = html
+    .split(PARKED_PLACEHOLDER)
+    .map((part, i) =>
+      i % 2 ? `\n\n${part}\n\n` : part.replace(WIDE_SEGMENT_BREAK, '').replace(/\s+/g, ' '),
+    )
+    .join('');
+  text = replaceElements(text, 'h[1-6]', (tagName, inner) => {
+    const bar = '='.repeat(Math.max(2, Number(tagName.slice(1))));
+    return `\n\n${bar} ${stripTags(inner).trim()} ${bar}\n\n`;
+  });
+  const end = text.lastIndexOf('>') + 1;
+  text =
+    text
+      .slice(0, end)
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<\/?(p|div|ul|ol|dl|dd|dt|blockquote|section|tr|td|th)\b[^>]*>/gi, '\n\n') +
+    text.slice(end);
+  return decodeEntities(stripTags(text))
     .replace(/[^\S\n]+/g, ' ')
     .replace(/ *\n */g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+}
 
-  return parked.restore(text);
+/** `html` without its comments. An unclosed `<!--` stays, as text, with everything after it. */
+function dropComments(html: string): string {
+  let kept = '';
+  let cursor = 0;
+  for (let open = html.indexOf('<!--'); open >= 0; open = html.indexOf('<!--', cursor)) {
+    const close = html.indexOf('-->', open + 4);
+    if (close < 0) break;
+    kept += html.slice(cursor, open);
+    cursor = close + 3;
+  }
+  return kept + html.slice(cursor);
+}
+
+/**
+ * Replace each element of the tags `name` matches — a regex source such as `h[1-6]` — with
+ * `replace(tagName, body)`, `tagName` lowercased. An open tag pairs with the first end tag of its own
+ * name after it, its body is everything between the two, and an open tag with no such end tag stays
+ * as text. Pairing resumes after each replaced element, so no open tag inside a body is paired again.
+ */
+function replaceElements(
+  html: string,
+  name: string,
+  replace: (tagName: string, body: string) => string,
+): string {
+  // Each tag name's end tags in document order, and the first one an open tag can still pair with.
+  const ends = new Map<string, { tags: RegExpExecArray[]; next: number }>();
+  for (const tag of html.matchAll(new RegExp(`</(${name})\\s*>`, 'gi'))) {
+    const tagName = (tag[1] as string).toLowerCase();
+    const found = ends.get(tagName) ?? { tags: [], next: 0 };
+    found.tags.push(tag);
+    ends.set(tagName, found);
+  }
+
+  const open = new RegExp(`<(${name})\\b`, 'gi');
+  let replaced = '';
+  let cursor = 0;
+  // The `>` ending the latest open tag, which also ends every open tag that starts before it.
+  let bracket = -1;
+  for (let tag = open.exec(html); tag; tag = open.exec(html)) {
+    const attributes = tag.index + tag[0].length;
+    if (bracket < attributes) bracket = html.indexOf('>', attributes);
+    if (bracket < 0) break;
+    const tagName = (tag[1] as string).toLowerCase();
+    const end = ends.get(tagName);
+    if (!end) continue;
+    while ((end.tags[end.next]?.index ?? Number.POSITIVE_INFINITY) <= bracket) end.next++;
+    const close = end.tags[end.next];
+    if (!close) continue;
+    replaced +=
+      html.slice(cursor, tag.index) + replace(tagName, html.slice(bracket + 1, close.index));
+    cursor = close.index + close[0].length;
+    open.lastIndex = cursor;
+  }
+  return replaced + html.slice(cursor);
+}
+
+/** An item MediaWiki hides with CSS because it is empty: dropped, and not counted. */
+const isEmptyItem = hasClass('mw-empty-elt');
+
+/** An open tag's `start` or `value` attribute, quoted or bare, still unparsed. */
+const START_ATTRIBUTE = /(?<=\s)start\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/i;
+const VALUE_ATTRIBUTE = /(?<=\s)value\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/i;
+
+/** An ordered list's `reversed` attribute. */
+const REVERSED_ATTRIBUTE = /(?<=\s)reversed(?=[\s=/>])/i;
+
+/**
+ * An integer attribute read by HTML's rules for parsing integers — leading whitespace, a sign, then
+ * digits, the rest ignored, so `14a` reads 14 — or `undefined` when it is absent, holds no integer, or
+ * lies past the range a number carries exactly.
+ */
+function integerAttribute(openTag: string, attribute: RegExp): number | undefined {
+  const match = attribute.exec(openTag);
+  const digits = /^[\t\n\f\r ]*([+-]?\d+)/.exec(match?.[1] ?? match?.[2] ?? match?.[3] ?? '')?.[1];
+  const value = Number(digits);
+  return digits !== undefined && Number.isSafeInteger(value) ? value : undefined;
+}
+
+/** One item of a list, or an unmarked entry holding a list nested directly inside a list. */
+type ListEntry = { marked: boolean; value?: number; content: Array<string | ListFrame> };
+
+/** One list the walk read; its item count is known once it closes, before any line is written. */
+type ListFrame = {
+  ordered: boolean;
+  reversed: boolean;
+  start?: number;
+  entries: ListEntry[];
+  /** Marked items: where a reversed list without `start` counts down from. */
+  items: number;
+  /** The entry text and nested lists go to now; a hidden item's is never rendered. */
+  open?: ListEntry;
+  /** Block containers opened inside the list and not yet closed, by tag name. */
+  containers: Map<string, number>;
+};
+
+/** The tags the list walk reads: lists and items, the blocks a list sits inside, and headings. */
+const LIST_WALK_TAG =
+  /<(\/?)(ul|ol|li|div|table|tr|td|th|blockquote|section|dl|dd|dt|h[1-6])\b[^>]*>/gi;
+
+/** Deepest indentation level a list line takes; a list nested deeper is laid out at this level. */
+const LIST_MAX_LEVEL = 16;
+
+/**
+ * Render every outermost list in `html` to its final lines and park it, in one walk over the tags.
+ *
+ * An item is `- text` in a `<ul>` and `N. text` in an `<ol>`, numbered as a browser numbers it: from
+ * `start`, or a `reversed` list's item count, counting down in a reversed list, and from an item's own
+ * `value`; the marker is decimal whatever `type` says. A nested list sits two spaces deeper than the
+ * item holding it, and every other line of an item — a paragraph, a `<br>`, a definition line, a
+ * parked table or code sample — two spaces deeper than its marker line, with no blank line anywhere
+ * in a list. Each list is parked whole, so the whitespace passes never reach its indentation.
+ *
+ * Unbalanced input closes where HTML would close it: an item at the next item or its list's end, a
+ * list at the end tag of a block it sits inside. A heading also ends every open list, and so does
+ * text inside a list but outside any item, which is where a lost `</ul>` leaves the text after it, so
+ * nothing past a list is swallowed into its last item. An item outside any list is a line break.
+ */
+function renderLists(html: string, parked: ParkedBlocks): string {
+  const tag = new RegExp(LIST_WALK_TAG.source, 'gi');
+  const tagged = taggedPrefix(html);
+  const frames: ListFrame[] = [];
+  const openLists = { ul: 0, ol: 0 };
+  let rendered = '';
+  let cursor = 0;
+
+  const close = () => {
+    const frame = frames.pop() as ListFrame;
+    openLists[frame.ordered ? 'ol' : 'ul']--;
+    if (!frames.length) rendered += parked.park(listText(frame, parked));
+  };
+  const addContent = (entry: ListEntry, part: string | ListFrame) => {
+    const last = entry.content.length - 1;
+    if (typeof part === 'string' && typeof entry.content[last] === 'string') {
+      entry.content[last] += part;
+    } else entry.content.push(part);
+  };
+  const append = (text: string) => {
+    if (!text) return;
+    while (frames.length && !frames.at(-1)?.open && /\S/.test(stripTags(text))) close();
+    const frame = frames.at(-1);
+    if (!frame) rendered += text;
+    else if (frame.open) addContent(frame.open, text);
+  };
+
+  for (let match = tag.exec(tagged); match; match = tag.exec(tagged)) {
+    append(html.slice(cursor, match.index));
+    cursor = match.index + match[0].length;
+    const closing = match[1] === '/';
+    const name = (match[2] as string).toLowerCase();
+    const frame = frames.at(-1);
+
+    if (name === 'ul' || name === 'ol') {
+      if (!closing) {
+        const start = name === 'ol' ? integerAttribute(match[0], START_ATTRIBUTE) : undefined;
+        const list: ListFrame = {
+          ordered: name === 'ol',
+          reversed: name === 'ol' && REVERSED_ATTRIBUTE.test(match[0]),
+          ...(start !== undefined && { start }),
+          entries: [],
+          items: 0,
+          containers: new Map(),
+        };
+        if (frame) {
+          if (!frame.open) {
+            frame.open = { marked: false, content: [] };
+            frame.entries.push(frame.open);
+          }
+          addContent(frame.open, list);
+        }
+        frames.push(list);
+        openLists[name]++;
+      } else if (openLists[name] > 0) {
+        while ((frames.at(-1) as ListFrame).ordered !== (name === 'ol')) close();
+        close();
+      } else if (!frame) rendered += match[0];
+    } else if (name === 'li') {
+      if (!frame) rendered += closing ? '' : '<br>';
+      else if (closing) delete frame.open;
+      else if (isEmptyItem(match[0])) frame.open = { marked: false, content: [] };
+      else {
+        const value = frame.ordered ? integerAttribute(match[0], VALUE_ATTRIBUTE) : undefined;
+        const item: ListEntry = {
+          marked: true,
+          ...(value !== undefined && { value }),
+          content: [],
+        };
+        frame.open = item;
+        frame.entries.push(item);
+        frame.items++;
+      }
+    } else if (name.startsWith('h')) {
+      if (!closing) while (frames.length) close();
+      append(match[0]);
+    } else if (!frame) {
+      rendered += match[0];
+    } else if (!closing) {
+      frame.containers.set(name, (frame.containers.get(name) ?? 0) + 1);
+      append(match[0]);
+    } else {
+      while (frames.length && !frames.at(-1)?.containers.get(name)) close();
+      const holder = frames.at(-1);
+      holder?.containers.set(name, (holder.containers.get(name) as number) - 1);
+      append(match[0]);
+    }
+  }
+  append(html.slice(cursor));
+  while (frames.length) close();
+  return rendered;
+}
+
+/** A closed list's lines. */
+function listText(root: ListFrame, parked: ParkedBlocks): string {
+  type Task =
+    | { kind: 'list'; frame: ListFrame; level: number }
+    | { kind: 'marker'; entry: ListEntry; marker: string; level: number }
+    | { kind: 'text'; entry: ListEntry; html: string; level: number };
+  const lines: string[] = [];
+  // The marker line still waiting for its item's first line of text.
+  let marker: { entry: ListEntry; line: number } | undefined;
+  const emit = (level: number, text: string) => {
+    lines.push(listLine(Math.min(level, LIST_MAX_LEVEL), text));
+    marker = undefined;
+  };
+
+  const pending: Task[] = [{ kind: 'list', frame: root, level: 0 }];
+  for (let task = pending.pop(); task; task = pending.pop()) {
+    if (task.kind === 'marker') {
+      emit(task.level, task.marker);
+      marker = { entry: task.entry, line: lines.length - 1 };
+    } else if (task.kind === 'text') {
+      for (const line of renderProse(task.html).split('\n')) {
+        if (!line) continue;
+        const block = parked.blockAt(line);
+        if (block !== undefined) {
+          for (const blockLine of block.split('\n')) emit(task.level, blockLine);
+        } else if (marker?.entry === task.entry) {
+          lines[marker.line] += ` ${line}`;
+          marker = undefined;
+        } else emit(task.level, line);
+      }
+    } else {
+      const { frame, level } = task;
+      const tasks: Task[] = [];
+      let ordinal = frame.start ?? (frame.reversed ? frame.items : 1);
+      for (const entry of frame.entries) {
+        if (entry.marked) {
+          if (entry.value !== undefined) ordinal = entry.value;
+          tasks.push({ kind: 'marker', entry, marker: frame.ordered ? `${ordinal}.` : '-', level });
+          ordinal += frame.reversed ? -1 : 1;
+        }
+        for (const part of entry.content) {
+          tasks.push(
+            typeof part === 'string'
+              ? { kind: 'text', entry, html: part, level: level + 1 }
+              : { kind: 'list', frame: part, level: level + 1 },
+          );
+        }
+      }
+      for (let i = tasks.length - 1; i >= 0; i--) pending.push(tasks[i] as Task);
+    }
+  }
+  return lines.join('\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -1730,16 +2034,61 @@ const FALLBACK_EDITION_SUBDOMAINS = [
   'ii',
 ] as const;
 
-/** Fallback subdomain → canonical origin, for the degraded resolution path. */
+/**
+ * Legacy language codes the sitematrix no longer lists, each with the edition it names. Wikipedia's
+ * interwiki map still routes all three to that edition, and `nb` is the code langlinks reports for
+ * no.wikipedia.org, so a caller can pass back a code `wikipedia_get_languages` handed it. `zh-cn`
+ * and `zh-tw` stay out: the interwiki map routes them to zh.wikipedia.org, but they name script
+ * variants of one edition, not editions.
+ */
+const LEGACY_EDITION_CODES: ReadonlyMap<string, string> = new Map([
+  ['nb', 'no'],
+  ['be-x-old', 'be-tarask'],
+  ['egl', 'eml'],
+]);
+
+/**
+ * The origin `hosts` maps `code` to, matched case-insensitively. Own keys only, since `code` is
+ * caller input and a plain object answers `constructor` from its prototype.
+ */
+function indexedHost(hosts: Readonly<Record<string, string>>, code: string): string | undefined {
+  const key = code.toLowerCase();
+  return Object.hasOwn(hosts, key) ? hosts[key] : undefined;
+}
+
+/**
+ * `hosts` with each {@link LEGACY_EDITION_CODES} entry keyed to the origin of the edition it names,
+ * wherever that edition is indexed — never over a code the index already holds.
+ */
+function withLegacyCodes(hosts: Readonly<Record<string, string>>): Record<string, string> {
+  const keyed = { ...hosts };
+  for (const [legacy, edition] of LEGACY_EDITION_CODES) {
+    const origin = indexedHost(hosts, edition);
+    if (origin && !Object.hasOwn(keyed, legacy)) keyed[legacy] = origin;
+  }
+  return keyed;
+}
+
+/**
+ * Fallback code → canonical origin, for the degraded resolution path: every fallback subdomain,
+ * plus the legacy codes naming one of them, as the live index keys them.
+ */
 const FALLBACK_EDITION_HOSTS: ReadonlyMap<string, string> = new Map(
-  FALLBACK_EDITION_SUBDOMAINS.map((code) => [code, `https://${code}.wikipedia.org`]),
+  Object.entries(
+    withLegacyCodes(
+      Object.fromEntries(
+        FALLBACK_EDITION_SUBDOMAINS.map((code) => [code, `https://${code}.wikipedia.org`]),
+      ),
+    ),
+  ),
 );
 
 /**
  * Every Wikipedia edition indexed by each code a caller may legitimately pass: the edition's
- * subdomain, and its MediaWiki language code when the two differ. Both spellings map to the same
- * canonical origin, so `als` and `gsw` alike resolve to `https://als.wikipedia.org` — which is
- * what lets the langlinks host fallback compose a real host from a language code.
+ * subdomain, its MediaWiki language code when the two differ, and any legacy code naming it
+ * ({@link LEGACY_EDITION_CODES}). Every spelling maps to the same canonical origin, so `als` and
+ * `gsw` alike resolve to `https://als.wikipedia.org` — which is what lets the langlinks host
+ * fallback compose a real host from a language code.
  */
 export type EditionIndex = {
   /** Lowercased edition code → `https://<subdomain>.wikipedia.org`. */
@@ -1780,10 +2129,11 @@ export const GEOSEARCH_MIN_RADIUS_METERS = 10;
 export const GEOSEARCH_MAX_RADIUS_METERS = 10_000;
 
 /**
- * This server's own page size for `list=search`. Upstream reports `limit.max: 500` for an anonymous
- * caller, so the cap is a payload-size choice rather than an API ceiling.
+ * Upstream ceiling for `list=search`'s `srlimit`, per `action=paraminfo`. The module's `highmax` of
+ * 5000 requires the `apihighlimits` right, which an anonymous caller never has, so 500 is the real
+ * bound. A page past {@link PAGE_META_CHUNK_SIZE} results has its metadata looked up in chunks.
  */
-export const SEARCH_MAX_LIMIT = 50;
+export const SEARCH_MAX_LIMIT = 500;
 
 /** Supported upstream search orders. */
 export const SEARCH_SORTS = [
@@ -1830,6 +2180,89 @@ export function redirectInfo(
 }
 
 /**
+ * What a summary's redirect lookup established: the title needed no redirect, the redirect REST
+ * followed, or nothing, because the lookup failed or answered for another page.
+ */
+type SummaryRedirect =
+  | { kind: 'none' }
+  | { kind: 'followed'; info: RedirectInfo }
+  | { kind: 'unchecked' };
+
+/**
+ * MediaWiki's title whitespace, which a page title folds in runs to one space. Narrower than `\s`
+ * on purpose: a BOM is not whitespace to MediaWiki, so a title holding one names a different page.
+ */
+const TITLE_WHITESPACE = /[ _\u00A0\u1680\u180E\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]+/;
+
+/**
+ * Whether `input`, normalized as MediaWiki normalizes a page title, already is `resolvedTitle` — so
+ * the REST summary reached it without a redirect and the redirect lookup is not needed.
+ *
+ * The `#fragment` is dropped, the text NFC-normalized, and each run of title whitespace (underscore
+ * included) folded to one space with none left at either end. The first letter matches as written or
+ * uppercased, the uppercase trusted only when it is one code point: MediaWiki titlecases rather than
+ * uppercases (`ǆ` → `ǅ`, `ﬀ` → `Ff`) and keeps `ß`, so a title opening on such a letter pays the
+ * lookup unless upstream kept it as written. A `false` for a title that needed no redirect costs one
+ * request and reports nothing. A `true` can hide a redirect only where an edition capitalizes a first
+ * letter other than to its uppercase — not at all, or Turkish `i` → `İ` — and the alias differs from
+ * its target in exactly that letter.
+ */
+export function resolvesWithoutRedirect(input: string, resolvedTitle: string): boolean {
+  const name = (input.split('#', 1)[0] ?? '')
+    .normalize('NFC')
+    .split(TITLE_WHITESPACE)
+    .filter(Boolean)
+    .join(' ');
+  if (name === resolvedTitle) return true;
+  const first = name.codePointAt(0);
+  if (first === undefined) return false;
+  const letter = String.fromCodePoint(first);
+  const upper = letter.toUpperCase();
+  return [...upper].length === 1 && upper + name.slice(letter.length) === resolvedTitle;
+}
+
+/**
+ * The part of a TOC lookup a summary reads: the page it resolved to, the redirect chain, and the
+ * anchors that index a section target. Parsed rather than cast, so a malformed body leaves the
+ * redirect unchecked instead of failing a summary that already answered.
+ */
+const SummaryLookupSchema = z.object({
+  title: z.string(),
+  redirects: z
+    .array(
+      z.object({
+        from: z.string().min(1),
+        to: z.string().exactOptional(),
+        tofragment: z.string().exactOptional(),
+      }),
+    )
+    .exactOptional(),
+  tocdata: z
+    .object({
+      sections: z
+        .array(
+          z.object({
+            line: z.string().exactOptional(),
+            index: z.string().exactOptional(),
+            anchor: z.string().exactOptional(),
+          }),
+        )
+        .exactOptional(),
+    })
+    .exactOptional(),
+});
+
+/**
+ * The optional TOC lookup's whole `prop=tocdata` response, parsed rather than cast: an error
+ * envelope, or a `parse` carrying the {@link SummaryLookupSchema} fields, whose `title` only the
+ * summary requires. A body of any other shape is an unavailable lookup, never a failed read.
+ */
+const ArticleTocLookupSchema = z.object({
+  error: z.object({ code: z.string().optional(), info: z.string().optional() }).optional(),
+  parse: SummaryLookupSchema.extend({ title: z.string().exactOptional() }).optional(),
+});
+
+/**
  * The deep-paging window CirrusSearch enforces on `sroffset`. At or past it the API refuses the
  * request outright (`cirrussearch-offset-too-large`); below it, a page that would cross the window
  * is silently cut at the 10,000th result instead. Matches beyond it have no continuation — a
@@ -1841,11 +2274,23 @@ export const SEARCH_RESULT_WINDOW = 10_000;
 const SEARCH_RESULT_WINDOW_LABEL = SEARCH_RESULT_WINDOW.toLocaleString('en-US');
 
 /**
- * Per-request timeout for the search results' description lookup. The lookup is best-effort and
- * runs after the search has already succeeded, so it gets one short attempt rather than the default
- * 15 s with retries — a stalled lookup must not hold back results that are ready.
+ * Short budget for a best-effort read beside a primary answer that is already in hand: the whole of
+ * a search page's description lookup — every chunk, queue wait included, no retries — and the one
+ * attempt of each other side lookup. A stalled lookup must not hold back an answer that is ready.
  */
 const PAGE_META_TIMEOUT_MS = 5_000;
+
+/**
+ * Pageids one `prop=description|pageprops` request takes from an anonymous caller: `action=paraminfo`
+ * reports `pageids` limit 50, and its `highlimit` of 500 requires `apihighlimits`.
+ */
+const PAGE_META_CHUNK_SIZE = 50;
+
+/**
+ * Description lookups in flight at once across every call this process serves. A module-level
+ * queue rather than a per-call pool: one hosted process answers many callers at a time.
+ */
+const pageMetaPacer = createPacer({ name: 'wikipedia-page-meta', maxConcurrent: 4 });
 
 /** A result's short description and Wikidata QID, each present only when upstream has one. */
 type PageMeta = { description?: string; wikibase_item?: string };
@@ -1903,16 +2348,56 @@ function articleNotFoundError(title: string, language: string): McpError {
 }
 
 /**
- * A title MediaWiki cannot name a page with. Carries the `invalid_title` reason the four
- * title-taking tools declare, so a refusal raised here — from an `invalid: true` page entry or an
- * `invalidtitle` parse error — reaches the client with the same typed contract as the handler-edge
- * guard, instead of an untyped upstream message asserting the article exists.
+ * A title that can name no page. Carries the `invalid_title` reason the five title-taking read
+ * tools declare, so a refusal raised here reaches the client with the same typed contract as the
+ * handler-edge guard, instead of an untyped upstream message or a claim that the article exists.
+ * `detail` says why: the API's own `invalidreason` or `info`, {@link NO_PAGE_NAMESPACE_DETAIL}, which
+ * reads the same on every read path, or {@link INTERWIKI_DETAIL} on the `action=query` paths — a
+ * parse refuses an interwiki title through `invalidtitle` and its `info`.
  */
-function invalidTitleError(title: string, upstreamReason?: string): McpError {
+function invalidTitleError(title: string, detail?: string): McpError {
   return validationError(
-    `"${title}" is not a valid Wikipedia page name.${upstreamReason ? ` ${upstreamReason}` : ''}`,
+    `"${title}" is not a valid Wikipedia page name.${detail ? ` ${detail}` : ''}`,
     { title, reason: 'invalid_title' },
   );
+}
+
+/**
+ * Why a Special: or Media: title names no page — `action=parse`'s `pagecannotexist` and an
+ * `action=query` page entry marked `special` alike. The namespace names are localized
+ * (`Spezial:`, `特別:`), which is why the refusal keys on those upstream signals, not on a prefix.
+ */
+const NO_PAGE_NAMESPACE_DETAIL =
+  "Special: and Media: titles, in any edition's spelling, name no page; a file's description page is in the File: namespace.";
+
+/** Why an interwiki-prefixed title (`wikt:cat`, `fr:Chat`) names no page on this edition. */
+const INTERWIKI_DETAIL =
+  "It begins with an interwiki prefix, which links to another wiki. For another Wikipedia edition, pass the title without the prefix and the edition's code as language.";
+
+/**
+ * The first page entry of an `action=query` answer for one title, after refusing a title that can
+ * name no page with {@link invalidTitleError}; `undefined` when the answer carries no entry.
+ *
+ * Read in the order that keeps each answer true: an interwiki title arrives under
+ * `query.interwiki` with no page entry at all; an unnameable title as `invalid` with no `missing`
+ * key; and a Special: or Media: title as `special`, beside `missing` when that special page or file
+ * does not exist, so `special` is read before the caller tests `missing`. An ordinary entry,
+ * present or missing, is returned for the caller to read.
+ */
+function nameablePageEntry<P extends UnnameablePageRaw>(
+  title: string,
+  query:
+    | {
+        interwiki?: readonly ActionInterwikiRaw[];
+        pages?: Readonly<Record<string, P>> | readonly P[];
+      }
+    | undefined,
+): P | undefined {
+  if (query?.interwiki?.length) throw invalidTitleError(title, INTERWIKI_DETAIL);
+  const page = query?.pages && Object.values(query.pages)[0];
+  if (page?.invalid) throw invalidTitleError(title, page.invalidreason);
+  if (page?.special) throw invalidTitleError(title, NO_PAGE_NAMESPACE_DETAIL);
+  return page;
 }
 
 /** An `offset` at or past {@link SEARCH_RESULT_WINDOW}, where no continuation exists. */
@@ -1932,9 +2417,10 @@ function searchWindowError(offset: number): McpError {
 /**
  * Translate the Action API's top-level `error` envelope into this server's typed failures.
  *
- * `title` is passed by the page-addressed endpoints, whose `missingtitle` and `invalidtitle` codes
- * map onto declared tool contracts. Regex syntax and complexity refusals are invalid queries;
- * other codes surface as service failures carrying the API's `info` text. The
+ * `title` is passed by the page-addressed endpoints, whose `missingtitle`, `invalidtitle`, and
+ * `pagecannotexist` codes map onto declared tool contracts — the last is `action=parse`'s answer
+ * for a Special: or Media: title, on every edition. Regex syntax and complexity refusals are
+ * invalid queries; other codes surface as service failures carrying the API's `info` text. The
  * {@link TRANSIENT_ENVELOPE_CODES} never reach here unless their retries ran out —
  * {@link transientEnvelopeError} throws them inside the retry.
  */
@@ -1955,6 +2441,7 @@ function actionApiError(error: ActionApiErrorRaw, language: string, title?: stri
   if (title !== undefined) {
     if (code === 'missingtitle') return articleNotFoundError(title, language);
     if (code === 'invalidtitle') return invalidTitleError(title, error.info);
+    if (code === 'pagecannotexist') return invalidTitleError(title, NO_PAGE_NAMESPACE_DETAIL);
   }
   return serviceUnavailable(`Wikipedia API error: ${error.info ?? code}`);
 }
@@ -2048,7 +2535,8 @@ const REFERENCES_PARSE_TIMEOUT_MS = 25_000;
  *
  * Pure and exported for unit testing. Closed editions are kept: a closed wiki is read-only, not
  * gone — `aa.wikipedia.org` still answers, and dropping them would newly reject codes that work.
- * Subdomains are indexed first so a language code can never displace a real subdomain's host.
+ * Subdomains are indexed first so a language code can never displace a real subdomain's host, and
+ * legacy codes last, so neither can be displaced by one.
  */
 export function parseSiteMatrix(raw: SiteMatrixRaw): EditionIndex {
   const editions: Array<{ subdomain: string; code: string | undefined; origin: string }> = [];
@@ -2075,7 +2563,7 @@ export function parseSiteMatrix(raw: SiteMatrixRaw): EditionIndex {
   if (Object.keys(hosts).length === 0) {
     throw serviceUnavailable('Wikipedia sitematrix response listed no language editions.');
   }
-  return { hosts, fetchedAt: new Date().toISOString() };
+  return { hosts: withLegacyCodes(hosts), fetchedAt: new Date().toISOString() };
 }
 
 /**
@@ -2157,6 +2645,46 @@ function editionCodeFromUrl(url: string): string | undefined {
  */
 type ServiceContext = RequestContext & { signal?: AbortSignal };
 
+/**
+ * The section read's `prop=pageprops&ppprop=disambiguation` response, parsed rather than cast: a
+ * body of any other shape is an unavailable lookup, never an unflagged page.
+ */
+const PagePropsLookupSchema = z.object({
+  error: z.object({ code: z.string().optional(), info: z.string().optional() }).optional(),
+  query: z
+    .object({
+      pages: z.array(
+        z.object({
+          missing: z.boolean().optional(),
+          invalid: z.boolean().optional(),
+          pageprops: z.record(z.string(), z.unknown()).optional(),
+        }),
+      ),
+    })
+    .optional(),
+});
+
+/**
+ * The summary pre-check's `action=query&titles=…` response: the flags {@link nameablePageEntry}
+ * reads, parsed rather than cast, so a body of any other shape leaves the title to REST.
+ */
+const TitleCheckSchema = z.object({
+  query: z.object({
+    interwiki: z
+      .array(z.object({ title: z.string().exactOptional(), iw: z.string().exactOptional() }))
+      .exactOptional(),
+    pages: z
+      .array(
+        z.object({
+          invalid: z.boolean().exactOptional(),
+          invalidreason: z.string().exactOptional(),
+          special: z.boolean().exactOptional(),
+        }),
+      )
+      .exactOptional(),
+  }),
+});
+
 export class WikipediaService {
   /** Process-local index cache, so a warm process never re-reads storage per call. */
   private indexMemo?: { index: EditionIndex; expiresAt: number };
@@ -2190,9 +2718,11 @@ export class WikipediaService {
    * Fetch, JSON-parse, and retry one MediaWiki endpoint, the whole ladder bounded by
    * {@link REQUEST_DEADLINE_MS}.
    *
-   * MediaWiki serves an HTML error page under rate limiting and maintenance, so a leading
-   * doctype is remapped to a retryable `serviceUnavailable` rather than a JSON parse failure. The
-   * Action API reports its own transient refusals inside an HTTP 200 body, so those are thrown
+   * MediaWiki serves an HTML error page under rate limiting and maintenance, so a 2xx body that is
+   * not a JSON object — that page, an XML body, a `null`, anything else — is a retryable
+   * `serviceUnavailable` with one fixed message carrying none of the body; a parse error rides as
+   * its `cause`, for the logs. Every endpoint this server reads answers with an object.
+   * The Action API reports its own transient refusals inside an HTTP 200 body, so those are thrown
    * here, inside the retry, and every caller gets the same backoff a 503 gets; every other body is
    * returned, `error` envelope and all, for the caller to map. The caller's signal ends a backoff
    * as well as a request in flight.
@@ -2213,12 +2743,19 @@ export class WikipediaService {
           signal,
         });
         const text = await response.text();
-        if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
-          throw serviceUnavailable(
-            `Wikipedia ${apiLabel} returned HTML instead of JSON — likely rate-limited or under maintenance.`,
+        const unusable = (options?: { cause: unknown }) =>
+          serviceUnavailable(
+            `Wikipedia ${apiLabel} returned a response that is not a JSON object — likely rate-limited or under maintenance.`,
+            undefined,
+            options,
           );
+        let body: unknown;
+        try {
+          body = JSON.parse(text);
+        } catch (err) {
+          throw unusable({ cause: err });
         }
-        const body: unknown = JSON.parse(text);
+        if (typeof body !== 'object' || body === null || Array.isArray(body)) throw unusable();
         const transient = transientEnvelopeError(body, response);
         if (transient) throw transient;
         return body as T;
@@ -2320,6 +2857,11 @@ export class WikipediaService {
    * to fail a call that would otherwise have succeeded. Returns `undefined` immediately in
    * single-instance override mode: that host may serve any editions, so no Wikipedia edition set
    * describes it and no sitematrix fetch is warranted.
+   *
+   * Concurrent callers share one build, which therefore runs on its own deadline and never on a
+   * caller's signal: one caller's cancellation must neither abort the request the others are
+   * waiting on nor read as an outage that arms the back-off for all of them. A cancelled caller's
+   * own await rejects with its signal's reason; the build carries on for everyone else.
    */
   private async editionIndex(ctx: ServiceContext): Promise<EditionIndex | undefined> {
     if (this.baseUrl) return;
@@ -2327,18 +2869,32 @@ export class WikipediaService {
     const now = Date.now();
     if (this.indexMemo && this.indexMemo.expiresAt > now) return this.indexMemo.index;
     if (now < this.indexRetryAfter) return;
-    this.indexInFlight ??= this.buildEditionIndex(ctx).finally(() => {
+    const { signal, ...buildCtx } = ctx;
+    signal?.throwIfAborted();
+    this.indexInFlight ??= this.buildEditionIndex(buildCtx).finally(() => {
       this.indexInFlight = undefined;
     });
-    return await this.indexInFlight;
+    const build = this.indexInFlight;
+    if (!signal) return await build;
+
+    const cancelled = Promise.withResolvers<never>();
+    const onAbort = () => cancelled.reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    try {
+      return await Promise.race([build, cancelled.promise]);
+    } finally {
+      signal.removeEventListener('abort', onAbort);
+    }
   }
 
   private async buildEditionIndex(ctx: ServiceContext): Promise<EditionIndex | undefined> {
     try {
       const cached = await this.storage.get<EditionIndex>(EDITION_INDEX_STORAGE_KEY, ctx);
       if (cached?.hosts && Object.keys(cached.hosts).length > 0) {
-        this.memoize(cached);
-        return cached;
+        // An index persisted before a legacy code was keyed answers for it without a rebuild.
+        const index = { ...cached, hosts: withLegacyCodes(cached.hosts) };
+        this.memoize(index);
+        return index;
       }
     } catch (err) {
       logger.warning(
@@ -2379,8 +2935,9 @@ export class WikipediaService {
    * to reject it with the typed `invalid_language` contract before any network call, mirroring how
    * the structural BCP 47 check is already pre-validated in-handler.
    *
-   * An edition answers to either spelling the registry indexes: the subdomain a caller reads off
-   * `wikipedia_get_languages`' `edition_code`, or its MediaWiki language code.
+   * An edition answers to every spelling the registry indexes: the subdomain a caller reads off
+   * `wikipedia_get_languages`' `edition_code`, its MediaWiki language code, and a legacy code
+   * naming it (`nb` for `no`).
    *
    * Always `false` in single-instance override mode: that host may serve any editions, so the
    * Wikipedia-specific edition set must not gate it.
@@ -2388,19 +2945,22 @@ export class WikipediaService {
   async isUnknownEdition(language: string, ctx: ServiceContext): Promise<boolean> {
     if (this.baseUrl) return false;
     if (isMalformedLanguage(language)) return true;
-    const normalized = language.toLowerCase();
     const index = await this.editionIndex(ctx);
-    return index ? !(normalized in index.hosts) : !FALLBACK_EDITION_HOSTS.has(normalized);
+    return index
+      ? indexedHost(index.hosts, language) === undefined
+      : !FALLBACK_EDITION_HOSTS.has(language.toLowerCase());
   }
 
   /**
    * The canonical origin serving `code`, or `undefined` when no edition is known for it — the
    * lookup that lets a langlinks entry missing its `url` resolve a real host from its language
-   * code instead of interpolating one that may not exist.
+   * code instead of interpolating one that may not exist, and that tells two spellings of one
+   * edition apart from two editions. Always `undefined` in single-instance override mode and while
+   * the registry is unavailable.
    */
   async editionHost(code: string, ctx: ServiceContext): Promise<string | undefined> {
     const index = await this.editionIndex(ctx);
-    return index?.hosts[code.toLowerCase()];
+    return index ? indexedHost(index.hosts, code) : undefined;
   }
 
   /**
@@ -2414,7 +2974,7 @@ export class WikipediaService {
     assertStructuralLanguage(language);
     const index = await this.editionIndex(ctx);
     if (!index) return buildBaseUrl(language);
-    const host = index.hosts[language.toLowerCase()];
+    const host = indexedHost(index.hosts, language);
     if (!host) throw unknownEditionError(language);
     return host;
   }
@@ -2429,13 +2989,26 @@ export class WikipediaService {
    * The extract is rendered from `extract_html` through {@link htmlSectionToPlainText}, the renderer
    * every read path shares. The plain `extract` flattens superscripts into the digits beside them —
    * `6.02214076×10<sup>23</sup>` reads as `6.02214076×1023` — and runs a disambiguation page's list
-   * into the sentence introducing it. The plain `extract` stands in for a payload without
-   * `extract_html`. An existing page without either
+   * into the sentence introducing it, where the rendered list keeps a `- ` line per entry. The plain
+   * `extract` stands in for a payload without `extract_html`. An existing page without either
    * extract still returns its metadata and an empty string.
    *
    * `latitude`/`longitude` come from the response's `coordinates`, which a non-geotagged article
    * carries as an explicit `null` rather than omitting — both are left undefined for that, for an
    * absent key, and for a partial pair, so a caller never reads half a coordinate as a location.
+   *
+   * REST answers a redirect with its target and no record of the alias, so a title that is not
+   * already the one REST resolved ({@link resolvesWithoutRedirect}) gets one best-effort lookup,
+   * {@link summaryRedirect}, after the summary is in hand; a title that is costs no request.
+   *
+   * REST carries no signal for a title that can name no page, so a title containing `:` — which
+   * every namespace and interwiki prefix needs — is first checked by {@link refuseUnnameableTitle};
+   * a title without one costs no request.
+   *
+   * `url` is composed from the resolved title by {@link articleUrl}, as the other reads cite it:
+   * REST's `content_urls` encodes with `encodeURIComponent`, escaping the `/ , : @` MediaWiki's own
+   * `fullurl` leaves literal and leaving the `'` it escapes. It is present whenever REST gave a page
+   * URL, and under a single-instance override, whose article path is unknown, is that URL as given.
    */
   async getSummary(
     title: string,
@@ -2454,7 +3027,10 @@ export class WikipediaService {
     url: string | undefined;
     revisionId: string | undefined;
     lastModified: string | undefined;
+    redirect: SummaryRedirect;
   }> {
+    if (title.includes(':')) await this.refuseUnnameableTitle(title, language, ctx);
+
     const encodedTitle = encodeURIComponent(title.replace(/ /g, '_'));
 
     let raw: RestSummaryRaw;
@@ -2482,6 +3058,15 @@ export class WikipediaService {
 
     const { lat, lon } = raw.coordinates ?? {};
     const geotagged = typeof lat === 'number' && typeof lon === 'number';
+    const pageUrl = raw.content_urls?.desktop?.page;
+    const url =
+      pageUrl && raw.title && !this.baseUrl
+        ? articleUrl(await this.resolveBaseUrl(language, ctx), raw.title)
+        : pageUrl;
+    const redirect: SummaryRedirect =
+      raw.title === undefined || resolvesWithoutRedirect(title, raw.title)
+        ? { kind: 'none' }
+        : await this.summaryRedirect(title, raw.title, language, ctx);
 
     return {
       title: raw.title ?? title,
@@ -2493,10 +3078,74 @@ export class WikipediaService {
       thumbnailUrl: raw.thumbnail?.source,
       latitude: geotagged ? lat : undefined,
       longitude: geotagged ? lon : undefined,
-      url: raw.content_urls?.desktop?.page,
+      url,
       revisionId: raw.revision,
       lastModified: raw.timestamp,
+      redirect,
     };
+  }
+
+  /**
+   * Refuse a summary title that can name no page, before the REST request: REST answers a
+   * Special: title with 404, a Media: title with a 500, and an interwiki title with 504, none of
+   * which says why.
+   *
+   * One `action=query` request for the title as written, read by {@link nameablePageEntry} — no
+   * `redirects`, since REST follows those itself, and a `missing` entry is left to REST to report.
+   * Best effort, under the side-lookup bound of one {@link PAGE_META_TIMEOUT_MS} attempt and no
+   * retries: a refusal of any status, a timeout, an HTML or malformed body, or an error envelope
+   * leaves the title to REST exactly as before. Only the caller's cancellation propagates.
+   */
+  private async refuseUnnameableTitle(
+    title: string,
+    language: string,
+    ctx: ServiceContext,
+  ): Promise<void> {
+    const proceed = (detail: string): void => {
+      logger.warning(
+        'Summary title check failed; the summary is read without it.',
+        withExtra(ctx, { error: detail }),
+      );
+    };
+
+    let body: unknown;
+    try {
+      body = await this.actionGet<unknown>(language, { action: 'query', titles: title }, ctx, {
+        timeoutMs: PAGE_META_TIMEOUT_MS,
+        maxRetries: 0,
+      });
+    } catch (err) {
+      if (ctx.signal?.aborted) throw err;
+      if (err instanceof McpError) return proceed(err.message);
+      throw err;
+    }
+
+    const parsed = TitleCheckSchema.safeParse(body);
+    if (!parsed.success) return proceed('The title check response had an unexpected shape.');
+    nameablePageEntry(title, parsed.data.query);
+  }
+
+  /**
+   * How the REST summary for `title` reached `resolvedTitle`, read from one {@link getArticleToc}
+   * request, which carries the redirect chain and the anchors that index a section target together.
+   *
+   * The summary has already answered, so the lookup runs under that helper's own bound — one
+   * {@link PAGE_META_TIMEOUT_MS} attempt, no retries — and no upstream failure fails the summary:
+   * {@link getArticleToc} returns `undefined` for every one, and that, a body without the summary's
+   * fields, or an answer for a page other than `resolvedTitle` is `unchecked`. The caller's
+   * cancellation and this server's own failures propagate.
+   */
+  private async summaryRedirect(
+    title: string,
+    resolvedTitle: string,
+    language: string,
+    ctx: ServiceContext,
+  ): Promise<SummaryRedirect> {
+    const toc = await this.getArticleToc(title, language, ctx);
+    const lookup = SummaryLookupSchema.safeParse(toc);
+    if (!lookup.success || lookup.data.title !== resolvedTitle) return { kind: 'unchecked' };
+    const info = redirectInfo(lookup.data.redirects, lookup.data);
+    return info.redirected_from ? { kind: 'followed', info } : { kind: 'none' };
   }
 
   /**
@@ -2514,8 +3163,8 @@ export class WikipediaService {
    * `suggestion` is CirrusSearch's spelling correction, which `srinfo`'s default already requests
    * on every page — empty or not. Each result's `description` and `wikibase_item` come from a
    * separate {@link lookupPageMeta} call, because `list=search` cannot return page props and
-   * `generator=search` drops `snippet` and `wordcount`. `descriptionsUnavailable` is true only when
-   * that lookup was attempted and failed; the results are returned either way.
+   * `generator=search` drops `snippet` and `wordcount`. `metaUnavailableCount` counts the results
+   * that lookup failed for, which carry neither field; the results are returned either way.
    */
   async search(
     query: string,
@@ -2531,7 +3180,7 @@ export class WikipediaService {
     totalResults: number;
     nextOffset: number | undefined;
     suggestion?: string;
-    descriptionsUnavailable: boolean;
+    metaUnavailableCount: number;
   }> {
     const raw = await this.actionGet<ActionSearchRaw>(
       language,
@@ -2560,67 +3209,110 @@ export class WikipediaService {
         wordcount: r.wordcount ?? 0,
       })) ?? [];
 
-    const meta =
+    const { meta, unavailable } =
       results.length > 0
         ? await this.lookupPageMeta(
             results.map((r) => r.pageid),
             language,
             ctx,
           )
-        : new Map<number, PageMeta>();
+        : { meta: new Map<number, PageMeta>(), unavailable: 0 };
     const suggestion = raw.query?.searchinfo?.suggestion;
 
     return {
       // Merged by pageid: the lookup answers in pageid order, and the search ranking must survive.
-      results: meta ? results.map((r) => ({ ...r, ...meta.get(r.pageid) })) : results,
+      results: results.map((r) => ({ ...r, ...meta.get(r.pageid) })),
       totalResults: raw.query?.searchinfo?.totalhits ?? results.length,
       nextOffset: raw.continue?.sroffset,
       ...(suggestion && { suggestion }),
-      descriptionsUnavailable: meta === undefined,
+      metaUnavailableCount: unavailable,
     };
   }
 
   /**
    * Best-effort short description and Wikidata QID for a page of search results, keyed by pageid.
    *
-   * One request covers a full page: `pageids` accepts 50 values from an anonymous caller, which is
-   * {@link SEARCH_MAX_LIMIT}. It runs once with a short timeout and no retries, and returns
-   * `undefined` on any failure — a transport error or an Action API `error` envelope — so a
-   * degraded lookup costs the caller the two fields, never the search. A caller cancellation is
-   * not a lookup failure: it propagates, as it would from the search request itself.
+   * The page is looked up in {@link PAGE_META_CHUNK_SIZE}-id chunks queued on
+   * {@link pageMetaPacer}, all under one {@link PAGE_META_TIMEOUT_MS} budget that starts before the
+   * first chunk queues, so queue wait counts against it. Nothing retries. A chunk that fails — a
+   * transport error, an Action API `error` envelope, or the budget running out while it is queued
+   * or in flight — costs only its own results the two fields, and `unavailable` counts those
+   * results; a lookup never delays the search past the budget or fails it. A caller cancellation
+   * is not a lookup failure: it propagates, as it would from the search request itself.
    */
   private async lookupPageMeta(
     pageids: number[],
     language: string,
     ctx: ServiceContext,
-  ): Promise<Map<number, PageMeta> | undefined> {
-    const degrade = (detail: string): undefined => {
-      logger.warning(
-        'Wikipedia description lookup failed; returning search results without descriptions.',
-        withExtra(ctx, { error: detail }),
+  ): Promise<{ meta: Map<number, PageMeta>; unavailable: number }> {
+    const budget = new AbortController();
+    const timer = setTimeout(() => {
+      budget.abort(
+        new DOMException(
+          `Search description lookup ran past its ${PAGE_META_TIMEOUT_MS} ms budget.`,
+          'TimeoutError',
+        ),
       );
-      return;
+    }, PAGE_META_TIMEOUT_MS);
+    const signal = ctx.signal ? AbortSignal.any([ctx.signal, budget.signal]) : budget.signal;
+
+    const lookupChunk = async (
+      chunk: number[],
+    ): Promise<{ meta: Map<number, PageMeta> } | { failed: number; reason: string }> => {
+      try {
+        const raw = await pageMetaPacer.run(
+          (slotSignal) =>
+            this.actionGet<ActionPageMetaQueryRaw>(
+              language,
+              {
+                action: 'query',
+                pageids: chunk.join('|'),
+                prop: 'description|pageprops',
+                ppprop: 'wikibase_item',
+              },
+              { ...ctx, signal: slotSignal },
+              { maxRetries: 0 },
+            ),
+          { signal },
+        );
+        if (raw.error) {
+          const reason = raw.error.info ?? raw.error.code ?? 'unknown API error';
+          return { failed: chunk.length, reason };
+        }
+        return { meta: pageMetaById(raw.query?.pages) };
+      } catch (err) {
+        if (ctx.signal?.aborted) throw err;
+        return { failed: chunk.length, reason: err instanceof Error ? err.message : String(err) };
+      }
     };
 
-    let raw: ActionPageMetaQueryRaw;
-    try {
-      raw = await this.actionGet<ActionPageMetaQueryRaw>(
-        language,
-        {
-          action: 'query',
-          pageids: pageids.join('|'),
-          prop: 'description|pageprops',
-          ppprop: 'wikibase_item',
-        },
-        ctx,
-        { timeoutMs: PAGE_META_TIMEOUT_MS, maxRetries: 0 },
-      );
-    } catch (err) {
-      if (ctx.signal?.aborted) throw err;
-      return degrade(err instanceof Error ? err.message : String(err));
+    const chunks: number[][] = [];
+    for (let i = 0; i < pageids.length; i += PAGE_META_CHUNK_SIZE) {
+      chunks.push(pageids.slice(i, i + PAGE_META_CHUNK_SIZE));
     }
-    if (raw.error) return degrade(raw.error.info ?? raw.error.code ?? 'unknown API error');
-    return pageMetaById(raw.query?.pages);
+    const outcomes = await Promise.allSettled(chunks.map(lookupChunk));
+    clearTimeout(timer);
+
+    const meta = new Map<number, PageMeta>();
+    const reasons = new Set<string>();
+    let unavailable = 0;
+    for (const outcome of outcomes) {
+      // Only a caller cancellation rejects, and every chunk has settled, so none is left running.
+      if (outcome.status === 'rejected') throw outcome.reason;
+      if ('meta' in outcome.value) {
+        for (const [pageid, entry] of outcome.value.meta) meta.set(pageid, entry);
+      } else {
+        unavailable += outcome.value.failed;
+        reasons.add(outcome.value.reason);
+      }
+    }
+    if (unavailable > 0) {
+      logger.warning(
+        'Wikipedia description lookup failed; returning those search results without descriptions.',
+        withExtra(ctx, { unavailable, results: pageids.length, errors: [...reasons] }),
+      );
+    }
+    return { meta, unavailable };
   }
 
   /**
@@ -2631,10 +3323,14 @@ export class WikipediaService {
    * than `explaintext`, which flattens superscripts into the digits beside them. Both modes strip the
    * same infoboxes, tables, and navboxes upstream, so the rendered text carries the same sections
    * under the same `== Heading ==` markers; beyond superscripts it differs only where the HTML says
-   * more — a `<pre>` sample arrives fenced, and a formula arrives once, as its TeX.
+   * more — a `<pre>` sample arrives fenced, a list keeps its markers and nesting, and a formula
+   * arrives once, as its TeX.
    *
    * `lastModified` is the revision's own timestamp (`revisions[0]`), never `prop=info`'s `touched`,
    * which is a cache-invalidation time that moves without an edit.
+   *
+   * `disambiguation` is the page's `disambiguation` page property, the one the REST summary's
+   * `type` reads, riding the same request as `prop=pageprops&ppprop=disambiguation`.
    */
   async getArticleFull(
     title: string,
@@ -2647,6 +3343,7 @@ export class WikipediaService {
     revisionId: string | undefined;
     lastModified: string | undefined;
     url: string | undefined;
+    disambiguation: boolean;
     redirect?: RedirectInfo;
     redirects?: ActionRedirectRaw[];
   }> {
@@ -2655,9 +3352,10 @@ export class WikipediaService {
       {
         action: 'query',
         titles: title,
-        prop: 'extracts|info|revisions',
+        prop: 'extracts|info|revisions|pageprops',
         inprop: 'url',
         rvprop: 'ids|timestamp',
+        ppprop: 'disambiguation',
         // Resolve redirects server-side so aliases (e.g. "NYC" → "New York City") return the
         // target's content, pageid, revision, and URL, matching getSummary's REST behavior.
         redirects: 'true',
@@ -2667,18 +3365,11 @@ export class WikipediaService {
 
     if (raw.error) throw actionApiError(raw.error, language, title);
 
-    const pages = raw.query?.pages;
-    // When `pages` is absent the API received an empty or invalid title rather than a valid
-    // (but missing) article. Map this to not_found — same user-visible outcome.
-    if (!pages) throw articleNotFoundError(title, language);
-
-    const page = Object.values(pages)[0];
-    if (!page) throw articleNotFoundError(title, language);
-
-    // An unnameable title arrives as `invalid` with no `missing` key, so this has to be tested
-    // separately or the entry falls through into "exists but has no readable content".
-    if (page.invalid) throw invalidTitleError(title, page.invalidreason);
-    if (page.missing !== undefined) throw articleNotFoundError(title, language);
+    // Refused before `missing` is read, or the entry falls through into "exists but has no
+    // readable content". No entry at all is a title the API could not look up rather than a
+    // valid (but missing) article — mapped to not_found, the same user-visible outcome.
+    const page = nameablePageEntry(title, raw.query);
+    if (!page || page.missing !== undefined) throw articleNotFoundError(title, language);
 
     // An extract of only empty paragraphs renders to nothing, which is no more readable than none.
     const content = htmlSectionToPlainText(page.extract ?? '');
@@ -2694,6 +3385,7 @@ export class WikipediaService {
       revisionId: revision?.revid?.toString(),
       lastModified: revision?.timestamp,
       url: page.fullurl,
+      disambiguation: page.pageprops?.disambiguation !== undefined,
       ...(raw.query?.redirects?.length && {
         redirect: redirectInfo(raw.query.redirects),
         redirects: raw.query.redirects,
@@ -2718,6 +3410,11 @@ export class WikipediaService {
    * — byte-identical to the full read's `fullurl` — and the section read carries no `lastModified`,
    * which would cost a second request. Under a single-instance override the host's article path is
    * unknown, so `url` is omitted rather than guessed.
+   *
+   * A section parse carries no page properties, so `disambiguation` comes from
+   * {@link lookupDisambiguation}, sent beside the parse rather than after it. The parse's error
+   * envelope is mapped inside its own promise, so a failed parse settles the read without waiting on
+   * the lookup, and the `finally` stops a lookup nothing will read.
    */
   async getArticleSection(
     title: string,
@@ -2734,44 +3431,57 @@ export class WikipediaService {
     url: string | undefined;
     redirect?: RedirectInfo;
     tablePage?: TablePage;
+    /** Whether the page is a disambiguation page; `undefined` when that could not be checked. */
+    disambiguation: boolean | undefined;
   }> {
-    const raw = await this.actionGet<ActionParseTextRaw>(
-      language,
-      {
-        action: 'parse',
-        ...(tableRead?.continuation
-          ? { oldid: String(tableRead.continuation.revisionId) }
-          : { page: title }),
-        prop: 'text|revid',
-        section: String(sectionIndex),
-        // Suppress the edit links, table of contents, and parser report — page furniture that
-        // would only be stripped again on the way to plain text.
-        disableeditsection: 'true',
-        disabletoc: 'true',
-        disablelimitreport: 'true',
-        // Resolve redirects so a section read on an alias (e.g. "NYC") targets the resolved
-        // article; without it the alias stub has no sections and the API returns nosuchsection.
-        redirects: 'true',
-      },
-      ctx,
-    );
-
-    if (raw.error) {
-      if (tableRead?.continuation) {
-        throw pinnedRevisionError('table', tableRead.continuation.revisionId, raw.error);
-      }
-      if (raw.error.code === 'nosuchsection') {
-        throw validationError(
-          `Section index ${sectionIndex} does not exist in "${title}". Call wikipedia_get_sections to get valid index values.`,
+    const stopLookup = new AbortController();
+    let raw: ActionParseTextRaw;
+    let disambiguation: boolean | undefined;
+    try {
+      [raw, disambiguation] = await Promise.all([
+        this.actionGet<ActionParseTextRaw>(
+          language,
           {
-            title,
-            sectionIndex,
-            reason: 'invalid_section',
-            recovery: { hint: 'Call wikipedia_get_sections to obtain valid section_index values.' },
+            action: 'parse',
+            ...(tableRead?.continuation
+              ? { oldid: String(tableRead.continuation.revisionId) }
+              : { page: title }),
+            prop: 'text|revid',
+            section: String(sectionIndex),
+            // Suppress the edit links, table of contents, and parser report — page furniture that
+            // would only be stripped again on the way to plain text.
+            disableeditsection: 'true',
+            disabletoc: 'true',
+            disablelimitreport: 'true',
+            // Resolve redirects so a section read on an alias (e.g. "NYC") targets the resolved
+            // article; without it the alias stub has no sections and the API returns nosuchsection.
+            redirects: 'true',
           },
-        );
-      }
-      throw actionApiError(raw.error, language, title);
+          ctx,
+        ).then((body) => {
+          if (!body.error) return body;
+          if (tableRead?.continuation) {
+            throw pinnedRevisionError('table', tableRead.continuation.revisionId, body.error);
+          }
+          if (body.error.code === 'nosuchsection') {
+            throw validationError(
+              `Section index ${sectionIndex} does not exist in "${title}". Call wikipedia_get_sections to get valid index values.`,
+              {
+                title,
+                sectionIndex,
+                reason: 'invalid_section',
+                recovery: {
+                  hint: 'Call wikipedia_get_sections to obtain valid section_index values.',
+                },
+              },
+            );
+          }
+          throw actionApiError(body.error, language, title);
+        }),
+        this.lookupDisambiguation(title, language, ctx, stopLookup.signal),
+      ]);
+    } finally {
+      stopLookup.abort();
     }
 
     // formatversion=2: text is a plain string, not { '*': string }.
@@ -2853,7 +3563,65 @@ export class WikipediaService {
         resolvedTitle && !this.baseUrl
           ? articleUrl(await this.resolveBaseUrl(language, ctx), resolvedTitle)
           : undefined,
+      disambiguation,
     };
+  }
+
+  /**
+   * Best-effort `disambiguation` page property for a section read: `true` or `false`, or
+   * `undefined` when the lookup was unavailable.
+   *
+   * A `section=N` parse cannot answer it — the property comes from a template at the foot of the
+   * page, which only a whole-page parse or the stored page props see — so this asks the stored page
+   * props for the same title, redirects followed as the parse follows them. One attempt under
+   * {@link PAGE_META_TIMEOUT_MS} and no retries; an upstream failure of any shape (a status, a
+   * timeout, an HTML or malformed body, an error envelope, a page reported missing) returns
+   * `undefined`, so the read never fails on the lookup or waits past that budget for it. A caller
+   * cancellation propagates, and `stop` ends a lookup whose read has already settled.
+   */
+  private async lookupDisambiguation(
+    title: string,
+    language: string,
+    ctx: ServiceContext,
+    stop: AbortSignal,
+  ): Promise<boolean | undefined> {
+    const degrade = (detail: string): undefined => {
+      logger.warning(
+        'Wikipedia page-property lookup failed; returning the section without the disambiguation flag.',
+        withExtra(ctx, { error: detail }),
+      );
+      return;
+    };
+
+    let body: unknown;
+    try {
+      body = await this.actionGet<unknown>(
+        language,
+        {
+          action: 'query',
+          titles: title,
+          prop: 'pageprops',
+          ppprop: 'disambiguation',
+          redirects: 'true',
+        },
+        { ...ctx, signal: ctx.signal ? AbortSignal.any([ctx.signal, stop]) : stop },
+        { timeoutMs: PAGE_META_TIMEOUT_MS, maxRetries: 0 },
+      );
+    } catch (err) {
+      if (ctx.signal?.aborted) throw err;
+      if (stop.aborted) return;
+      // apiGet reports every upstream failure, a body that is not JSON included, as an McpError.
+      if (err instanceof McpError) return degrade(err.message);
+      throw err;
+    }
+
+    const parsed = PagePropsLookupSchema.safeParse(body);
+    if (!parsed.success) return degrade('The lookup response had an unexpected shape.');
+    const { error, query } = parsed.data;
+    if (error) return degrade(error.info ?? error.code ?? 'unknown API error');
+    const page = query?.pages[0];
+    if (!page || page.missing || page.invalid) return degrade('The lookup returned no page.');
+    return page.pageprops?.disambiguation !== undefined;
   }
 
   /**
@@ -2936,40 +3704,61 @@ export class WikipediaService {
     };
   }
 
-  /** Best-effort TOC for guidance, without the section-list fallback or retries. */
+  /**
+   * An article's table of contents and redirect chain from one `prop=tocdata` parse, for the reads
+   * it only enriches: a full read's outline indices and redirect section, a summary's redirect.
+   *
+   * Optional by contract, without the section-list fallback: one attempt under
+   * {@link PAGE_META_TIMEOUT_MS} and no retries, and every upstream failure — any status, a timeout,
+   * a body that is not JSON, an error envelope, a body of another shape — returns `undefined`, so
+   * the read it serves answers as it does without it. A caller cancellation propagates, and so does
+   * a failure of this server's own.
+   */
   async getArticleToc(
     title: string,
     language: string,
     ctx: ServiceContext,
   ): Promise<ActionSectionsRaw['parse'] | undefined> {
+    const degrade = (detail: string): undefined => {
+      logger.warning(
+        'Wikipedia table-of-contents lookup failed; continuing without it.',
+        withExtra(ctx, { error: detail }),
+      );
+      return;
+    };
+
+    let body: unknown;
     try {
-      const raw = await this.actionGet<ActionSectionsRaw>(
+      body = await this.actionGet<unknown>(
         language,
         { action: 'parse', page: title, prop: 'tocdata', redirects: 'true' },
         ctx,
         { timeoutMs: PAGE_META_TIMEOUT_MS, maxRetries: 0 },
       );
-      if (raw.error) throw actionApiError(raw.error, language, title);
-      return raw.parse;
     } catch (err) {
       if (ctx.signal?.aborted || (err instanceof Error && err.name === 'AbortError')) throw err;
-      if (
-        err instanceof McpError &&
-        (err.code === JsonRpcErrorCode.ServiceUnavailable ||
-          err.code === JsonRpcErrorCode.Timeout ||
-          err.code === JsonRpcErrorCode.RateLimited ||
-          err.code === JsonRpcErrorCode.Forbidden ||
-          err.code === JsonRpcErrorCode.Unauthorized ||
-          err.code === JsonRpcErrorCode.NotFound)
-      )
-        return undefined;
-      // apiGet's exhausted single attempt retains JSON.parse's malformed-body error as its cause.
-      if (err instanceof Error && err.cause instanceof SyntaxError) return undefined;
+      // apiGet reports every upstream failure as an McpError; anything else is this server's own.
+      if (err instanceof McpError) return degrade(err.message);
       throw err;
     }
+
+    const parsed = ArticleTocLookupSchema.safeParse(body);
+    if (!parsed.success) return degrade('The lookup response had an unexpected shape.');
+    const { error, parse } = parsed.data;
+    if (error) return degrade(error.info ?? error.code ?? 'unknown API error');
+    if (!parse) return degrade('The lookup returned no parse.');
+    return parse;
   }
 
-  /** Fetch section table of contents for an article. */
+  /**
+   * Fetch an article's table of contents, its visible categories, and whether it is a disambiguation
+   * page, all from one parse request.
+   *
+   * `categories` keeps upstream order and drops the hidden maintenance categories; each name is the
+   * database key with underscores turned back into spaces, which is how `incategory:` and every
+   * other title surface writes it. `disambiguation` is the page's `disambiguation` property, the one
+   * the REST summary's `type` reads. Both come from the first response on the fallback path too.
+   */
   async getSections(
     title: string,
     language: string,
@@ -2978,13 +3767,15 @@ export class WikipediaService {
     title: string;
     pageid: number | undefined;
     sections: Array<{ index: number; number: string; title: string; level: number }>;
+    categories: string[];
+    disambiguation: boolean;
     redirect?: RedirectInfo;
   }> {
     const raw = await this.actionGet<ActionSectionsRaw>(
       language,
       // prop=tocdata replaces the deprecated prop=sections (same data, renamed/renested fields).
       // redirects resolves aliases (e.g. "NYC" → "New York City") like the other read paths.
-      { action: 'parse', page: title, prop: 'tocdata', redirects: 'true' },
+      { action: 'parse', page: title, prop: 'tocdata|categories|properties', redirects: 'true' },
       ctx,
     );
 
@@ -2992,6 +3783,12 @@ export class WikipediaService {
 
     const resolvedTitle = raw.parse?.title ?? title;
     const rawSections = raw.parse?.tocdata?.sections ?? [];
+    const pageFacts = {
+      categories: (raw.parse?.categories ?? []).flatMap(({ category, hidden }) =>
+        category && !hidden ? [category.replaceAll('_', ' ')] : [],
+      ),
+      disambiguation: raw.parse?.properties?.disambiguation !== undefined,
+    };
 
     // Fallback: if tocdata has no sections, derive headers from full-article text.
     if (rawSections.length === 0) {
@@ -3008,6 +3805,7 @@ export class WikipediaService {
         title: fullArticle.title,
         pageid: fullArticle.pageid,
         sections: fallbackSections,
+        ...pageFacts,
         ...(raw.parse?.redirects?.length && {
           redirect: redirectInfo(raw.parse.redirects, raw.parse),
         }),
@@ -3029,6 +3827,7 @@ export class WikipediaService {
       title: resolvedTitle,
       pageid: raw.parse?.pageid,
       sections,
+      ...pageFacts,
       ...(raw.parse?.redirects?.length && {
         redirect: redirectInfo(raw.parse.redirects, raw.parse),
       }),
@@ -3075,23 +3874,21 @@ export class WikipediaService {
 
     if (raw.error) throw actionApiError(raw.error, sourceLanguage, title);
 
-    const pages = raw.query?.pages;
-    if (!pages) throw serviceUnavailable('Unexpected response shape from Wikipedia langlinks API.');
-
-    const page = Object.values(pages)[0];
-    if (!page) throw articleNotFoundError(title, sourceLanguage);
-
-    // An unnameable title arrives as `invalid` with no `missing` key, so this has to be tested
-    // separately or the entry falls through into "has no other language editions".
-    if (page.invalid) throw invalidTitleError(title, page.invalidreason);
-    if (page.missing !== undefined) throw articleNotFoundError(title, sourceLanguage);
+    // Refused before the shape check, since an interwiki title carries no `pages`, and before
+    // `missing`, or the entry falls through into "has no other language editions".
+    const page = nameablePageEntry(title, raw.query);
+    if (!raw.query?.pages) {
+      throw serviceUnavailable('Unexpected response shape from Wikipedia langlinks API.');
+    }
+    if (!page || page.missing !== undefined) throw articleNotFoundError(title, sourceLanguage);
 
     const langlinks = page.langlinks ?? [];
     // llprop=url normally populates every url, so the registry is consulted only on the rare miss.
     const index = langlinks.some((ll) => !ll.url) ? await this.editionIndex(ctx) : undefined;
 
     const languages = langlinks.map((ll) => {
-      const host = index?.hosts[ll.lang.toLowerCase()];
+      // Own keys only: `ll.lang` is upstream text, and `constructor` would read the prototype.
+      const host = index ? indexedHost(index.hosts, ll.lang) : undefined;
       const url =
         ll.url ??
         (host ? `${host}/wiki/${encodeURIComponent(ll.title.replace(/ /g, '_'))}` : undefined);

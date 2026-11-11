@@ -22,7 +22,7 @@ import {
   initWikipediaService,
   REFERENCES_PAGE_MAX_BYTES,
 } from '@/services/wikipedia/wikipedia-service.js';
-import { parseInlineText, parseTargets } from '../../../helpers/commonmark.js';
+import { parseInlineText, parseTargets, readBackText } from '../../../helpers/commonmark.js';
 
 /** A trimmed `action=parse` capture: `{ source, parse }` (see each file's `source` for URL and date). */
 type Capture = {
@@ -95,6 +95,7 @@ type Page = {
   url?: string;
   revision_id: string;
   redirected_from?: string;
+  redirect_section?: string;
   total_references: number;
   references: Array<{
     id: string;
@@ -274,6 +275,33 @@ describe('wikipedia_get_references — single-page articles', () => {
     );
     expect(fragment).toMatchObject({ title: 'Seine', total_references: 57 });
     expect(new URL(http.calls[1]!.request.url).searchParams.get('page')).toBe('Seine#History');
+  });
+
+  it('names the section a redirect points into on both surfaces, and only for such a redirect', async () => {
+    stubParse('en.wikipedia.org', (params) => ({
+      parse: {
+        ...SEINE.parse,
+        redirects:
+          params.get('page') === '2018 Paris flood'
+            ? [{ from: '2018 Paris flood', to: 'Seine', tofragment: '2018 *Paris* flood' }]
+            : [{ from: 'River Seine', to: 'Seine' }],
+      },
+    }));
+    const sectioned = await runToolContract(wikipediaGetReferences, { title: '2018 Paris flood' });
+    expect(page(sectioned)).toMatchObject({
+      title: 'Seine',
+      redirected_from: '2018 Paris flood',
+      redirect_section: '2018 *Paris* flood',
+      total_references: 57,
+    });
+    expect(text(sectioned)).toContain(
+      '**Redirected from:** 2018 Paris flood\n**Redirect section:** 2018 \\*Paris\\* flood\n',
+    );
+
+    const plain = await runToolContract(wikipediaGetReferences, { title: 'River Seine' });
+    expect(page(plain).redirected_from).toBe('River Seine');
+    expect(page(plain)).not.toHaveProperty('redirect_section');
+    expect(text(plain)).not.toContain('Redirect section');
   });
 
   it('returns an empty list and a notice, not an error, for an article without footnotes', async () => {
@@ -531,6 +559,41 @@ describe('wikipedia_get_references — URLs read back exactly under CommonMark (
   });
 });
 
+describe('wikipedia_get_references — lists inside footnote text (#81)', () => {
+  const footnote = (id: string, body: string) =>
+    `<li id="${id}"><span class="reference-text">${body}</span></li>`;
+  const html = [
+    '<p><sup class="reference"><a href="#cite_note-1">[1]</a></sup>',
+    '<sup class="reference"><a href="#cite_note-2">[2]</a></sup></p>',
+    '<ol class="references">',
+    footnote(
+      'cite_note-1',
+      'Two sources:<ul><li>One, <i>p. 2</i>.<ol><li>Reprint.</li></ol></li><li>Two.</li></ul>',
+    ),
+    footnote('cite_note-2', 'Steps:<ol start="9"><li>Nine.</li><li>Ten.</li></ol>'),
+    '</ol>',
+  ].join('');
+
+  it('fences a nested list inside its entry and escapes a flat one, both reading back exactly', async () => {
+    stubParse('en.wikipedia.org', () => ({
+      parse: { title: 'Sample', pageid: 1, revid: 7, text: html },
+    }));
+    const result = await runToolContract(wikipediaGetReferences, { title: 'Sample' });
+    const [nested, flat] = page(result).references.map((entry) => entry.text);
+
+    expect(nested).toBe('Two sources:\n\n- One, p. 2.\n  1. Reprint.\n- Two.');
+    expect(flat).toBe('Steps:\n\n9. Nine.\n10. Ten.');
+    const markdown = text(result);
+    expect(markdown).toContain(
+      '\n- \\[1\\] cite\\_note-1\n  Two sources:\n\n  ```\n  - One, p. 2.\n    1. Reprint.\n  - Two.\n  ```\n',
+    );
+    expect(markdown).toContain('\n- \\[2\\] cite\\_note-2\n  Steps:\n\n  9\\. Nine.\n  10\\. Ten.');
+    const readBack = readBackText(markdown);
+    expect(readBack).toContain(`[1] cite_note-1\n${nested}\n\n`);
+    expect(readBack).toContain(`[2] cite_note-2\n${flat}`);
+  });
+});
+
 describe('wikipedia_get_references — errors', () => {
   const baseCursor = {
     kind: 'wikipedia_references_v1',
@@ -601,6 +664,29 @@ describe('wikipedia_get_references — errors', () => {
     expect(invalid.structuredContent).toMatchObject({
       error: { code: JsonRpcErrorCode.ValidationError, data: { reason: 'invalid_title' } },
     });
+  });
+
+  it('refuses Media:Example.jpg from the pagecannotexist envelope with the declared recovery (issue #87)', async () => {
+    stubParse('en.wikipedia.org', () => ({
+      error: { code: 'pagecannotexist', info: "Namespace doesn't allow actual pages." },
+    }));
+    const result = await runToolContract(wikipediaGetReferences, { title: 'Media:Example.jpg' });
+    const message =
+      '"Media:Example.jpg" is not a valid Wikipedia page name. Special: and Media: titles, in any edition\'s spelling, name no page; a file\'s description page is in the File: namespace.';
+    const recovery =
+      'Use wikipedia_search_articles to find the exact article title and pass it verbatim.';
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toEqual({
+      error: {
+        code: JsonRpcErrorCode.ValidationError,
+        message,
+        data: { title: 'Media:Example.jpg', reason: 'invalid_title', recovery: { hint: recovery } },
+      },
+    });
+    expect(text(result)).toBe(
+      `Error: ${message}\n\nRecovery: ${recovery}\n\n(reason invalid_title)`,
+    );
   });
 
   it.each([

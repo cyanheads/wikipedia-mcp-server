@@ -1,0 +1,8 @@
+{
+  "source": {
+    "request": "action=parse&prop=text, Tree traversal section 10",
+    "revid": 1379688139,
+    "captured": "2026-11-11"
+  },
+  "html": "<div class=\"mw-content-ltr mw-parser-output\" lang=\"en\" dir=\"ltr\"><div class=\"mw-heading mw-heading4\"><h4 id=\"Arbitrary_trees\">Arbitrary trees</h4></div>\n<p>To traverse arbitrary trees (not necessarily binary trees) with depth-first search, the following operations are performed at each node:\n</p>\n<ol><li>If the current node is empty then return.</li>\n<li>Visit the current node for pre-order traversal.</li>\n<li>For each <i>i</i> from 1 to the current node's number of subtrees − 1, or from the latter to the former for reverse traversal, do:\n<ol><li>Recursively traverse the current node's <i>i</i>-th subtree.</li>\n<li>Visit the current node for in-order traversal.</li></ol></li>\n<li>Recursively traverse the current node's last subtree.</li>\n<li>Visit the current node for post-order traversal.</li></ol>\n<p>Depending on the problem at hand, pre-order, post-order, and especially one of the number of subtrees − 1 in-order operations may be optional. Also, in practice more than one of pre-order, post-order, and in-order operations may be required. For example, when inserting into a ternary tree, a pre-order operation is performed by comparing items. A post-order operation may be needed afterwards to re-balance the tree.\n</p></div>\n"
+}

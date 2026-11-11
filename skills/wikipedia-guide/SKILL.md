@@ -1,6 +1,6 @@
 ---
 name: wikipedia-guide
-description: Gates and identifier chains for the wikipedia_* tools. Covers switching language editions without reusing titles, disambiguation pages the article tools don't flag, section numbers versus section_index, coverage that differs by edition, and the checks to run before calling something absent or sourced. Use when a wikipedia_* task crosses editions, reads past the summary, quotes a section, or has to cite or conclude absence.
+description: Gates and identifier chains for the wikipedia_* tools. Covers switching language editions without reusing titles, disambiguation pages, section numbers versus section_index, coverage that differs by edition, and the checks to run before calling something absent or sourced. Use when a wikipedia_* task crosses editions, reads past the summary, quotes a section, or has to cite or conclude absence.
 license: Apache-2.0
 metadata:
   author: cyanheads
@@ -27,8 +27,8 @@ Each call reads one edition. No tool searches several editions at once, and none
 
 **Never carry a title across editions.** Get the target edition's title from wikipedia_get_languages. If you found it by searching that edition instead, check that its `wikibase_item` matches the source article's before treating it as the same subject.
 
-**Check `page_type` before reading an ambiguous title in depth.** Only wikipedia_get_summary flags a disambiguation page. wikipedia_get_sections and wikipedia_get_article read one as if it were an article: `Mercury` returns dozens of "sections" (Companies, Computing, Film and television …) with no flag. To pick the intended article:
-- Read the disambiguation page's sections. They list one candidate per line, title first ("Mercury Drug, a Philippine pharmacy chain").
+**Check `page_type` before reading an ambiguous title in depth.** wikipedia_get_summary, wikipedia_get_sections, and wikipedia_get_article report `page_type: "disambiguation"` on a disambiguation page and omit the field otherwise, but the page still reads like an article: `Mercury` returns dozens of "sections" (Companies, Computing, Film and television …). A read whose notice says the page type could not be checked is unflagged, not cleared: call wikipedia_get_summary. To pick the intended article:
+- Read the disambiguation page's sections. Each candidate is a line starting with `- `, title first ("- Mercury Drug, a Philippine pharmacy chain").
 - Or search. On en, the disambiguation page's own result carries the description "Topics referred to by the same term", and the other results' descriptions separate the candidates.
 
 Confirm your pick with wikipedia_get_summary.
@@ -37,7 +37,7 @@ Confirm your pick with wikipedia_get_summary.
 
 **Run these checks before reporting something absent:**
 - *From Wikipedia:* a `not_found` on a guessed title only means that title doesn't exist, so search next. Then search the edition of the subject's own language, because coverage differs by edition. `Place de la Mairie (Rennes)` has a fr article but no en one, and an en search for it returns only other pages, such as `Rennes` and `Hôtel de Ville, Rennes`.
-- *From a language edition:* wikipedia_get_languages lists the queried edition itself under `missing` when you include it in `editions` (`Python (programming language)` on en with `editions: ["en"]` gives `missing: ["en"]`). The queried edition is never in `languages`.
+- *From a language edition:* wikipedia_get_languages lists the queried edition itself under `source_editions` when you include it in `editions` (`Python (programming language)` on en with `editions: ["en"]` gives `source_editions: ["en"]`), never under `missing`, and the queried edition is never in `languages`. A code under `unknown_editions` names no Wikipedia edition (`jp` for `ja`), so it says nothing about the article: correct it and ask again. Only `missing` means the edition has no article for the title.
 - *From an article:* a full read leaves out infoboxes, data tables, and some lists. On `Seine`, the full read has no infobox (its length and basin size are only in section 0), and the "In art" section read lists 27 artists where the full read lists none. Read the section before saying the article doesn't state something, and read section 0 for the infobox.
 - *Near a point:* geotags differ by edition. Within 500 m of central Rennes, fr returns more than twice as many geotagged articles as en. Search the local edition before calling an area thin.
 
@@ -62,7 +62,7 @@ Find the section with wikipedia_get_sections and read it. If the article has no 
 ### Narrowing a search
 
 Operators combine with AND in one query:
-- `intitle:bridge incategory:"Bridges in Paris"` matches only titles containing "bridge" in that category.
+- `intitle:bridge incategory:"Bridges in Paris"` matches only titles containing "bridge" in that category. wikipedia_get_sections returns an article's `categories`; pass one as `incategory:"<name>"`.
 - `prefix:` matches the start of a title, but punctuation is matched loosely: `prefix:Seine-` returns Seine-Saint-Denis and Seine-Maritime, and also "Seine fishing".
 - Quote an exact phrase, and put `-` before a term to exclude it: adding `-Paris` to `"flood of 1910"` drops the matches that mention Paris.
 

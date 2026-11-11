@@ -18,16 +18,31 @@ import {
   isMalformedLanguage,
 } from '@/services/wikipedia/wikipedia-service.js';
 
+const NO_EXTRACT_NOTICE =
+  'This page has no summary extract. Open its canonical URL, or try wikipedia_get_article with section_index: 0. Namespace pages may contain documentation or descriptive text rather than article prose; a readable lead is not guaranteed.';
+
+const REDIRECT_UNCHECKED_NOTICE =
+  'The redirect could not be checked because the lookup was unavailable, so redirected_from and redirect_section may be missing. Call wikipedia_get_sections with the same title to see the redirect.';
+
+/** Guidance for an alias that points into a section, naming its index only once verified. */
+function redirectSectionNotice(index: number | undefined): string {
+  const lead =
+    'This title redirects to a section of the article, named in redirect_section; the extract summarizes the whole article.';
+  return index === undefined
+    ? `${lead} Call wikipedia_get_sections to find that section's section_index.`
+    : `${lead} Read that section with wikipedia_get_article and section_index: ${index}.`;
+}
+
 export const wikipediaGetSummary = tool('wikipedia_get_summary', {
   title: 'Get Wikipedia Summary',
   description:
-    'Fetch the short article summary that answers "what is X?". The extract is a truncated fragment from the start of the lead section — usually a sentence or two, and as little as a tenth of the lead — alongside the Wikidata QID (wikibase_item) for cross-referencing with wikidata-mcp-server, a short description, a thumbnail URL, the canonical article URL, the revision the extract was read from, and, for a geotagged article, latitude and longitude that pass straight to wikipedia_search_nearby to answer "what else is notable near this". For the lead section in full, call wikipedia_get_article with section_index 0. Redirect pages are followed automatically. When page_type is "disambiguation", the title matched a disambiguation page — call wikipedia_search_articles with a more specific query to find the intended article. Prefer this over wikipedia_get_article unless article depth is needed.',
+    'Fetch the short article summary that answers "what is X?". The extract is a truncated fragment from the start of the lead section — usually a sentence or two, and as little as a tenth of the lead — alongside the Wikidata QID (wikibase_item) for cross-referencing with wikidata-mcp-server, a short description, a thumbnail URL, the canonical article URL, the revision the extract was read from, and, for a geotagged article, latitude and longitude that pass straight to wikipedia_search_nearby to answer "what else is notable near this". For the lead section in full, call wikipedia_get_article with section_index 0. Redirects are followed and reported in redirected_from, and in redirect_section when the alias points into a section; the extract still covers the whole article. When page_type is "disambiguation", the title matched a disambiguation page — call wikipedia_search_articles with a more specific query to find the intended article. Prefer this over wikipedia_get_article unless article depth is needed.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     title: z
       .string()
       .describe(
-        'Article title (URL-decoded), e.g. "Python (programming language)". A trailing #fragment is accepted and ignored; the characters < > [ ] { } and | cannot appear in a Wikipedia page name.',
+        'Article title (URL-decoded), e.g. "Python (programming language)". A trailing #fragment is accepted and ignored; the characters < > [ ] { } and | cannot appear in a Wikipedia page name. Special: and Media: titles, and interwiki links such as "wikt:cat", name no page.',
       ),
     language: z
       .string()
@@ -36,10 +51,22 @@ export const wikipediaGetSummary = tool('wikipedia_get_summary', {
   }),
   output: z.object({
     title: z.string().describe('Resolved article title (may differ from input for redirects).'),
+    redirected_from: z
+      .string()
+      .optional()
+      .describe(
+        'Original alias followed to the resolved article. Absent when the title is not a redirect, or when the redirect could not be checked (a notice then says so).',
+      ),
+    redirect_section: z
+      .string()
+      .optional()
+      .describe(
+        "Section of the article the alias points into — its heading when the table of contents confirms it, otherwise the alias's raw fragment. The extract still summarizes the whole article; a notice gives the section_index to read when it is confirmed.",
+      ),
     page_type: z
       .string()
       .describe(
-        'Page type from the Wikipedia REST API. Common values: "standard" (regular article), "disambiguation" (disambiguation page), "no-extract" (article with no extract). When "disambiguation", call wikipedia_search_articles with a more specific query.',
+        'Page type from the Wikipedia REST API: "standard" (an article, including one whose lead yields no extract), "disambiguation" (a disambiguation page — call wikipedia_search_articles with a more specific query), "mainpage" (the edition\'s Main Page), or "no-extract" (a page outside the article namespace, such as a category, or with non-wikitext content).',
       ),
     pageid: z.number().optional().describe('Wikipedia page ID. Absent when the API omits it.'),
     wikibase_item: z
@@ -93,7 +120,9 @@ export const wikipediaGetSummary = tool('wikipedia_get_summary', {
     notice: z
       .string()
       .optional()
-      .describe('Guidance when the existing page has no summary extract.'),
+      .describe(
+        'Guidance when the page has no summary extract, when the title redirects into a section (naming its section_index once the table of contents confirms it), or when the redirect could not be checked.',
+      ),
   },
 
   errors: [
@@ -107,7 +136,7 @@ export const wikipediaGetSummary = tool('wikipedia_get_summary', {
     {
       reason: 'invalid_title',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The title contains characters MediaWiki cannot name a page with.',
+      when: 'The title can name no page: it contains characters MediaWiki forbids in a page name, is a Special: or Media: title in any edition\'s spelling, or is an interwiki link such as "wikt:cat".',
       recovery:
         'Use wikipedia_search_articles to find the exact article title and pass it verbatim.',
     },
@@ -181,20 +210,27 @@ export const wikipediaGetSummary = tool('wikipedia_get_summary', {
       throw err;
     }
 
-    if (!result.extract) {
-      ctx.enrich.notice(
-        'This page has no summary extract. Open its canonical URL, or try wikipedia_get_article with section_index: 0. Namespace pages may contain documentation or descriptive text rather than article prose; a readable lead is not guaranteed.',
-      );
-    }
+    // `notice` is last-wins, so every condition that has something to say contributes a segment.
+    // None embeds upstream text: the section an alias targets rides redirect_section, escaped there.
+    const notices: string[] = [];
+    if (!result.extract) notices.push(NO_EXTRACT_NOTICE);
+    const redirect = result.redirect.kind === 'followed' ? result.redirect.info : undefined;
+    if (result.redirect.kind === 'unchecked') notices.push(REDIRECT_UNCHECKED_NOTICE);
+    if (redirect?.redirect_section)
+      notices.push(redirectSectionNotice(redirect.redirect_section_index));
+    if (notices.length) ctx.enrich.notice(notices.join(' '));
 
     ctx.log.info('Summary fetched', {
       title: result.title,
       pageType: result.pageType,
       hasQid: Boolean(result.wikidataQid),
+      redirect: result.redirect.kind,
     });
 
     return {
       title: result.title,
+      ...(redirect?.redirected_from && { redirected_from: redirect.redirected_from }),
+      ...(redirect?.redirect_section && { redirect_section: redirect.redirect_section }),
       page_type: result.pageType,
       pageid: result.pageid,
       wikibase_item: result.wikidataQid,
@@ -216,6 +252,10 @@ export const wikipediaGetSummary = tool('wikipedia_get_summary', {
     lines.push(`# ${escapeMarkdown(result.title)}`);
     if (result.description) lines.push(`*${escapeMarkdown(result.description)}*`);
     lines.push(`**Type:** ${result.page_type} | **Language:** ${result.language}`);
+    if (result.redirected_from)
+      lines.push(`**Redirected from:** ${escapeMarkdown(result.redirected_from)}`);
+    if (result.redirect_section)
+      lines.push(`**Redirect section:** ${escapeMarkdown(result.redirect_section)}`);
     if (result.pageid != null) lines.push(`**Page ID:** ${result.pageid}`);
     if (result.wikibase_item) lines.push(`**Wikidata QID:** ${result.wikibase_item}`);
     if (result.thumbnail_url)

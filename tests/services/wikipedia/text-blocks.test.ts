@@ -1,17 +1,27 @@
 /**
- * @fileoverview Tests for the fenced-code and table-row grammar the article renderer writes and the
- * markdown escaper reads back.
+ * @fileoverview Tests for the fenced-code, table-row, and list grammar the article renderer writes
+ * and the markdown escaper reads back.
  * @module tests/services/wikipedia/text-blocks.test
  */
 
 import { describe, expect, it } from 'vitest';
 import {
   fenceCodeBlock,
+  listLine,
   parseTableRow,
   splitTextBlocks,
+  type TextBlock,
   tableDelimiterRow,
   tableRow,
 } from '@/services/wikipedia/text-blocks.js';
+import { expectLinearGrowth } from '../../helpers/cpu-growth.js';
+
+/** The text `splitTextBlocks` read `blocks` from, rebuilt by its own `\n` join. */
+function rejoin(blocks: readonly TextBlock[]): string {
+  return blocks
+    .map((block) => (block.kind === 'row' ? tableRow(block.cells) : block.text))
+    .join('\n');
+}
 
 /** Cell text an article can hold that sits close to the row syntax. */
 const AWKWARD_CELLS = [
@@ -112,5 +122,88 @@ describe('splitTextBlocks', () => {
 
   it('returns an empty text block for empty input', () => {
     expect(splitTextBlocks('')).toEqual([{ kind: 'text', text: '' }]);
+  });
+});
+
+describe('listLine (#81)', () => {
+  it('indents a line two spaces per level', () => {
+    expect(listLine(0, '- Item')).toBe('- Item');
+    expect(listLine(1, '3. Item')).toBe('  3. Item');
+    expect(listLine(3, 'continued')).toBe('      continued');
+  });
+});
+
+describe('splitTextBlocks — list blocks (#81)', () => {
+  const nested = [listLine(0, '- a'), listLine(1, '1. b'), listLine(2, 'more of b')].join('\n');
+
+  it.each<[string, string, TextBlock[]]>([
+    [
+      'a list holding an indented line, between paragraphs',
+      `Intro:\n\n${nested}\n\nAfter.`,
+      [
+        { kind: 'text', text: 'Intro:\n' },
+        { kind: 'list', text: nested },
+        { kind: 'text', text: '\nAfter.' },
+      ],
+    ],
+    [
+      'a flat list, which stays prose',
+      'Intro:\n\n- a\n- b\n10. c\n\nAfter.',
+      [{ kind: 'text', text: 'Intro:\n\n- a\n- b\n10. c\n\nAfter.' }],
+    ],
+    [
+      'two lists in a row, one at each edge of the text',
+      `${nested}\n\n${nested}`,
+      [
+        { kind: 'list', text: nested },
+        { kind: 'text', text: '' },
+        { kind: 'list', text: nested },
+      ],
+    ],
+    [
+      'a paragraph any one of whose lines is indented, taken whole',
+      'Lead line\n  indented\nlast\n\nNext.',
+      [
+        { kind: 'list', text: 'Lead line\n  indented\nlast' },
+        { kind: 'text', text: '\nNext.' },
+      ],
+    ],
+    ['a line indented with a tab', 'a\n\tb', [{ kind: 'list', text: 'a\n\tb' }]],
+    [
+      'a line of spaces alone, which is not a blank line',
+      'a\n   \nb',
+      [{ kind: 'list', text: 'a\n   \nb' }],
+    ],
+    [
+      'a list beside a code block and a table row, no blank line between',
+      '```\n  code\n```\n- a\n  b\n| x |',
+      [
+        { kind: 'code', text: '```\n  code\n```' },
+        { kind: 'list', text: '- a\n  b' },
+        { kind: 'row', cells: ['x'] },
+      ],
+    ],
+    [
+      'an indented fence inside a list, which opens no code block',
+      '- a:\n  ```\n  code\n  ```\n- b',
+      [{ kind: 'list', text: '- a:\n  ```\n  code\n  ```\n- b' }],
+    ],
+  ])('reads %s', (_name, text, blocks) => {
+    expect(splitTextBlocks(text)).toEqual(blocks);
+    expect(rejoin(blocks)).toBe(text);
+  });
+
+  // Every shape reaches a regex test per line, so each starts at 1,250 characters and its 64× span
+  // ends at 80,000, below the size where Bun's regex engine changes mode.
+  const fill = (unit: string, size: number) => unit.repeat(Math.ceil(size / unit.length));
+  it.each([
+    ['one long line ending in a break', (n: number) => `${fill('§1 x', n)}\ny`],
+    ['breaks throughout', (n: number) => fill('  \r\n', n)],
+    ['one indented paragraph', (n: number) => fill('- a\n  b\n', n)],
+    ['alternating paragraphs', (n: number) => fill('- a\n  b\n\nc\n\n', n)],
+    ['fence lines inside a list', (n: number) => fill('  ```\n', n)],
+    ['fences throughout', (n: number) => fill('```\n  x\n', n)],
+  ])('stays linear on %s', (_name, shape) => {
+    expectLinearGrowth(splitTextBlocks, shape, 1_250);
   });
 });

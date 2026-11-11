@@ -3,6 +3,7 @@
  * @module tests/mcp-server/tools/definitions/wikipedia-search-articles.tool.test
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import {
@@ -15,10 +16,12 @@ import {
 import { beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { allToolDefinitions } from '@/mcp-server/tools/definitions/index.js';
 import { wikipediaSearchArticles } from '@/mcp-server/tools/definitions/wikipedia-search-articles.tool.js';
+import { quotedNotice } from '@/mcp-server/tools/utils/escape-markdown.js';
 import {
   getWikipediaService,
   initWikipediaService,
 } from '@/services/wikipedia/wikipedia-service.js';
+import { parseInlineText } from '../../../helpers/commonmark.js';
 import { mockWikipediaService } from '../../../helpers/wikipedia-service-mock.js';
 
 describe('wikipediaSearchArticles', () => {
@@ -110,11 +113,11 @@ describe('wikipediaSearchArticles', () => {
     const searchFn = vi.fn().mockResolvedValue({ results: [], totalResults: 0 });
     mockWikipediaService({ search: searchFn });
 
-    const input = wikipediaSearchArticles.input.parse({ query: 'Python', limit: 80 });
+    const input = wikipediaSearchArticles.input.parse({ query: 'Python', limit: 800 });
     const ctx = createMockContext({ errors: wikipediaSearchArticles.errors });
     await wikipediaSearchArticles.handler(input, ctx);
-    expect(searchFn).toHaveBeenCalledWith('Python', 50, 'en', ctx, 0, 'relevance');
-    expect(getEnrichment(ctx)).toMatchObject({ requestedLimit: 80, appliedLimit: 50 });
+    expect(searchFn).toHaveBeenCalledWith('Python', 500, 'en', ctx, 0, 'relevance');
+    expect(getEnrichment(ctx)).toMatchObject({ requestedLimit: 800, appliedLimit: 500 });
   });
 
   it('still accepts a limit at the cap (issue #41)', async () => {
@@ -638,6 +641,50 @@ describe('wikipediaSearchArticles — spelling suggestion (issue #51)', () => {
   });
 });
 
+describe('wikipediaSearchArticles — caller and upstream text inside the notice', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    mockWikipediaService();
+  });
+
+  /** Every Markdown-significant character, and a line-leading `#` after a break. */
+  const QUERY = '*a* _b_ [c](d) `e` <f>\n# g';
+  const SUGGESTION = '*s* _t_ [u] `v` <w>';
+
+  /** The notice as a CommonMark reader takes it from content[]: the trailer's last paragraph. */
+  const renderedNotice = (result: { content: Array<{ type: string; text?: string }> }) =>
+    parseInlineText(result.content.at(-1)?.text ?? '').at(-1);
+
+  it.each([
+    {
+      page: 'an empty first page',
+      offset: 0,
+      reply: { results: [], totalResults: 0, suggestion: SUGGESTION },
+      notice: `No Wikipedia articles found for "${QUERY}" in language "en". Try different keywords or a broader query. Did you mean "${SUGGESTION}"? Re-run with that query.`,
+    },
+    {
+      page: 'a page past the end',
+      offset: 20,
+      reply: { results: [], totalResults: 8 },
+      notice: `No results at offset 20 for "${QUERY}" in language "en" (total matches: 8). The end of the result set was reached — lower the offset to page back.`,
+    },
+  ])(
+    'reads the notice back from content[] as structuredContent carries it on $page',
+    async ({ offset, reply, notice }) => {
+      mockWikipediaService({ search: vi.fn().mockResolvedValue(reply) });
+
+      const result = await runToolContract(wikipediaSearchArticles, { query: QUERY, offset });
+
+      expect((result.structuredContent as Record<string, unknown>).notice).toBe(notice);
+      expect(renderedNotice(result)).toBe(notice);
+    },
+  );
+
+  it('renders the notice through the shared quoted-notice renderer', () => {
+    expect(wikipediaSearchArticles.enrichmentTrailer?.notice?.render).toBe(quotedNotice);
+  });
+});
+
 describe('wikipediaSearchArticles — description and Wikidata QID (issue #52)', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -700,7 +747,7 @@ describe('wikipediaSearchArticles — description and Wikidata QID (issue #52)',
         results: [{ title: 'Python', pageid: 24, snippet: 'Snakes.', wordcount: 1200 }],
         totalResults: 40,
         nextOffset: 1,
-        descriptionsUnavailable: true,
+        metaUnavailableCount: 1,
       }),
     });
 
@@ -724,7 +771,7 @@ describe('wikipediaSearchArticles — description and Wikidata QID (issue #52)',
         })),
         totalResults: 13441,
         nextOffset: undefined,
-        descriptionsUnavailable: true,
+        metaUnavailableCount: 10,
       }),
     });
 
@@ -737,6 +784,161 @@ describe('wikipediaSearchArticles — description and Wikidata QID (issue #52)',
     expect(structured.truncated).toBe(true);
     expect(structured.notice).toContain('10,000');
     expect(structured.notice).toContain('Descriptions and Wikidata QIDs could not be loaded');
+  });
+});
+
+describe('wikipediaSearchArticles — the 500-result page (issue #84)', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    mockWikipediaService();
+  });
+
+  /** `n` service results whose pageids run up from `first`. */
+  const rows = (n: number, first = 1) =>
+    Array.from({ length: n }, (_, i) => ({
+      title: `Page ${first + i}`,
+      pageid: first + i,
+      snippet: 'S',
+      wordcount: 10,
+    }));
+
+  const RETRY_ADVICE =
+    'wikipedia_get_summary returns both for any one title, or re-run the search to retry.';
+
+  it('advertises limit with only the safe-integer bound, naming 500 as the clamp point', () => {
+    const { properties } = z.toJSONSchema(wikipediaSearchArticles.input, { io: 'input' }) as {
+      properties: Record<string, unknown>;
+    };
+    expect(properties.limit).toEqual({
+      type: 'integer',
+      minimum: 1,
+      maximum: Number.MAX_SAFE_INTEGER,
+      default: 10,
+      description:
+        'Maximum number of results to return per page (default 10). Positive integers above 500 are clamped with a notice.',
+    });
+  });
+
+  it('passes a limit of 500 through unclamped', async () => {
+    const searchFn = vi.fn().mockResolvedValue({
+      results: rows(500),
+      totalResults: 782,
+      nextOffset: 500,
+      metaUnavailableCount: 0,
+    });
+    mockWikipediaService({ search: searchFn });
+
+    const result = await runToolContract(wikipediaSearchArticles, {
+      query: 'incategory:"Rivers of France"',
+      limit: 500,
+    });
+
+    expect(searchFn).toHaveBeenCalledWith(
+      'incategory:"Rivers of France"',
+      500,
+      'en',
+      expect.anything(),
+      0,
+      'relevance',
+    );
+    const structured = result.structuredContent as Record<string, unknown>;
+    expect(structured.shown).toBe(500);
+    expect(structured).not.toHaveProperty('requestedLimit');
+    expect(structured).not.toHaveProperty('appliedLimit');
+    expect(structured).not.toHaveProperty('notice');
+    expect(contentText(result)).toContain('**500 results** (en)');
+  });
+
+  it('clamps a limit of 501 to 500 through the real input parse, disclosed on both surfaces', async () => {
+    const searchFn = vi.fn().mockResolvedValue({
+      results: rows(500),
+      totalResults: 782,
+      nextOffset: 500,
+      metaUnavailableCount: 0,
+    });
+    mockWikipediaService({ search: searchFn });
+
+    const result = await runToolContract(wikipediaSearchArticles, { query: 'q', limit: 501 });
+
+    expect(searchFn).toHaveBeenCalledWith('q', 500, 'en', expect.anything(), 0, 'relevance');
+    expect(result.structuredContent).toMatchObject({
+      requestedLimit: 501,
+      appliedLimit: 500,
+      shown: 500,
+      notice:
+        'Requested limit 501 was clamped to 500 results per page. Continue with nextOffset, keeping the same query and sort.',
+    });
+    const text = contentText(result);
+    expect(text).toContain('Requested limit 501 was clamped to 500 results per page.');
+    expect(text).toContain('**requestedLimit:** 501\n**appliedLimit:** 500\n');
+  });
+
+  it('counts the results a failed lookup chunk left without metadata, on both surfaces', async () => {
+    mockWikipediaService({
+      search: vi.fn().mockResolvedValue({
+        results: rows(500),
+        totalResults: 782,
+        nextOffset: 500,
+        metaUnavailableCount: 50,
+      }),
+    });
+
+    const result = await runToolContract(wikipediaSearchArticles, { query: 'q', limit: 500 });
+
+    expect(result.isError).toBeFalsy();
+    expect((result.structuredContent as Record<string, unknown>).notice).toBe(
+      `Descriptions and Wikidata QIDs could not be loaded for 50 of 500 results on this page, so those results carry neither. ${RETRY_ADVICE}`,
+    );
+    expect(contentText(result)).toContain(
+      'Descriptions and Wikidata QIDs could not be loaded for 50 of 500 results on this page, so those results carry neither.',
+    );
+  });
+
+  it('keeps the whole-page wording when every result lacks metadata', async () => {
+    mockWikipediaService({
+      search: vi.fn().mockResolvedValue({
+        results: rows(500),
+        totalResults: 782,
+        nextOffset: 500,
+        metaUnavailableCount: 500,
+      }),
+    });
+
+    const result = await runToolContract(wikipediaSearchArticles, { query: 'q', limit: 500 });
+
+    expect((result.structuredContent as Record<string, unknown>).notice).toBe(
+      `Descriptions and Wikidata QIDs could not be loaded for this page, so results carry neither. ${RETRY_ADVICE}`,
+    );
+  });
+
+  it('composes the window cut, the limit clamp, and the partial failure into one notice', async () => {
+    mockWikipediaService({
+      search: vi.fn().mockResolvedValue({
+        results: rows(400, 9601),
+        totalResults: 737_926,
+        nextOffset: undefined,
+        metaUnavailableCount: 50,
+      }),
+    });
+
+    const result = await runToolContract(wikipediaSearchArticles, {
+      query: 'river',
+      limit: 501,
+      offset: 9600,
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      requestedLimit: 501,
+      appliedLimit: 500,
+      truncated: true,
+      cap: 10_000,
+      shown: 400,
+      notice: `Wikipedia serves at most 10,000 results per query, and this page ends there. 727926 further matches exist but no offset reaches them — narrow the query with more specific terms to bring them into the first 10,000. Requested limit 501 was clamped to 500 results per page. Continue with nextOffset, keeping the same query and sort. Descriptions and Wikidata QIDs could not be loaded for 50 of 400 results on this page, so those results carry neither. ${RETRY_ADVICE}`,
+    });
+    const text = contentText(result);
+    for (const segment of ['727926 further matches', 'clamped to 500', '50 of 400 results']) {
+      expect(text).toContain(segment);
+    }
   });
 });
 
@@ -863,5 +1065,196 @@ describe('wikipediaSearchArticles — transient upstream envelopes (issue #55)',
     });
 
     expect(requests()).toBe(0);
+  });
+});
+
+describe('wikipediaSearchArticles — 500-result pages through the service (issue #84)', () => {
+  const EN = 'https://en.wikipedia.org';
+
+  /** The Action API query parameters of a request to the English edition, or undefined otherwise. */
+  const params = (request: Request) => {
+    const url = new URL(request.url);
+    return url.origin === EN && url.pathname === '/w/api.php' ? url.searchParams : undefined;
+  };
+  const isSearch = (request: Request) => params(request)?.get('list') === 'search';
+  const isLookup = (request: Request) => params(request)?.has('pageids') === true;
+
+  /**
+   * A search reply serving `srlimit` hits from `sroffset`, cut at `totalhits` and at the 10,000
+   * window the way CirrusSearch cuts a page.
+   */
+  const searchReply = (totalhits: number) => (request: Request) => {
+    const offset = Number(params(request)?.get('sroffset'));
+    const reachable = Math.min(totalhits, 10_000);
+    const end = Math.min(offset + Number(params(request)?.get('srlimit')), reachable);
+    return Response.json({
+      query: {
+        searchinfo: { totalhits },
+        search: Array.from({ length: Math.max(0, end - offset) }, (_, i) => ({
+          title: `Page ${offset + i + 1}`,
+          pageid: offset + i + 1,
+          snippet: 'S',
+          wordcount: 10,
+        })),
+      },
+      ...(end < reachable && { continue: { sroffset: end } }),
+    });
+  };
+
+  /** A lookup reply with a description and QID for every pageid the request names. */
+  const lookupReply = (request: Request) =>
+    Response.json({
+      query: {
+        pages: (params(request)?.get('pageids') ?? '').split('|').map((id) => ({
+          pageid: Number(id),
+          description: `About ${id}`,
+          pageprops: { wikibase_item: `Q${id}` },
+        })),
+      },
+    });
+
+  function stubUpstream(
+    lookup: (request: Request) => Response | Promise<Response>,
+    totalhits = 782,
+  ) {
+    const http = createFetchMock([
+      { match: isSearch, respond: searchReply(totalhits) },
+      { match: isLookup, respond: lookup },
+    ]);
+    http.install();
+    onTestFinished(() => {
+      http.restore();
+    });
+    return {
+      searches: () =>
+        http.calls
+          .filter((call) => isSearch(call.request))
+          .map((call) => [
+            params(call.request)?.get('sroffset'),
+            params(call.request)?.get('srlimit'),
+          ]),
+      lookups: () => http.calls.filter((call) => isLookup(call.request)).length,
+    };
+  }
+
+  /** Run the tool on the fake clock, so a stalled lookup ends on the budget without sleeping. */
+  async function run(
+    input: Parameters<typeof runToolContract<typeof wikipediaSearchArticles>>[1],
+    signal?: AbortSignal,
+  ) {
+    const pending = runToolContract(
+      wikipediaSearchArticles,
+      input,
+      signal ? { context: { signal } } : undefined,
+    );
+    await vi.runAllTimersAsync();
+    return await pending;
+  }
+
+  /** The rendered result headings, one per result in `content[]`. */
+  const headings = (text: string) => text.match(/^### Page \d+$/gm) ?? [];
+
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    initWikipediaService({} as AppConfig, createInMemoryStorage(), 'wikipedia-mcp-server/test');
+    vi.spyOn(getWikipediaService(), 'fetchEditionIndex').mockResolvedValue({
+      hosts: { en: EN },
+      fetchedAt: '2026-11-11T00:00:00.000Z',
+    });
+  });
+
+  it('returns 500 results with description and QID on both surfaces from one search and ten lookups', async () => {
+    const upstream = stubUpstream(lookupReply);
+
+    const result = await run({ query: 'incategory:"Rivers of France"', limit: 500 });
+
+    expect(result.isError).toBeFalsy();
+    const structured = result.structuredContent as {
+      results: Array<{ pageid: number; description?: string; wikibase_item?: string }>;
+    };
+    expect(structured.results.map((r) => r.pageid)).toEqual(
+      Array.from({ length: 500 }, (_, i) => i + 1),
+    );
+    expect(
+      structured.results.filter(
+        (r) => r.description === `About ${r.pageid}` && r.wikibase_item === `Q${r.pageid}`,
+      ),
+    ).toHaveLength(500);
+    expect(result.structuredContent).toMatchObject({
+      shown: 500,
+      nextOffset: 500,
+      totalCount: 782,
+    });
+    expect(result.structuredContent).not.toHaveProperty('notice');
+    const text = contentText(result);
+    expect(text).toContain('**500 results** (en)');
+    expect(headings(text)).toHaveLength(500);
+    for (const pageid of [1, 250, 500]) {
+      expect(text).toContain(
+        `### Page ${pageid}\n*About ${pageid}*\n**Page ID:** ${pageid} | **Words:** 10 | **Wikidata QID:** Q${pageid}`,
+      );
+    }
+    expect(upstream.searches()).toEqual([['0', '500']]);
+    expect(upstream.lookups()).toBe(10);
+  });
+
+  it('answers offset 9600 with the 400 results up to the window, cut and disclosed', async () => {
+    const upstream = stubUpstream(lookupReply, 737_926);
+
+    const result = await run({ query: 'river', offset: 9600, limit: 500 });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      shown: 400,
+      truncated: true,
+      cap: 10_000,
+      totalCount: 737_926,
+    });
+    expect(result.structuredContent).not.toHaveProperty('nextOffset');
+    expect(headings(contentText(result))).toHaveLength(400);
+    expect(contentText(result)).toContain('727926 further matches exist');
+    expect(upstream.searches()).toEqual([['9600', '500']]);
+    expect(upstream.lookups()).toBe(8);
+  });
+
+  it('answers offset 9990 with the last 10 results, cut and disclosed (characterization)', async () => {
+    stubUpstream(lookupReply, 737_926);
+
+    const result = await run({ query: 'river', offset: 9990, limit: 500 });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({ shown: 10, truncated: true, cap: 10_000 });
+    expect(headings(contentText(result))).toHaveLength(10);
+  });
+
+  it('propagates a caller cancellation during the lookups as RequestCancelled, not a degraded page', async () => {
+    const caller = new AbortController();
+    let lookups = 0;
+    // The lookups never answer; the caller leaves once four are in flight.
+    stubUpstream(
+      (request) =>
+        new Promise<Response>((_, reject) => {
+          request.signal.addEventListener('abort', () => reject(request.signal.reason), {
+            once: true,
+          });
+          if (++lookups === 4) caller.abort(new DOMException('caller left', 'AbortError'));
+        }),
+    );
+
+    const result = await run({ query: 'q', limit: 500 }, caller.signal);
+
+    // A page degraded after the abort would carry the signal's own reason as its message.
+    const message = 'fetch GET https://en.wikipedia.org/…?… was aborted.';
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: { code: JsonRpcErrorCode.RequestCancelled, message },
+    });
+    expect(contentText(result)).toContain(message);
+    expect(contentText(result)).not.toContain('caller left');
+    expect(lookups).toBe(4);
   });
 });

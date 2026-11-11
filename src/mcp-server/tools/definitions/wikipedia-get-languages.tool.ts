@@ -3,15 +3,16 @@
  * @module mcp-server/tools/definitions/wikipedia-get-languages.tool
  */
 
-import { tool, z } from '@cyanheads/mcp-ts-core';
+import { type Context, tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { markdownLink } from '@cyanheads/mcp-ts-core/utils';
+import { markdown, markdownLink } from '@cyanheads/mcp-ts-core/utils';
 import { escapeMarkdown } from '@/mcp-server/tools/utils/escape-markdown.js';
 import {
   getWikipediaService,
   isBlankTitle,
   isInvalidTitle,
   isMalformedLanguage,
+  type WikipediaService,
 } from '@/services/wikipedia/wikipedia-service.js';
 
 /** One langlink as the tool returns it, before the `editions` filter selects from the set. */
@@ -40,24 +41,79 @@ function codesFor(entry: LanguageEntry): string[] {
 }
 
 /**
- * Select the requested editions out of an article's full langlink set, and report which requested
- * codes matched nothing.
+ * Where the requested codes landed. Every code is echoed as passed, so the caller reads back the
+ * spelling it sent, and lands in exactly one of `matched` (through its entry), `sourceEditions`,
+ * `unknownEditions`, or `missing`.
+ */
+type EditionsFilterResult = {
+  matched: LanguageEntry[];
+  sourceEditions: string[];
+  unknownEditions: string[];
+  missing: string[];
+};
+
+/**
+ * Select the requested editions out of an article's full langlink set, and classify every code that
+ * selected nothing. Each code is tested, on its normalized form, in this order:
+ *
+ * 1. **matched** — it names an entry: equals its `language_code` or `edition_code`, or the registry
+ *    serves it from the entry's host (`be-x-old` finds the `be-tarask` entry).
+ * 2. **source** — it names the edition being queried, which langlinks never lists: equals
+ *    `language`, or the registry serves both from one host (`als` while querying `gsw`).
+ * 3. **unknown** — it names no Wikipedia edition at all (`jp` for `ja`).
+ * 4. **missing** — a real edition with no article for this title.
+ *
+ * Under a base-URL override, or while the registry is unavailable, `editionHost` knows no host, so
+ * only the string comparisons apply and no code is classified unknown: only a live or cached
+ * sitematrix index can back "names no edition", and the offline set lacks real editions (`gsw`),
+ * so an unmatched code is reported missing, unchecked. The handler's own `language` check has
+ * already loaded the registry, so classifying makes no upstream request.
  *
  * A local selection rather than a narrower upstream request: `prop=langlinks`' `lllang` parameter
  * is single-valued, so several codes have no request shape of their own and the one `lllimit=500`
  * fetch already holds every candidate.
  */
-function applyEditionsFilter(
+async function applyEditionsFilter(
   entries: LanguageEntry[],
   requested: string[],
-): { matched: LanguageEntry[]; missing: string[] } {
-  const wanted = new Set(requested.map(normalizeEditionCode));
-  const matched = entries.filter((entry) => codesFor(entry).some((code) => wanted.has(code)));
-  const found = new Set(matched.flatMap(codesFor));
+  language: string,
+  svc: WikipediaService,
+  ctx: Context,
+): Promise<EditionsFilterResult> {
+  const source = normalizeEditionCode(language);
+  const sourceHost = await svc.editionHost(source, ctx);
+  // The `language` gate accepted the queried code, so a loaded index always serves it: no host
+  // for it means an override or a degraded registry, where no code can be checked.
+  const registryLoaded = sourceHost !== undefined;
+  const entryHosts = entries.map((entry) => (entry.url ? URL.parse(entry.url)?.origin : undefined));
+  const hit = new Set<LanguageEntry>();
+  const sourceEditions: string[] = [];
+  const unknownEditions: string[] = [];
+  const missing: string[] = [];
+
+  for (const code of requested) {
+    const normalized = normalizeEditionCode(code);
+    const host = await svc.editionHost(normalized, ctx);
+    const matches = entries.filter(
+      (entry, i) =>
+        codesFor(entry).includes(normalized) || (host !== undefined && entryHosts[i] === host),
+    );
+    if (matches.length > 0) {
+      for (const entry of matches) hit.add(entry);
+    } else if (normalized === source || (host !== undefined && host === sourceHost)) {
+      sourceEditions.push(code);
+    } else if (registryLoaded && (await svc.isUnknownEdition(normalized, ctx))) {
+      unknownEditions.push(code);
+    } else {
+      missing.push(code);
+    }
+  }
+
   return {
-    matched,
-    // Echoed as passed, so the caller reads back the spelling it sent.
-    missing: requested.filter((code) => !found.has(normalizeEditionCode(code))),
+    matched: entries.filter((entry) => hit.has(entry)),
+    sourceEditions,
+    unknownEditions,
+    missing,
   };
 }
 
@@ -70,7 +126,7 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
     title: z
       .string()
       .describe(
-        'Article title in the source language edition. A trailing #fragment is accepted and ignored; the characters < > [ ] { } and | cannot appear in a Wikipedia page name.',
+        'Article title in the source language edition. A trailing #fragment is accepted and ignored; the characters < > [ ] { } and | cannot appear in a Wikipedia page name. Special: and Media: titles, and interwiki links such as "wikt:cat", name no page.',
       ),
     language: z
       .string()
@@ -83,7 +139,7 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
       .min(1)
       .optional()
       .describe(
-        'Edition codes to keep, e.g. ["fr", "de", "gsw"]. Each is matched case-insensitively against both edition_code and language_code, so either spelling of a mismatch edition finds it ("gsw" matches the edition whose edition_code is "als"). Omit to list every edition. A code with no article for this title is reported under missing rather than dropped, and is not a failure.',
+        'Edition codes to keep, e.g. ["fr", "de", "gsw"]. Each is matched case-insensitively against both edition_code and language_code, so either spelling of a mismatch edition finds it ("gsw" matches the edition whose edition_code is "als"), and so does a legacy code naming it ("nb" for "no"). Omit to list every edition. Every code comes back in exactly one place, none of them a failure: its entry in languages; source_editions when it names the queried edition itself; unknown_editions when it names no Wikipedia edition; missing when the edition has no article for this title. With editions given, an article with no other editions returns an empty languages list instead of failing.',
       ),
   }),
   output: z.object({
@@ -130,9 +186,28 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
       .array(z.string())
       .optional()
       .describe(
-        'Requested edition codes with no article for this title, echoed as they were passed. Present whenever editions was given — empty when every code matched — and absent otherwise.',
+        'Requested codes with no article for this title, echoed as they were passed. Each names a real Wikipedia edition whenever the edition registry could check it; while the registry is unavailable an unchecked code lands here instead of unknown_editions. Present whenever editions was given — empty when no code fell here — and absent otherwise.',
+      ),
+    source_editions: z
+      .array(z.string())
+      .optional()
+      .describe(
+        'Requested codes naming the queried edition itself — the article read here, which is never listed among its own language editions — echoed as they were passed. Either spelling of a mismatch edition counts ("als" and "gsw" while querying "gsw"). Present only when non-empty.',
+      ),
+    unknown_editions: z
+      .array(z.string())
+      .optional()
+      .describe(
+        'Requested codes that name no Wikipedia edition, echoed as they were passed — a slip such as "jp" for "ja" or "cn" for "zh". Checked against the live edition registry only, so never reported while it is unavailable. Present only when non-empty.',
       ),
   }),
+
+  enrichment: {
+    notice: z
+      .string()
+      .optional()
+      .describe('Guidance when a requested code names no Wikipedia edition.'),
+  },
 
   errors: [
     {
@@ -145,14 +220,14 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
     {
       reason: 'invalid_title',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The title contains characters MediaWiki cannot name a page with.',
+      when: 'The title can name no page: it contains characters MediaWiki forbids in a page name, is a Special: or Media: title in any edition\'s spelling, or is an interwiki link such as "wikt:cat".',
       recovery:
         'Use wikipedia_search_articles to find the exact article title and pass it verbatim.',
     },
     {
       reason: 'no_other_languages',
       code: JsonRpcErrorCode.NotFound,
-      when: 'Article exists but has no other language editions.',
+      when: 'Article exists but has no other language editions, and editions was not given.',
       recovery: 'The article may be too new or too regional to have been translated yet.',
     },
     {
@@ -226,7 +301,9 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
     }
     const { title: resolvedTitle, languages } = getLanguagesResult;
 
-    if (languages.length === 0) {
+    // With editions given, every requested code is still classified, so a bare article answers
+    // with an empty match instead of failing before any code is placed.
+    if (languages.length === 0 && !input.editions) {
       throw ctx.fail(
         'no_other_languages',
         `Article "${input.title}" in language "${language}" has no other language editions.`,
@@ -244,15 +321,22 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
       ...(l.url && { url: l.url }),
     }));
 
-    // `no_other_languages` was decided above on the unfiltered set, so a filter that matches
-    // nothing on an article that does have editions stays a success with an empty list.
-    const filter = input.editions ? applyEditionsFilter(entries, input.editions) : undefined;
+    const filter = input.editions
+      ? await applyEditionsFilter(entries, input.editions, language, svc, ctx)
+      : undefined;
 
     ctx.log.info('Language links fetched', {
       title: resolvedTitle,
       count: entries.length,
       ...(filter && { requested: input.editions?.length, matched: filter.matched.length }),
     });
+
+    if (filter?.unknownEditions.length) {
+      // Static text: the codes themselves ride unknown_editions, escaped where format() renders them.
+      ctx.enrich.notice(
+        'The codes under unknown_editions name no Wikipedia edition. An edition code is a Wikipedia subdomain or language code, such as "ja" (not "jp") or "zh" (not "cn").',
+      );
+    }
 
     return {
       source_title: resolvedTitle,
@@ -261,6 +345,8 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
       // Always the unfiltered count — the filter narrows what is returned, not what exists.
       total_languages: entries.length,
       ...(filter && { missing: filter.missing }),
+      ...(filter?.sourceEditions.length && { source_editions: filter.sourceEditions }),
+      ...(filter?.unknownEditions.length && { unknown_editions: filter.unknownEditions }),
     };
   },
 
@@ -277,11 +363,18 @@ export const wikipediaGetLanguages = tool('wikipedia_get_languages', {
         ? `**${result.languages.length} of ${result.total_languages} languages available** (narrowed to the requested editions)`
         : `**${result.total_languages} languages available**`,
     ];
+    // Each code in its own span, so a requested code holding ", " still reads as one code.
+    const codeList = (codes: string[]) =>
+      codes.map((code) => markdown().inlineCode(code).build()).join(', ');
+    if (result.source_editions) {
+      lines.push(`**Queried edition (this article):** ${codeList(result.source_editions)}`);
+    }
+    if (result.unknown_editions) {
+      lines.push(`**Not a Wikipedia edition:** ${codeList(result.unknown_editions)}`);
+    }
     if (result.missing?.length) {
-      lines.push(
-        `**No article in:** ${result.missing.map((code) => escapeMarkdown(code)).join(', ')}`,
-      );
-    } else if (filtered) {
+      lines.push(`**No article in:** ${codeList(result.missing)}`);
+    } else if (filtered && !result.unknown_editions) {
       lines.push('**Every requested edition matched.**');
     }
     lines.push('');

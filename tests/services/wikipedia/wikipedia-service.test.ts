@@ -10,6 +10,7 @@ import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { createFetchMock, createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { logger } from '@cyanheads/mcp-ts-core/utils';
 import { beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
+import { escapeMarkdownOutsideBlocks } from '@/mcp-server/tools/utils/escape-markdown.js';
 import {
   articleTableRead,
   articleUrl,
@@ -27,12 +28,16 @@ import {
   LEAD_SECTION_TITLE,
   parseSiteMatrix,
   redirectInfo,
+  resolvesWithoutRedirect,
   SEARCH_MAX_LIMIT,
   SEARCH_RESULT_WINDOW,
   splitArticleIntoSections,
   tocLineToPlainText,
   WikipediaService,
 } from '@/services/wikipedia/wikipedia-service.js';
+import { readBackText } from '../../helpers/commonmark.js';
+import { expectLinearGrowth } from '../../helpers/cpu-growth.js';
+import { listFixture, mercurySummary } from '../../helpers/list-fixtures.js';
 
 /**
  * `apiGet` is the private fetch seam every public method funnels through. Spying on it needs the
@@ -508,6 +513,190 @@ describe('WikipediaService edition index — cache and fallback (issue #26)', ()
     await svc.actionGet('gsw', { action: 'query' }, ctx).catch(() => undefined);
     expect(fetchSpy.mock.calls[0]?.[0]).toContain('https://als.wikipedia.org/w/api.php');
   });
+
+  it('answers an inherited Object property name as no edition at all', async () => {
+    const svc = initService();
+    const ctx = createMockContext();
+    // `editionHost` takes caller-supplied codes, so a prototype key must not read back as a host.
+    expect(await svc.editionHost('constructor', ctx)).toBeUndefined();
+    expect(await svc.editionHost('__proto__', ctx)).toBeUndefined();
+  });
+});
+
+/**
+ * A sitematrix slice in the live response's shape: one row per language, its Wikipedia site under
+ * `code: 'wiki'`. `be-x-old` is listed the way the live matrix lists it — a language with no wiki
+ * of its own — so the parser skips it and only the legacy-code table can resolve it.
+ */
+function siteMatrixOf(rows: ReadonlyArray<readonly [code: string, subdomain?: string]>) {
+  const sitematrix: Record<string, unknown> = { count: rows.length + 1 };
+  rows.forEach(([code, subdomain = code], i) => {
+    sitematrix[String(i)] = {
+      code,
+      name: code,
+      site: [{ url: `https://${subdomain}.wikipedia.org`, code: 'wiki' }],
+    };
+  });
+  sitematrix[String(rows.length)] = { code: 'be-x-old', name: 'be-x-old', site: [] };
+  return { sitematrix };
+}
+
+const LEGACY_TARGETS_MATRIX = siteMatrixOf([
+  ['en'],
+  ['zh'],
+  ['no'],
+  ['be-tarask'],
+  ['eml'],
+  ['gsw', 'als'],
+]);
+
+describe('WikipediaService edition registry — legacy language codes (issue #80)', () => {
+  it('keys nb, be-x-old, and egl to the editions they name, and not zh-cn or zh-tw', () => {
+    const { hosts } = parseSiteMatrix(LEGACY_TARGETS_MATRIX);
+    expect(hosts.nb).toBe('https://no.wikipedia.org');
+    expect(hosts['be-x-old']).toBe('https://be-tarask.wikipedia.org');
+    expect(hosts.egl).toBe('https://eml.wikipedia.org');
+    // Script variants of zh, routed to zh.wikipedia.org by the interwiki map but no edition.
+    expect(hosts['zh-cn']).toBeUndefined();
+    expect(hosts['zh-tw']).toBeUndefined();
+  });
+
+  it('leaves a legacy code out when the edition it names is not listed', () => {
+    const { hosts } = parseSiteMatrix(siteMatrixOf([['en'], ['eml']]));
+    expect(hosts.egl).toBe('https://eml.wikipedia.org');
+    expect(hosts.nb).toBeUndefined();
+    expect(hosts['be-x-old']).toBeUndefined();
+  });
+
+  it('never lets a legacy code displace an edition the sitematrix lists under that code', () => {
+    const { hosts } = parseSiteMatrix(siteMatrixOf([['no'], ['nb', 'nb-own']]));
+    expect(hosts.nb).toBe('https://nb-own.wikipedia.org');
+  });
+
+  it('resolves legacy codes on every registry lookup, request host included', async () => {
+    initWikipediaService(mockConfig, mockStorage, TEST_USER_AGENT);
+    const svc = getWikipediaService();
+    vi.spyOn(svc, 'fetchEditionIndex').mockResolvedValue(parseSiteMatrix(LEGACY_TARGETS_MATRIX));
+    const ctx = createMockContext();
+
+    for (const [code, host] of [
+      ['nb', 'https://no.wikipedia.org'],
+      ['be-x-old', 'https://be-tarask.wikipedia.org'],
+      ['EGL', 'https://eml.wikipedia.org'],
+    ] as const) {
+      expect(await svc.isUnknownEdition(code, ctx)).toBe(false);
+      expect(await svc.editionHost(code, ctx)).toBe(host);
+    }
+    expect(await svc.isUnknownEdition('zh-cn', ctx)).toBe(true);
+    expect(await svc.isUnknownEdition('zh-tw', ctx)).toBe(true);
+
+    // Both request paths every tool's reads go through route the legacy code at its edition.
+    const apiGet = vi
+      .spyOn(svc as unknown as PrivateApiGet, 'apiGet')
+      .mockResolvedValue({ query: { pages: [] } });
+    await svc.actionGet('nb', { action: 'query' }, ctx);
+    await svc.restGet('nb', '/page/summary/Jorden', ctx);
+    expect(apiGet.mock.calls.map(([url]) => new URL(String(url)).origin)).toEqual([
+      'https://no.wikipedia.org',
+      'https://no.wikipedia.org',
+    ]);
+  });
+
+  it('gives an index persisted before the legacy codes were keyed the same answers', async () => {
+    // Written by a release whose parser knew no legacy codes; its 24 h TTL outlives an upgrade.
+    storageBacking.set('wikipedia/edition-index', {
+      hosts: {
+        en: 'https://en.wikipedia.org',
+        no: 'https://no.wikipedia.org',
+        'be-tarask': 'https://be-tarask.wikipedia.org',
+        eml: 'https://eml.wikipedia.org',
+      },
+      fetchedAt: '2026-11-01T00:00:00.000Z',
+    });
+    const svc = initService();
+    const ctx = createMockContext();
+
+    expect(await svc.isUnknownEdition('nb', ctx)).toBe(false);
+    expect(await svc.editionHost('be-x-old', ctx)).toBe('https://be-tarask.wikipedia.org');
+    expect(await svc.editionHost('egl', ctx)).toBe('https://eml.wikipedia.org');
+    expect(svc.fetchEditionIndex).not.toHaveBeenCalled();
+  });
+
+  it('resolves legacy codes on the offline set while the sitematrix is unavailable', async () => {
+    initWikipediaService(mockConfig, mockStorage, TEST_USER_AGENT);
+    const svc = getWikipediaService();
+    vi.spyOn(svc, 'fetchEditionIndex').mockRejectedValue(new Error('sitematrix unreachable'));
+    const ctx = createMockContext();
+
+    expect(await svc.isUnknownEdition('nb', ctx)).toBe(false);
+    expect(await svc.isUnknownEdition('be-x-old', ctx)).toBe(false);
+    expect(await svc.isUnknownEdition('zh-cn', ctx)).toBe(true);
+    expect(buildBaseUrl('nb')).toBe('https://no.wikipedia.org');
+    expect(buildBaseUrl('egl')).toBe('https://eml.wikipedia.org');
+  });
+});
+
+describe('WikipediaService edition index — caller cancellation during a cold build', () => {
+  /**
+   * Answer the sitematrix the way a real fetch does — rejecting once its own signal has fired —
+   * after `onRequest` runs, so a test can cancel a caller while the request is in flight.
+   */
+  function stubSitematrix(onRequest: () => void) {
+    const requests: Array<{ url: string; signalAborted: boolean | undefined }> = [];
+    const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      onRequest();
+      const signalAborted = init?.signal?.aborted;
+      requests.push({ url: input instanceof Request ? input.url : String(input), signalAborted });
+      if (signalAborted) throw new DOMException('The operation was aborted.', 'AbortError');
+      return Response.json(siteMatrixOf([['en'], ['fr'], ['gsw', 'als']]));
+    });
+    onTestFinished(() => {
+      spy.mockRestore();
+    });
+    return requests;
+  }
+
+  it('rejects only the cancelled caller; the others get the built index and no back-off is armed', async () => {
+    // The real sitematrix request is under test, so fetchEditionIndex is not stubbed.
+    initWikipediaService(mockConfig, mockStorage, TEST_USER_AGENT);
+    const svc = getWikipediaService();
+    const first = new AbortController();
+    const reason = new DOMException('first caller went away', 'AbortError');
+    const requests = stubSitematrix(() => first.abort(reason));
+
+    const [cancelled, served] = await Promise.allSettled([
+      svc.isUnknownEdition('gsw', { ...createMockContext(), signal: first.signal }),
+      svc.isUnknownEdition('gsw', createMockContext()),
+    ]);
+
+    expect(cancelled).toEqual({ status: 'rejected', reason });
+    // `gsw` is absent from the offline set, so `false` is an answer only the built index gives.
+    expect(served).toEqual({ status: 'fulfilled', value: false });
+    // One request, never cancelled by the caller that left.
+    expect(requests).toEqual([
+      { url: expect.stringContaining('sitematrix'), signalAborted: false },
+    ]);
+    // No back-off: the next call is served the built index, with no second request.
+    expect(await svc.editionHost('gsw', createMockContext())).toBe('https://als.wikipedia.org');
+    expect(requests).toHaveLength(1);
+  });
+
+  it('starts no build for a caller already cancelled, and arms no back-off for it', async () => {
+    initWikipediaService(mockConfig, mockStorage, TEST_USER_AGENT);
+    const svc = getWikipediaService();
+    const requests = stubSitematrix(() => undefined);
+    const gone = new AbortController();
+    const reason = new DOMException('already gone', 'AbortError');
+    gone.abort(reason);
+
+    await expect(
+      svc.isUnknownEdition('gsw', { ...createMockContext(), signal: gone.signal }),
+    ).rejects.toBe(reason);
+    expect(requests).toHaveLength(0);
+    // The next caller builds the index rather than finding the offline set armed for 60 s.
+    expect(await svc.isUnknownEdition('gsw', createMockContext())).toBe(false);
+    expect(requests).toHaveLength(1);
+  });
 });
 
 describe('WikipediaService — caller cancellation', () => {
@@ -640,7 +829,7 @@ describe('WikipediaService — redirect resolution (issue #19)', () => {
     // Migrated off deprecated prop=sections and resolving the alias in one call.
     expect(spy).toHaveBeenCalledWith(
       'en',
-      expect.objectContaining({ prop: 'tocdata', redirects: 'true' }),
+      expect.objectContaining({ prop: 'tocdata|categories|properties', redirects: 'true' }),
       ctx,
     );
     expect(result.title).toBe('New York City');
@@ -1329,7 +1518,9 @@ describe('WikipediaService.getSections — tocdata line is rendered HTML (issue 
             '42': {
               pageid: 42,
               title: 'Stubby',
-              extract: 'Lead text.\n\n== First ==\nBody.\n\n=== Nested ===\nMore.',
+              // HTML mode, as the full read requests it: headings arrive as heading elements.
+              extract:
+                '<p>Lead text.\n</p>\n<h2><span id="First">First</span></h2>\n<p>Body.\n</p>\n<h3><span id="Nested">Nested</span></h3>\n<p>More.\n</p>',
             },
           },
         },
@@ -1340,6 +1531,398 @@ describe('WikipediaService.getSections — tocdata line is rendered HTML (issue 
       { index: 1, number: '1', title: 'First', level: 2 },
       { index: 2, number: '2', title: 'Nested', level: 3 },
     ]);
+  });
+});
+
+describe('WikipediaService — disambiguation flag and categories (issues #77, #83)', () => {
+  beforeEach(() => {
+    initService();
+  });
+
+  const actionIs = (action: string) => (request: Request) =>
+    new URL(request.url).searchParams.get('action') === action;
+  const paramsOf = (call: { request: Request }) => new URL(call.request.url).searchParams;
+
+  /** `action=parse&prop=tocdata|categories|properties` for Mercury, trimmed from the live payload. */
+  const MERCURY_PARSE = {
+    parse: {
+      title: 'Mercury',
+      pageid: 19007,
+      tocdata: {
+        sections: [
+          { tocLevel: 1, hLevel: 2, line: 'Companies', number: '1', index: '1' },
+          { tocLevel: 1, hLevel: 2, line: 'Computing', number: '2', index: '2' },
+        ],
+      },
+      categories: [
+        { sortkey: '', category: 'All_article_disambiguation_pages', hidden: true },
+        { sortkey: '', category: 'Disambiguation_pages' },
+        { sortkey: '', category: 'All_disambiguation_pages_in_need_of_cleanup', hidden: true },
+        { sortkey: '', category: 'Place_name_disambiguation_pages' },
+        { sortkey: '', category: 'Ship_disambiguation_pages' },
+      ],
+      properties: {
+        'wikibase-shortdesc': 'Topics referred to by the same term',
+        disambiguation: '',
+        wikibase_item: 'Q48397',
+      },
+    },
+  };
+
+  it('reads the TOC, the visible categories, and the disambiguation flag from one parse request', async () => {
+    const http = createFetchMock([
+      { match: actionIs('parse'), respond: Response.json(MERCURY_PARSE) },
+    ]);
+    http.install();
+    try {
+      const result = await getWikipediaService().getSections('Mercury', 'en', createMockContext());
+      expect(result.sections.map((s) => s.title)).toEqual(['Companies', 'Computing']);
+      // Hidden maintenance categories stay out; the rest keep upstream order, underscores as spaces.
+      expect(result.categories).toEqual([
+        'Disambiguation pages',
+        'Place name disambiguation pages',
+        'Ship disambiguation pages',
+      ]);
+      expect(result.disambiguation).toBe(true);
+      expect(http.calls).toHaveLength(1);
+      expect(paramsOf(http.calls[0]!).get('prop')).toBe('tocdata|categories|properties');
+      expect(paramsOf(http.calls[0]!).get('redirects')).toBe('true');
+    } finally {
+      http.restore();
+    }
+  });
+
+  it('reports an ordinary article unflagged, and its categories with the punctuation they carry', async () => {
+    const http = createFetchMock([
+      {
+        match: actionIs('parse'),
+        respond: Response.json({
+          parse: {
+            title: 'Peace of Westphalia',
+            pageid: 24398,
+            tocdata: { sections: [{ hLevel: 2, line: 'Background', number: '1', index: '1' }] },
+            categories: [
+              { sortkey: '', category: 'Articles_with_short_description', hidden: true },
+              { sortkey: '', category: '1648_treaties' },
+              { sortkey: '', category: "Thirty_Years'_War_treaties" },
+              { sortkey: '', category: 'Christina,_Queen_of_Sweden' },
+              { sortkey: '', category: '"Weird_Al"_Yankovic' },
+            ],
+            properties: { defaultsort: 'Westphalia, Peace of', wikibase_item: 'Q154705' },
+          },
+        }),
+      },
+    ]);
+    http.install();
+    try {
+      const result = await getWikipediaService().getSections(
+        'Peace of Westphalia',
+        'en',
+        createMockContext(),
+      );
+      expect(result.categories).toEqual([
+        '1648 treaties',
+        "Thirty Years' War treaties",
+        'Christina, Queen of Sweden',
+        '"Weird Al" Yankovic',
+      ]);
+      expect(result.disambiguation).toBe(false);
+    } finally {
+      http.restore();
+    }
+  });
+
+  it('carries a German category name through without a namespace prefix to strip', async () => {
+    const http = createFetchMock([
+      {
+        match: actionIs('parse'),
+        respond: Response.json({
+          parse: {
+            title: 'Westfälischer Friede',
+            tocdata: { sections: [{ hLevel: 2, line: 'Vorgeschichte', number: '1', index: '1' }] },
+            categories: [
+              { sortkey: '', category: 'Westfälischer_Friede' },
+              { sortkey: '', category: 'Vertrag_(17._Jahrhundert)' },
+              { sortkey: '', category: '1648' },
+            ],
+            properties: {},
+          },
+        }),
+      },
+    ]);
+    http.install();
+    try {
+      const result = await getWikipediaService().getSections(
+        'Westfälischer Friede',
+        'de',
+        createMockContext(),
+      );
+      expect(result.categories).toEqual([
+        'Westfälischer Friede',
+        'Vertrag (17. Jahrhundert)',
+        '1648',
+      ]);
+      expect(new URL(http.calls[0]!.request.url).origin).toBe('https://de.wikipedia.org');
+    } finally {
+      http.restore();
+    }
+  });
+
+  it('returns an empty category list when the page has none, and skips an entry with no name', async () => {
+    for (const categories of [
+      undefined,
+      [],
+      [{ sortkey: '' }, { category: 'Kept', sortkey: '' }],
+    ]) {
+      const http = createFetchMock([
+        {
+          match: actionIs('parse'),
+          respond: Response.json({
+            parse: {
+              title: 'Bare',
+              tocdata: { sections: [{ hLevel: 2, line: 'Only', number: '1', index: '1' }] },
+              ...(categories && { categories }),
+            },
+          }),
+        },
+      ]);
+      http.install();
+      try {
+        const result = await getWikipediaService().getSections('Bare', 'en', createMockContext());
+        expect(result.categories).toEqual(categories?.length ? ['Kept'] : []);
+        expect(result.disambiguation).toBe(false);
+      } finally {
+        http.restore();
+      }
+    }
+  });
+
+  it('takes the flag and categories of a headingless page from the first parse in the fallback', async () => {
+    const http = createFetchMock([
+      {
+        match: actionIs('parse'),
+        respond: Response.json({
+          parse: {
+            title: 'Libby Creek',
+            pageid: 4567,
+            tocdata: { sections: [] },
+            categories: [
+              { sortkey: '', category: 'All_disambiguation_pages', hidden: true },
+              { sortkey: '', category: 'Disambiguation_pages' },
+            ],
+            properties: { disambiguation: '' },
+          },
+        }),
+      },
+      {
+        match: actionIs('query'),
+        // The full read carries no page props here, so a flag can only come from the first parse.
+        respond: Response.json({
+          query: {
+            pages: [
+              {
+                pageid: 4567,
+                title: 'Libby Creek',
+                extract: '<p>Libby Creek may refer to:</p><ul><li>Libby Creek (Wyoming)</li></ul>',
+              },
+            ],
+          },
+        }),
+      },
+    ]);
+    http.install();
+    try {
+      const result = await getWikipediaService().getSections(
+        'Libby Creek',
+        'en',
+        createMockContext(),
+      );
+      expect(result.sections).toEqual([]);
+      expect(result.categories).toEqual(['Disambiguation pages']);
+      expect(result.disambiguation).toBe(true);
+      expect(http.calls.map((call) => paramsOf(call).get('action'))).toEqual(['parse', 'query']);
+    } finally {
+      http.restore();
+    }
+  });
+
+  it('flags the full read from page props riding its one query request', async () => {
+    const cases = [
+      { pageprops: { disambiguation: '' }, expected: true },
+      { pageprops: undefined, expected: false },
+    ];
+    for (const { pageprops, expected } of cases) {
+      const http = createFetchMock([
+        {
+          match: actionIs('query'),
+          respond: Response.json({
+            query: {
+              redirects: [{ from: 'Alias', to: 'Mercury' }],
+              pages: [
+                {
+                  pageid: 19007,
+                  title: 'Mercury',
+                  extract: '<p>Mercury most commonly refers to:</p>',
+                  ...(pageprops && { pageprops }),
+                },
+              ],
+            },
+          }),
+        },
+      ]);
+      http.install();
+      try {
+        const result = await getWikipediaService().getArticleFull(
+          'Alias',
+          'en',
+          createMockContext(),
+        );
+        expect(result.disambiguation).toBe(expected);
+        expect(result.content).toBe('Mercury most commonly refers to:');
+        expect(http.calls).toHaveLength(1);
+        const params = paramsOf(http.calls[0]!);
+        expect(params.get('prop')).toBe('extracts|info|revisions|pageprops');
+        expect(params.get('ppprop')).toBe('disambiguation');
+        expect(params.get('redirects')).toBe('true');
+      } finally {
+        http.restore();
+      }
+    }
+  });
+
+  it('runs the section read’s page-property lookup beside the parse, not after it', async () => {
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    const startedAt = Date.now();
+    const { promise: lookupArrived, resolve: markLookup } = Promise.withResolvers<void>();
+    const http = createFetchMock([
+      {
+        match: actionIs('parse'),
+        // The parse answers only once the lookup has been sent: a lookup issued after the parse
+        // settles would leave this request to time out.
+        respond: () =>
+          lookupArrived.then(() =>
+            Response.json({
+              parse: { title: 'Mercury', pageid: 19007, revid: 5, text: '<p>Lead.</p>' },
+            }),
+          ),
+      },
+      {
+        match: actionIs('query'),
+        respond: () => {
+          markLookup();
+          return Response.json({
+            query: {
+              pages: [{ pageid: 19007, title: 'Mercury', pageprops: { disambiguation: '' } }],
+            },
+          });
+        },
+      },
+    ]);
+    http.install();
+    try {
+      const pending = getWikipediaService().getArticleSection(
+        'Mercury',
+        0,
+        'en',
+        createMockContext(),
+      );
+      await vi.runAllTimersAsync();
+      const result = await pending;
+      expect(result.disambiguation).toBe(true);
+      expect(result.content).toBe('Lead.');
+      expect(Date.now() - startedAt).toBe(0);
+      expect(http.calls.map((call) => paramsOf(call).get('action'))).toEqual(['parse', 'query']);
+      const lookup = paramsOf(http.calls[1]!);
+      expect(Object.fromEntries(lookup)).toMatchObject({
+        titles: 'Mercury',
+        prop: 'pageprops',
+        ppprop: 'disambiguation',
+        redirects: 'true',
+      });
+    } finally {
+      http.restore();
+    }
+  });
+
+  it('reports an unflagged page false and a page the lookup cannot see as unknown', async () => {
+    for (const [lookupBody, expected] of [
+      [{ query: { pages: [{ pageid: 9232, title: 'Eiffel Tower' }] } }, false],
+      [{ query: { pages: [{ title: 'Eiffel Tower', missing: true }] } }, undefined],
+    ] as const) {
+      const http = createFetchMock([
+        {
+          match: actionIs('parse'),
+          respond: Response.json({
+            parse: { title: 'Eiffel Tower', revid: 5, text: '<p>Lead.</p>' },
+          }),
+        },
+        { match: actionIs('query'), respond: Response.json(lookupBody) },
+      ]);
+      http.install();
+      try {
+        const result = await getWikipediaService().getArticleSection(
+          'Eiffel Tower',
+          0,
+          'en',
+          createMockContext(),
+        );
+        expect(result.disambiguation).toBe(expected);
+      } finally {
+        http.restore();
+      }
+    }
+  });
+
+  it('settles a failed parse without waiting on the lookup, and stops the lookup', async () => {
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    captureWarnings();
+    const startedAt = Date.now();
+    let lookupSignal: AbortSignal | undefined;
+    const http = createFetchMock([
+      {
+        match: actionIs('parse'),
+        respond: Response.json({
+          error: { code: 'missingtitle', info: 'The page does not exist.' },
+        }),
+      },
+      {
+        match: actionIs('query'),
+        // A lookup that never answers on its own.
+        respond: (request) => {
+          lookupSignal = request.signal;
+          return new Promise<Response>((_, reject) => {
+            request.signal.addEventListener('abort', () => reject(request.signal.reason), {
+              once: true,
+            });
+          });
+        },
+      },
+    ]);
+    http.install();
+    try {
+      const pending = getWikipediaService()
+        .getArticleSection('Nonexistent', 1, 'en', createMockContext())
+        .then(
+          () => undefined,
+          (error: unknown) => error,
+        );
+      await vi.advanceTimersByTimeAsync(0);
+      const error = await pending;
+      expect(error).toMatchObject({
+        code: JsonRpcErrorCode.NotFound,
+        message: expect.stringContaining('No Wikipedia article found'),
+      });
+      expect(Date.now() - startedAt).toBe(0);
+      expect(lookupSignal?.aborted).toBe(true);
+    } finally {
+      http.restore();
+    }
   });
 });
 
@@ -1450,6 +2033,21 @@ describe('WikipediaService.getLanguages — missing page handling', () => {
     expect(languages[0]?.url).toBeUndefined();
     expect(languages[0]?.editionCode).toBeUndefined();
   });
+
+  it.each(['constructor', '__proto__', 'Constructor'])(
+    'resolves no host for a url-less langlink coded %s, which only the prototype answers',
+    async (lang) => {
+      const svc = getWikipediaService();
+      vi.spyOn(svc, 'actionGet').mockResolvedValue({
+        query: {
+          pages: { '1': { pageid: 1, title: 'Test', langlinks: [{ lang, title: 'Test' }] } },
+        },
+      });
+
+      const { languages } = await svc.getLanguages('Test', 'en', createMockContext());
+      expect(languages).toEqual([{ languageCode: lang, title: 'Test' }]);
+    },
+  );
 
   it('does not consult the registry when every entry carries a url', async () => {
     const svc = getWikipediaService();
@@ -1675,6 +2273,74 @@ describe('WikipediaService — HTML/JSON detection in responses', () => {
       message: expect.stringContaining('does not exist on Wikipedia'),
     });
   });
+
+  /** The one message every 2xx body that is not a JSON object gets, on either runtime. */
+  const notJson = (api: string) =>
+    `Wikipedia ${api} returned a response that is not a JSON object — likely rate-limited or under maintenance.`;
+
+  it.each([
+    [
+      'an XML body',
+      '<?xml version="1.0" encoding="utf-8"?><api servedby="mw-api-ext"><error code="maxlag" info="Waiting for db1234"/></api>',
+    ],
+    [
+      'an HTML error page',
+      '<!DOCTYPE html><html><head><title>Wikimedia Error</title></head></html>',
+    ],
+    [
+      'an HTML body without a doctype',
+      '<html lang="en"><body>Servers under maintenance</body></html>',
+    ],
+    ['a truncated JSON body', '{"query":{"pages":[{"title":"Python (programming'],
+    ['plain text', 'upstream hiccup: please retry'],
+    ['an empty body', ''],
+    ['a JSON null', 'null'],
+    ['a JSON number', '42'],
+    ['a JSON string', '"ok"'],
+    ['a JSON array', '[{"title":"Python"}]'],
+  ])(
+    'reports %s on HTTP 200 as one fixed, retried ServiceUnavailable carrying none of it',
+    async (_name, body) => {
+      useFakeClock();
+      const svc = getWikipediaService();
+      const { calls } = stubUpstream(anyActionRequest, () => new Response(body));
+
+      const { error } = await settle(
+        svc.actionGet('en', { action: 'query', titles: 'Python' }, createMockContext()),
+      );
+
+      expect(calls()).toBe(4);
+      expect(error).toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        message: `${notJson('Action API')} (failed after 4 attempts)`,
+      });
+      expect((error as { data?: unknown }).data).toEqual({
+        retryAttempts: 4,
+        operation: 'WikipediaService.actionGet',
+      });
+    },
+  );
+
+  it('gives a non-JSON 200 body from the REST API the same fixed message', async () => {
+    useFakeClock();
+    const svc = getWikipediaService();
+    const { calls } = stubUpstream(
+      (url) => url.pathname.startsWith('/api/rest_v1/'),
+      () => new Response('<?xml version="1.0"?><error servedby="mw-api-ext"/>'),
+    );
+
+    const { error } = await settle(svc.restGet('en', '/page/summary/Python', createMockContext()));
+
+    expect(calls()).toBe(4);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      message: `${notJson('REST API')} (failed after 4 attempts)`,
+    });
+    expect((error as { data?: unknown }).data).toEqual({
+      retryAttempts: 4,
+      operation: 'WikipediaService.restGet',
+    });
+  });
 });
 
 describe('WikipediaService — output contains no secrets', () => {
@@ -1870,9 +2536,9 @@ describe('htmlSectionToPlainText — parser HTML rendering (issue #28)', () => {
     expect(text).toContain('The assignment statement, using a single equals sign =');
   });
 
-  it('renders each list item on its own line', () => {
+  it('renders each list item on its own line, behind its marker (#81)', () => {
     expect(text).toContain(
-      "Python's statements include the following:\n\nThe assignment statement, using a single equals sign =\nThe if statement,",
+      "Python's statements include the following:\n\n- The assignment statement, using a single equals sign =\n- The if statement,",
     );
   });
 
@@ -1990,10 +2656,10 @@ const LAYOUT_TABLE_HTML = `<div class="mw-heading mw-heading2"><h2 id="Discograp
 </td></tr></tbody></table></div>`;
 
 describe('htmlSectionToPlainText — layout vs data tables (issue #32)', () => {
-  it('keeps the lists a layout table wraps, one item per line', () => {
+  it('keeps the lists a layout table wraps, one item per line behind its marker', () => {
     const text = htmlSectionToPlainText(LAYOUT_TABLE_HTML);
     expect(text).toBe(
-      '== Discography ==\n\nMain article: D\n\nStudio albums\n\nOne (2006)\nTwo (2008)\n\nRe-recorded albums\n\nThree (2021)',
+      '== Discography ==\n\nMain article: D\n\nStudio albums\n\n- One (2006)\n- Two (2008)\n\nRe-recorded albums\n\n- Three (2021)',
     );
   });
 
@@ -2031,7 +2697,7 @@ describe('htmlSectionToPlainText — layout vs data tables (issue #32)', () => {
     const nested =
       '<table role="presentation"><tbody><tr><td><ul><li>keep me</li></ul><table><tbody><tr><td>drop me</td></tr></tbody></table><p>keep me too</p></td></tr></tbody></table>';
     const text = htmlSectionToPlainText(nested);
-    expect(text).toBe('keep me\n\nkeep me too');
+    expect(text).toBe('- keep me\n\nkeep me too');
     expect(text).not.toContain('drop me');
   });
 
@@ -2041,6 +2707,412 @@ describe('htmlSectionToPlainText — layout vs data tables (issue #32)', () => {
     const ambox =
       '<p>Body.</p><table class="box-Update plainlinks metadata ambox ambox-content" role="presentation"><tbody><tr><td class="mbox-text">This article needs to be updated. (November 2024)</td></tr></tbody></table>';
     expect(htmlSectionToPlainText(ambox)).toBe('Body.');
+  });
+});
+
+describe('htmlSectionToPlainText — constructs the list walk leaves alone (characterization)', () => {
+  it.each([
+    [
+      'list items in a data-table cell, joined with "; "',
+      '<table class="wikitable"><tr><th>Artist</th><th>Albums</th></tr><tr><td>A</td><td><ul><li>One</li><li>Two<ol><li>Deep</li></ol></li></ul></td></tr></table>',
+      '| Artist | Albums |\n| --- | --- |\n| A | One; Two; Deep |',
+    ],
+    [
+      'list items in infobox cells',
+      '<table class="infobox"><tr><th class="infobox-above">Box</th></tr><tr><th>Genres</th><td><div class="hlist"><ul><li>Rock</li><li>Pop</li></ul></div></td></tr><tr><th>Members</th><td><ul><li>A</li>\n<li>B</li></ul></td></tr></table>',
+      'Box\nGenres: Rock; Pop\nMembers: A; B',
+    ],
+    [
+      'a definition list outside any list',
+      '<p>Intro:</p><dl><dt>Term</dt><dd>First definition.</dd>\n<dd>Second <i>definition</i>.</dd></dl><p>After.</p>',
+      'Intro:\n\nTerm\n\nFirst definition.\n\nSecond definition.\n\nAfter.',
+    ],
+    [
+      'a clade tree',
+      '<table class="clade"><tbody><tr><td class="clade-label">Root</td><td class="clade-leaf"><table class="clade"><tbody><tr><td class="clade-label">A</td><td class="clade-leaf">Alpha</td></tr><tr><td class="clade-label"></td><td class="clade-leaf">Beta</td></tr></tbody></table></td></tr></tbody></table>',
+      '```\n- Root\n  - A\n    - Alpha\n  - Beta\n```',
+    ],
+    [
+      'a code sample, its blank lines and indentation kept',
+      '<p>Example:</p><pre>  indented\n\tline &lt;b&gt; ``` \n\n\nafter blank lines\n</pre><p>Next.</p>',
+      'Example:\n\n````\n  indented\n\tline <b> ```\n\n\nafter blank lines\n````\n\nNext.',
+    ],
+    [
+      'the reference list a section payload carries, list inside a footnote included',
+      '<p>Claim.<sup class="reference"><a href="#cite_note-1">[1]</a></sup></p><div class="reflist"><ol class="references"><li id="cite_note-1"><span class="reference-text">Source <ul><li>nested</li></ul></span></li></ol></div><p>Tail.</p>',
+      'Claim.\n\nTail.',
+    ],
+  ])('renders %s as before', (_name, html, expected) => {
+    expect(htmlSectionToPlainText(html)).toBe(expected);
+  });
+});
+
+describe('htmlSectionToPlainText — lists keep their markers and nesting (#81)', () => {
+  /** `text` as the `content[]` surface renders it, read back through a CommonMark parse. */
+  const readBack = (text: string) => readBackText(escapeMarkdownOutsideBlocks(text));
+
+  describe('captured sections', () => {
+    it('numbers an ordered list (Twelve-step program §3)', () => {
+      const text = htmlSectionToPlainText(listFixture('twelve-step-program-s3'));
+      expect(text).toContain(
+        '\n\n1. We admitted we were powerless over alcohol—that our lives had become unmanageable.\n2. Came to believe that a power greater than ourselves could restore us to sanity.\n3. Made a decision to turn our will and our lives over to the care of God, as we understood Him.\n',
+      );
+      expect(text).toMatch(
+        /\n10\. Continued to take personal inventory, and when we were wrong, promptly admitted it\.\n11\. Sought through prayer and meditation .*\n12\. Having had a spiritual awakening as the result of these steps, /,
+      );
+      expect(readBack(text)).toBe(text);
+    });
+
+    it('indents a nested list two spaces per level, with no blank line inside it (Outline of geography §8)', () => {
+      const text = htmlSectionToPlainText(listFixture('outline-of-geography-s8'));
+      expect(text).toMatch(
+        /\n\n- Cultural geography – study of cultural products .* spatially\.\n {2}- Children's geographies – study of places .* includes:\n {4}- Children and the city\n {4}- Children and the countryside\n(?: {4}- .*\n)* {4}- Otherness of childhood\n {2}- Animal geographies – /,
+      );
+      expect(readBack(text)).toBe(text);
+    });
+
+    it('counts a reversed list down from its item count (Late Show Top Ten List §2)', () => {
+      const text = htmlSectionToPlainText(listFixture('late-show-top-ten-list-s2'));
+      expect(text).toContain(
+        '\n\n10. State dinners are at IHOP\n9. Country renamed United States of ditech.com\n',
+      );
+      expect(text).toContain(
+        '\n2. Price of a stamp is now two grand\n1. Cheney was spotted strolling into a bank carrying his 12-gauge',
+      );
+      expect(readBack(text)).toBe(text);
+    });
+
+    it('starts a list at its start attribute (Multiple sclerosis §22)', () => {
+      const text = htmlSectionToPlainText(listFixture('multiple-sclerosis-s22'));
+      expect(text).toContain('\n\n5. Radiologically isolated syndrome');
+      expect(text).toContain(
+        '\n\n1. Relapsing-remitting MS (RRMS)\n2. Primary progressive MS (PPMS)\n',
+      );
+      expect(readBack(text)).toBe(text);
+    });
+
+    it('numbers from an item value, parsed as HTML parses an integer, and skips hidden items (Messiah §14)', () => {
+      const text = htmlSectionToPlainText(listFixture('messiah-handel-s14'));
+      expect(text).toContain(
+        '\n\n5. Thus saith the Lord of hosts (accompanied recitative for bass)\n6. But who may abide the day of His coming (soprano, alto or bass)\n7. And he shall purify the sons of Levi (chorus)\n\n',
+      );
+      expect(text).toContain(
+        '\n\n13. Pifa ("pastoral symphony": instrumental)\n14. (a) There were shepherds abiding in the fields (secco recitative for soprano)\n14. (b) And lo, the angel of the Lord (accompanied recitative for soprano)\n15. And the angel said unto them (secco recitative for soprano)\n',
+      );
+      expect(readBack(text)).toBe(text);
+    });
+
+    it('writes decimal markers whatever the list type (World Heritage Site §6)', () => {
+      const text = htmlSectionToPlainText(listFixture('world-heritage-site-s6'));
+      expect(text).toContain('\n\n1. "To represent a masterpiece of human creative genius"\n2. ');
+      expect(text).toMatch(/\n\n7\. "To contain superlative .*"\n8\. .*\n9\. .*\n10\. .*$/);
+      expect(readBack(text)).toBe(text);
+    });
+
+    it('nests a list inside an item and resumes the outer count after it (Tree traversal §10)', () => {
+      const text = htmlSectionToPlainText(listFixture('tree-traversal-s10'));
+      expect(text).toContain(
+        "\n\n1. If the current node is empty then return.\n2. Visit the current node for pre-order traversal.\n3. For each i from 1 to the current node's number of subtrees − 1, or from the latter to the former for reverse traversal, do:\n  1. Recursively traverse the current node's i-th subtree.\n  2. Visit the current node for in-order traversal.\n4. Recursively traverse the current node's last subtree.\n5. Visit the current node for post-order traversal.\n\n",
+      );
+      expect(readBack(text)).toBe(text);
+    });
+
+    it("indents an item's block lines two spaces past its marker line (Tree traversal §3)", () => {
+      const text = htmlSectionToPlainText(listFixture('tree-traversal-s3'));
+      expect(text).toContain(
+        "\n\n1. If the current node is empty then return.\n2. Execute the following three operations in a certain order:\n  N: Visit the current node.\n  L: Recursively traverse the current node's left subtree.\n  R: Recursively traverse the current node's right subtree.\n\n",
+      );
+      expect(readBack(text)).toBe(text);
+    });
+
+    it('keeps the hierarchy of a full-article extract seven levels deep (Outline of geography)', async () => {
+      initService();
+      const svc = getWikipediaService();
+      vi.spyOn(svc, 'actionGet').mockResolvedValue(
+        nycFullReadResponse(listFixture('outline-of-geography-extract')),
+      );
+      const { content } = await svc.getArticleFull(
+        'Outline of geography',
+        'en',
+        createMockContext(),
+      );
+      expect(content).toMatch(/^ {12}- \S/m);
+      expect(content).not.toMatch(/^ {14}/m);
+      expect(content).not.toMatch(/^- .*\n\n {2}- /m);
+      expect(readBack(content)).toBe(content);
+    });
+
+    it('numbers the same list on a full read (Twelve-step program)', async () => {
+      initService();
+      const svc = getWikipediaService();
+      vi.spyOn(svc, 'actionGet').mockResolvedValue(
+        nycFullReadResponse(listFixture('twelve-step-program-s3')),
+      );
+      const { content } = await svc.getArticleFull(
+        'Twelve-step program',
+        'en',
+        createMockContext(),
+      );
+      expect(content).toContain(
+        '\n\n1. We admitted we were powerless over alcohol—that our lives had become unmanageable.\n2. Came to believe',
+      );
+      expect(content).toMatch(/\n12\. Having had a spiritual awakening /);
+    });
+  });
+
+  it.each([
+    [
+      'five levels deep, mixing bullets and numbers',
+      '<p>Intro:</p><ul><li>One<ol><li>Two<ul><li>Three<ol start="3"><li>Four<ul><li>Five</li></ul></li></ol></li></ul></li></ol></li><li>Back</li></ul><p>After.</p>',
+      'Intro:\n\n- One\n  1. Two\n    - Three\n      3. Four\n        - Five\n- Back\n\nAfter.',
+    ],
+    [
+      'block lines inside an item',
+      '<ol><li>Lead<p>Paragraph two</p>line<br>after a break<dl><dd>N: node</dd>\n<dd>L: left</dd></dl></li><li>Next</li></ol>',
+      '1. Lead\n  Paragraph two\n  line\n  after a break\n  N: node\n  L: left\n2. Next',
+    ],
+    [
+      'text after a nested list, still its item’s',
+      '<ul><li>A<ul><li>B</li></ul>tail of A</li><li>C</li></ul>',
+      '- A\n  - B\n  tail of A\n- C',
+    ],
+    [
+      'an item that opens with a nested list, and an empty item',
+      '<ol><li><ul><li>B</li></ul></li><li></li><li>c</li></ol>',
+      '1.\n  - B\n2.\n3. c',
+    ],
+    [
+      'a data table inside an item',
+      '<ul><li>Results:<table class="wikitable"><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>x | y</td></tr></table></li><li>Next</li></ul>',
+      '- Results:\n  | A | B |\n  | --- | --- |\n  | 1 | x \\| y |\n- Next',
+    ],
+    [
+      'a code sample inside an item',
+      '<ul><li>Run:<pre>x = 1\n  y ```</pre>then</li></ul>',
+      '- Run:\n  ````\n  x = 1\n    y ```\n  ````\n  then',
+    ],
+    [
+      'inline markup and entities in an item',
+      '<ul><li><b>Bold</b> &amp; <a href="/wiki/X">link</a>&nbsp;&lt;tag&gt;\n  spread</li></ul>',
+      '- Bold & link <tag> spread',
+    ],
+    [
+      'hidden empty items, which are not counted',
+      '<ol><li class="mw-empty-elt"></li><li>a</li><li class="mw-empty-elt"></li><li>b</li></ol><ol reversed=""><li class="mw-empty-elt"></li><li>c</li><li>d</li></ol>',
+      '1. a\n2. b\n\n2. c\n1. d',
+    ],
+    [
+      'item values, start, and reversed together',
+      '<ol start="3"><li>c</li><li value="10">j</li><li>k</li><li value="-2">minus two</li><li>minus one</li></ol><ol reversed="" start="1"><li>one</li><li>zero</li><li>past zero</li></ol>',
+      '3. c\n10. j\n11. k\n-2. minus two\n-1. minus one\n\n1. one\n0. zero\n-1. past zero',
+    ],
+    [
+      'attribute values HTML does not read as an integer',
+      '<ol start="x"><li value="">a</li><li value="v2">b</li><li value=" +7">c</li><li value="99999999999999999999">d</li></ol><ul><li value="5">bullet</li></ul><ol data-start="9" class="reversed"><li data-value="4">e</li></ol>',
+      '1. a\n2. b\n7. c\n8. d\n\n- bullet\n\n1. e',
+    ],
+    [
+      'a list a layout table wraps, its cells still separate paragraphs',
+      '<table role="presentation"><tr><td><ol><li>a</li></ol></td><td><ol start="2"><li>b</li></ol></td></tr></table>',
+      '1. a\n\n2. b',
+    ],
+  ])('renders %s', (_name, html, expected) => {
+    const text = htmlSectionToPlainText(html);
+    expect(text).toBe(expected);
+    expect(text).not.toContain('￿');
+    expect(readBack(text)).toBe(text);
+  });
+
+  it.each([
+    ['an item closed by the next item', '<ul><li>a<li>b</ul><p>After.</p>', '- a\n- b\n\nAfter.'],
+    [
+      'a nested list closed by its end tag',
+      '<ol><li>a<ol><li>b</ol><li>c</ol>',
+      '1. a\n  1. b\n2. c',
+    ],
+    [
+      'a list closed by the end of the element around it',
+      '<div><ul><li>a<li>b</div><p>After.</p>',
+      '- a\n- b\n\nAfter.',
+    ],
+    [
+      'lists closed by their table cells',
+      '<table role="presentation"><tr><td><ul><li>a</td><td><ol><li>b</td></tr></table><p>After.</p>',
+      '- a\n\n1. b\n\nAfter.',
+    ],
+    [
+      'a list a heading follows',
+      '<ul><li>a<h2>Next</h2><p>After.</p>',
+      '- a\n\n== Next ==\n\nAfter.',
+    ],
+    [
+      'text after the last closed item',
+      '<ul><li>a</li><li>b</li><p>After.</p>',
+      '- a\n- b\n\nAfter.',
+    ],
+    ['a list the input ends inside', '<p>Lead.</p><ol><li>a<li>b', 'Lead.\n\n1. a\n2. b'],
+    ['an item outside any list', '<p>a</p><li>b</li><li>c</li>', 'a\n\nb\nc'],
+  ])('closes an unclosed list where HTML would: %s', (_name, html, expected) => {
+    const text = htmlSectionToPlainText(html);
+    expect(text).toBe(expected);
+    expect(readBack(text)).toBe(text);
+  });
+
+  it('indents nesting past sixteen levels no further than the sixteenth', () => {
+    const levels = 20;
+    const html = `${'<ul><li>x'.repeat(levels)}${'</li></ul>'.repeat(levels)}`;
+    const lines = htmlSectionToPlainText(html).split('\n');
+    expect(lines.map((line) => line.indexOf('-'))).toEqual(
+      Array.from({ length: levels }, (_, level) => 2 * Math.min(level, 16)),
+    );
+  });
+});
+
+describe('htmlSectionToPlainText — a source line break inside a paragraph is a space', () => {
+  it('runs a wrapped paragraph onto one line (Twelve-step program §3)', () => {
+    const text = htmlSectionToPlainText(listFixture('twelve-step-program-s3'));
+    expect(text).toContain(
+      'as we understand Him") sometimes occur to avoid gender-specific pronouns',
+    );
+  });
+
+  it('runs a wrapped paragraph onto one line on a full read', async () => {
+    initService();
+    const svc = getWikipediaService();
+    vi.spyOn(svc, 'actionGet').mockResolvedValue(
+      nycFullReadResponse('<p>First line\nsecond line\r\n\tthird line.</p><p>Next.</p>'),
+    );
+    const { content } = await svc.getArticleFull('NYC', 'en', createMockContext());
+    expect(content).toBe('First line second line third line.\n\nNext.');
+  });
+
+  it('keeps the line breaks a break tag, a heading, or a block makes', () => {
+    expect(htmlSectionToPlainText('<h2>Head\ning</h2><p>a\nb<br>c\n</p>\n<div>d\ne</div>')).toBe(
+      '== Head ing ==\n\na b\nc\n\nd e',
+    );
+  });
+
+  it.each([
+    [
+      'Japanese',
+      '<p>削除をご検討ください。\n後述する方針</p>',
+      '削除をご検討ください。後述する方針',
+    ],
+    ['Chinese', '<p>中文 \n 文本</p>', '中文文本'],
+    ['fullwidth punctuation', '<p>（注）\n本文</p>', '（注）本文'],
+  ])(
+    'joins %s text across a line break without a space, as a browser does',
+    (_name, html, text) => {
+      expect(htmlSectionToPlainText(html)).toBe(text);
+    },
+  );
+
+  it.each([
+    ['Korean', '<p>한국어\n문서</p>', '한국어 문서'],
+    ['Latin beside wide text', '<p>abc\n漢字\nxyz</p>', 'abc 漢字 xyz'],
+    ['wide text across spaces with no line break', '<p>漢字  漢字</p>', '漢字 漢字'],
+  ])('keeps a space across a line break in %s', (_name, html, text) => {
+    expect(htmlSectionToPlainText(html)).toBe(text);
+  });
+});
+
+describe('htmlSectionToPlainText — list rendering stays linear in the payload (#81)', () => {
+  beforeEach(() => vi.restoreAllMocks());
+
+  /** `size` characters of `unit` repeated, so every shape grows by the same count. */
+  const fill = (unit: string, size: number) => unit.repeat(Math.ceil(size / unit.length));
+
+  // Every shape reaches a regex scan, so each starts at 625 characters and its 64× span ends at
+  // 40,000, below the size where Bun's regex engine changes mode; a whole page of list markup costs
+  // enough per character that the smaller span keeps each case well inside the test timeout.
+  it.each([
+    ['one long line ending in a break', (n: number) => `${fill('§1 x', n)}\ny`],
+    ['breaks throughout', (n: number) => fill('  \r\n', n)],
+    ['a long line inside a list item', (n: number) => `<ul><li>${fill('§1 x', n)}\ny</li></ul>`],
+    ['breaks throughout a list item', (n: number) => `<ul><li>${fill('  \r\n', n)}</li></ul>`],
+    ['wrapped paragraphs', (n: number) => fill('<p>a\nb</p>\n', n)],
+    ['items in one list', (n: number) => `<ol>${fill('<li>x', n)}`],
+    ['lists', (n: number) => fill('<ol>', n)],
+    ['nested lists', (n: number) => fill('<ul><li>x', n)],
+    ['nested reversed lists', (n: number) => fill('<ol reversed=""><li>x', n)],
+    [
+      'nested lists with end tags',
+      (n: number) => `${fill('<ol><li>x', n / 2)}${fill('</li></ol>', n / 2)}`,
+    ],
+    ['link tags', (n: number) => `${fill('<a', n / 2)}${fill('>', n / 2)}`],
+    ['list tags', (n: number) => `${fill('<ol', n / 2)}${fill('>', n / 2)}`],
+    ['item tags', (n: number) => `<ul>${fill('<li', n)}`],
+    ['divs in a list', (n: number) => `${fill('<ul><li>x', n / 2)}${fill('</div>', n / 2)}`],
+    ['divs inside list items', (n: number) => fill('<ul><li><div>', n)],
+    ['code samples inside list items', (n: number) => `<ul>${fill('<li><pre>x</pre>', n)}</ul>`],
+    [
+      'one item tag with attributes',
+      (n: number) => `<ol><li${fill(' value value= start reversedx', n)}>x</li></ol>`,
+    ],
+    ['one item with a padded value', (n: number) => `<ol><li value="${fill(' ', n)}x">a</li></ol>`],
+  ])('stays linear on %s', (_name, shape) => {
+    expectLinearGrowth(htmlSectionToPlainText, shape, 625);
+  });
+});
+
+describe('htmlSectionToPlainText — headings, code samples, and comments pair as before (characterization)', () => {
+  it.each([
+    ['a heading holding another open heading', '<h2>a<h2>b</h2>c', '== ab ==\n\nc'],
+    [
+      'a heading with no end tag of its level',
+      '<p>Lead.</p><h3>a</h2><h2>b</h2><p>c</p>',
+      'Lead.\n\na\n\n== b ==\n\nc',
+    ],
+    ['heading tags in any case', '<H2 class="x">Up</h2 ><p>Down.</p>', '== Up ==\n\nDown.'],
+    [
+      'an unclosed heading before a closed one',
+      '<h2>open<p>body</p><h3>Sub</h3><p>more</p>',
+      'open\n\nbody\n\n=== Sub ===\n\nmore',
+    ],
+    ['a code sample holding another open one', '<pre>a<pre>b</pre>c', '```\nab\n```\n\nc'],
+    [
+      'an unclosed code sample',
+      '<p>Lead.</p><pre>never closed<p>after</p>',
+      'Lead.\n\nnever closed\n\nafter',
+    ],
+    [
+      'code sample tags in any case',
+      '<pre>one</pre><PRE class="x">two</pre >',
+      '```\none\n```\n\n```\ntwo\n```',
+    ],
+    ['a comment holding another comment opener', '<p>a<!-- one <!-- two --> b --></p>', 'a b -->'],
+    ['an unclosed comment', '<p>a</p><!-- open <p>b</p>', 'a\n\n<!-- open\n\nb'],
+    ['empty and near-empty comments', '<p>a<!---->b<!-->c--></p>', 'ab'],
+  ])('renders %s as before', (_name, html, expected) => {
+    expect(htmlSectionToPlainText(html)).toBe(expected);
+  });
+});
+
+describe('htmlSectionToPlainText — headings, code samples, and comments stay linear in the payload', () => {
+  beforeEach(() => vi.restoreAllMocks());
+
+  /** `size` characters of `unit` repeated, so every shape grows by the same count. */
+  const fill = (unit: string, size: number) => unit.repeat(Math.ceil(size / unit.length));
+
+  // Every shape reaches a regex scan, so each starts at 625 characters and its 64× span ends at
+  // 40,000, below the size where Bun's regex engine changes mode and well inside the test timeout.
+  it.each([
+    ['one long line ending in a break', (n: number) => `${fill('§1 x', n)}\ny`],
+    ['breaks throughout', (n: number) => fill('  \r\n', n)],
+    ['headings', (n: number) => fill('<h2>', n)],
+    ['heading tags', (n: number) => `${fill('<h2', n / 2)}${fill('>', n / 2)}`],
+    [
+      'headings and end tags of another level',
+      (n: number) => `${fill('<h2>', n / 2)}${fill('</h3>', n / 2)}`,
+    ],
+    ['code samples', (n: number) => fill('<pre>', n)],
+    ['code sample tags', (n: number) => `${fill('<pre', n / 2)}${fill('>', n / 2)}`],
+    ['comments', (n: number) => fill('<!--', n)],
+    ['wide text across line breaks', (n: number) => `<p>${fill('漢\n', n)}</p>`],
+    ['wide text beside spaces and tabs', (n: number) => `<p>漢${fill(' \t', n)}x</p>`],
+    ['wide text beside blank lines', (n: number) => `<p>漢${fill(' \n', n)}x</p>`],
+  ])('stays linear on %s', (_name, shape) => {
+    expectLinearGrowth(htmlSectionToPlainText, shape, 625);
   });
 });
 
@@ -2122,7 +3194,7 @@ describe('htmlSectionToPlainText — side boxes and furniture bars (issue #34)',
 
   it('leaves the section with its heading and its own content only', () => {
     expect(text).toBe(
-      '== External links ==\n\n=== Official ===\n\nOfficial website of The Obama Foundation',
+      '== External links ==\n\n=== Official ===\n\n- Official website of The Obama Foundation',
     );
   });
 
@@ -2200,7 +3272,7 @@ describe('htmlSectionToPlainText — side boxes and furniture bars (issue #34)',
     // side box's own subtree.
     const nested = `<table role="presentation"><tbody><tr><td><ul><li>keep me</li></ul><div class="side-box metadata side-box-right"><div class="side-box-abovebelow">Library resources</div><div class="side-box-text"><ul><li>Online books</li></ul></div></div><p>keep me too</p></td></tr></tbody></table>`;
     const rendered = htmlSectionToPlainText(nested);
-    expect(rendered).toBe('keep me\n\nkeep me too');
+    expect(rendered).toBe('- keep me\n\nkeep me too');
     expect(rendered).not.toContain('Library resources');
     expect(rendered).not.toContain('Online books');
   });
@@ -2238,7 +3310,7 @@ describe('htmlSectionToPlainText — side boxes and furniture bars (issue #34)',
 
   it('still keeps a layout table that carries neither the marker nor a box class', () => {
     expect(htmlSectionToPlainText(LAYOUT_TABLE_HTML)).toBe(
-      '== Discography ==\n\nMain article: D\n\nStudio albums\n\nOne (2006)\nTwo (2008)\n\nRe-recorded albums\n\nThree (2021)',
+      '== Discography ==\n\nMain article: D\n\nStudio albums\n\n- One (2006)\n- Two (2008)\n\nRe-recorded albums\n\n- Three (2021)',
     );
   });
 });
@@ -2438,7 +3510,10 @@ describe('WikipediaService — revision-pinned table pages (#67)', () => {
     expect(pages.map((page) => page.revisionId)).toEqual(['42', '42']);
     expect(pages.map((page) => page.tablePage?.row_offset)).toEqual([0, 3]);
     expect(pages.map((page) => page.tablePage?.rows_returned)).toEqual([3, 2]);
-    for (const call of action.mock.calls.slice(1)) {
+    // Each page also sends its page-property lookup, which reads no revision.
+    const parses = action.mock.calls.filter(([, params]) => params.action === 'parse');
+    expect(parses).toHaveLength(2);
+    for (const call of parses.slice(1)) {
       expect(call[1]).toMatchObject({ oldid: '42' });
       expect(call[1]).not.toHaveProperty('page');
     }
@@ -2540,7 +3615,8 @@ describe('WikipediaService — revision-pinned table pages (#67)', () => {
         data: { reason: 'revision_unavailable' },
       });
     }
-    expect(action).toHaveBeenCalledTimes(4);
+    // One parse per read, beside each read's page-property lookup.
+    expect(action.mock.calls.filter(([, params]) => params.action === 'parse')).toHaveLength(4);
   });
 });
 
@@ -2783,6 +3859,22 @@ describe('htmlSectionToPlainText — elements the page hides (issue #33)', () =>
     expect(text).not.toContain('application/x-tex');
   });
 
+  it('gives a display formula a line of its own, however the source breaks its lines', () => {
+    const image = (element: string, image: string, tex: string) =>
+      `<span class="mwe-math-element mwe-math-element-${element}"><img src="s" class="mwe-math-fallback-image-${image} mw-invert" alt="${tex}"></span>`;
+    expect(
+      htmlSectionToPlainText(
+        `<p>so that${image('block', 'display', '{\\displaystyle E=mc^{2}}')}where ${image('inline', 'inline', '{\\displaystyle m}')} is the mass.</p>`,
+      ),
+    ).toBe('so that\n{\\displaystyle E=mc^{2}}\nwhere {\\displaystyle m} is the mass.');
+    // TextExtracts' full-article HTML carries a visible <math> with no fallback image.
+    expect(
+      htmlSectionToPlainText(
+        '<p>so that <math display="block" alttext="{\\displaystyle E=mc^{2}}"><mi>E</mi></math> where <math alttext="{\\displaystyle m}"><mi>m</mi></math> is the mass.</p>',
+      ),
+    ).toBe('so that\n{\\displaystyle E=mc^{2}}\nwhere {\\displaystyle m} is the mass.');
+  });
+
   it('keeps an inline formula glued to its surrounding punctuation', () => {
     const inline =
       '<p>where (<span class="mwe-math-element"><span class="mwe-math-mathml-inline mwe-math-mathml-a11y" style="display: none;"><math><mi>n</mi></math></span><img src="s" class="mwe-math-fallback-image-inline" alt="{\\displaystyle n}"></span>) is the count.</p>';
@@ -2848,7 +3940,7 @@ describe('htmlSectionToPlainText — hidden CS1 messages (issue #75)', () => {
     const text = htmlSectionToPlainText(`<ul><li>${CITATION}${MAINT}</li></ul>`);
     expect(text).not.toContain('CS1 maint');
     expect(text).not.toContain('{{cite book}}');
-    expect(text).toBe(ROWELL);
+    expect(text).toBe(`- ${ROWELL}`);
   });
 
   it('leaves the citation text around a hidden message byte-identical', () => {
@@ -2955,7 +4047,11 @@ describe('WikipediaService.getArticleSection — rendered section reads (issue #
     await svc.getArticleSection('TypeScript', 1, 'en', ctx);
     await svc.getArticleSection('TypeScript', 15, 'en', ctx);
 
-    const sections = spy.mock.calls.map((call) => (call[1] as Record<string, string>).section);
+    // The page-property lookup beside each parse carries no section.
+    const sections = spy.mock.calls
+      .map((call) => call[1] as Record<string, string>)
+      .filter((params) => params.action === 'parse')
+      .map((params) => params.section);
     expect(sections).toEqual(['1', '15']);
   });
 
@@ -3259,6 +4355,681 @@ describe('WikipediaService — invalid page entries and titles (issue #42)', () 
 });
 
 // ---------------------------------------------------------------------------
+// Issue #87 — titles that name no page: Special:, Media:, and interwiki links
+// ---------------------------------------------------------------------------
+
+/** Which endpoint a request reached: an Action API `action`, or the REST summary. */
+function endpointOf(request: Request): string {
+  const url = new URL(request.url);
+  if (url.pathname.startsWith('/api/rest_v1/page/summary/')) return 'rest';
+  return url.pathname === '/w/api.php' ? `action=${url.searchParams.get('action')}` : url.pathname;
+}
+
+describe('WikipediaService — titles that name no page (issue #87)', () => {
+  beforeEach(() => {
+    const svc = initService();
+    // 特別:おまかせ表示 is read from the Japanese edition.
+    vi.spyOn(svc, 'fetchEditionIndex').mockResolvedValue({
+      ...TEST_EDITION_INDEX,
+      hosts: { ...TEST_EDITION_INDEX.hosts, ja: 'https://ja.wikipedia.org' },
+    });
+  });
+
+  const NO_PAGE_DETAIL =
+    "Special: and Media: titles, in any edition's spelling, name no page; a file's description page is in the File: namespace.";
+  const INTERWIKI_DETAIL =
+    "It begins with an interwiki prefix, which links to another wiki. For another Wikipedia edition, pass the title without the prefix and the edition's code as language.";
+
+  /** `action=parse`'s answer, on every edition, for a title in a namespace that holds no pages. */
+  const PAGE_CANNOT_EXIST = {
+    error: { code: 'pagecannotexist', info: "Namespace doesn't allow actual pages." },
+  };
+
+  /**
+   * Virtual-namespace titles and the `action=query` answer each draws, captured live on 2026-11-11
+   * (identical for `prop=extracts|info|revisions`, `prop=langlinks`, and no prop at all): `special`
+   * alone when the special page or file exists, `special` beside `missing` when it does not. REST
+   * answers the Special: namespace with 404 and Media: with 500.
+   */
+  const NO_PAGE_TITLES = [
+    {
+      title: 'Special:Random',
+      language: 'en',
+      query: {
+        batchcomplete: true,
+        query: { pages: [{ ns: -1, title: 'Special:Random', special: true }] },
+      },
+      restStatus: 404,
+    },
+    {
+      title: 'Media:Example.jpg',
+      language: 'en',
+      query: {
+        batchcomplete: true,
+        query: { pages: [{ ns: -2, title: 'Media:Example.jpg', special: true }] },
+      },
+      restStatus: 500,
+    },
+    {
+      title: 'Spezial:Zufällige Seite',
+      language: 'de',
+      query: {
+        batchcomplete: true,
+        query: { pages: [{ ns: -1, title: 'Spezial:Zufällige Seite', special: true }] },
+      },
+      restStatus: 404,
+    },
+    {
+      title: '特別:おまかせ表示',
+      language: 'ja',
+      query: {
+        batchcomplete: true,
+        query: { pages: [{ ns: -1, title: '特別:おまかせ表示', special: true }] },
+      },
+      restStatus: 404,
+    },
+    {
+      title: 'special:random',
+      language: 'en',
+      query: {
+        batchcomplete: true,
+        query: {
+          normalized: [{ fromencoded: false, from: 'special:random', to: 'Special:Random' }],
+          pages: [{ ns: -1, title: 'Special:Random', special: true }],
+        },
+      },
+      restStatus: 404,
+    },
+    {
+      title: 'Special:Zzqxnosuchpage',
+      language: 'en',
+      query: {
+        batchcomplete: true,
+        query: {
+          pages: [{ ns: -1, title: 'Special:Zzqxnosuchpage', special: true, missing: true }],
+        },
+      },
+      restStatus: 404,
+    },
+    {
+      title: 'Media:Zzqx no such file.jpg',
+      language: 'en',
+      query: {
+        batchcomplete: true,
+        query: {
+          pages: [{ ns: -2, title: 'Media:Zzqx no such file.jpg', special: true, missing: true }],
+        },
+      },
+      restStatus: 500,
+    },
+  ];
+
+  /** Interwiki titles: `action=query` lists them under `query.interwiki` with no page entry. */
+  const INTERWIKI_TITLES = [
+    {
+      title: 'wikt:cat',
+      query: { batchcomplete: true, query: { interwiki: [{ title: 'wikt:cat', iw: 'wikt' }] } },
+    },
+    {
+      title: 'fr:Chat',
+      query: { batchcomplete: true, query: { interwiki: [{ title: 'fr:Chat', iw: 'fr' }] } },
+    },
+  ];
+
+  type Read = (svc: WikipediaService, title: string, language: string) => Promise<unknown>;
+  const PARSE_READS: ReadonlyArray<{ read: string; run: Read }> = [
+    { read: 'getSections', run: (svc, t, l) => svc.getSections(t, l, createMockContext()) },
+    { read: 'getReferences', run: (svc, t, l) => svc.getReferences(t, l, createMockContext()) },
+    {
+      read: 'getArticleSection',
+      run: (svc, t, l) => svc.getArticleSection(t, 1, l, createMockContext()),
+    },
+  ];
+  const QUERY_READS: ReadonlyArray<{ read: string; run: Read }> = [
+    { read: 'getArticleFull', run: (svc, t, l) => svc.getArticleFull(t, l, createMockContext()) },
+    { read: 'getLanguages', run: (svc, t, l) => svc.getLanguages(t, l, createMockContext()) },
+    { read: 'getSummary', run: (svc, t, l) => svc.getSummary(t, l, createMockContext()) },
+  ];
+
+  /** Answer each endpoint the way the live API answers one title; unrouted requests fail. */
+  function serve(answers: {
+    parse?: unknown;
+    query?: (request: Request) => Response | Promise<Response>;
+    rest?: () => Response;
+  }) {
+    const http = createFetchMock([
+      ...(answers.parse === undefined
+        ? []
+        : [
+            {
+              match: (request: Request) => endpointOf(request) === 'action=parse',
+              respond: () => Response.json(answers.parse),
+            },
+          ]),
+      ...(answers.query === undefined
+        ? []
+        : [
+            {
+              match: (request: Request) => endpointOf(request) === 'action=query',
+              respond: answers.query,
+            },
+          ]),
+      ...(answers.rest === undefined
+        ? []
+        : [{ match: (request: Request) => endpointOf(request) === 'rest', respond: answers.rest }]),
+    ]);
+    http.install();
+    onTestFinished(() => {
+      http.restore();
+    });
+    return http;
+  }
+
+  const restError = (status: number) => () =>
+    Response.json({ status, type: 'Internal error' }, { status });
+
+  /** Run `call` to completion under fake timers, so a retry ladder's backoff costs no real time. */
+  async function settled<T>(call: () => Promise<T>) {
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    const outcome = call().then(
+      (value) => ({ value, error: undefined }),
+      (error: unknown) => ({ value: undefined, error }),
+    );
+    await vi.runAllTimersAsync();
+    return outcome;
+  }
+
+  const endpoints = (http: ReturnType<typeof createFetchMock>) =>
+    http.calls.map((call) => endpointOf(call.request));
+
+  it.each(
+    NO_PAGE_TITLES.flatMap((fixture) =>
+      [...PARSE_READS, ...QUERY_READS].map((read) => ({ ...fixture, ...read })),
+    ),
+  )('$read refuses $title ($language) as invalid_title', async (testCase) => {
+    const http = serve({
+      parse: PAGE_CANNOT_EXIST,
+      query: () => Response.json(testCase.query),
+      rest: restError(testCase.restStatus),
+    });
+    const { error } = await settled(() =>
+      testCase.run(getWikipediaService(), testCase.title, testCase.language),
+    );
+
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      message: `"${testCase.title}" is not a valid Wikipedia page name. ${NO_PAGE_DETAIL}`,
+    });
+    expect((error as { data?: unknown }).data).toEqual({
+      title: testCase.title,
+      reason: 'invalid_title',
+    });
+    expect(endpoints(http)).not.toContain('rest');
+  });
+
+  it.each(
+    INTERWIKI_TITLES.flatMap((fixture) => QUERY_READS.map((read) => ({ ...fixture, ...read }))),
+  )('$read refuses the interwiki title $title as invalid_title', async (testCase) => {
+    const http = serve({ query: () => Response.json(testCase.query), rest: restError(504) });
+    const { error } = await settled(() =>
+      testCase.run(getWikipediaService(), testCase.title, 'en'),
+    );
+
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      message: `"${testCase.title}" is not a valid Wikipedia page name. ${INTERWIKI_DETAIL}`,
+    });
+    expect((error as { data?: unknown }).data).toEqual({
+      title: testCase.title,
+      reason: 'invalid_title',
+    });
+    expect(endpoints(http)).not.toContain('rest');
+  });
+
+  it.each(
+    INTERWIKI_TITLES.flatMap((fixture) => PARSE_READS.map((read) => ({ ...fixture, ...read }))),
+  )(
+    '$read refuses the interwiki title $title from its invalidtitle code (characterization)',
+    async (testCase) => {
+      serve({
+        parse: { error: { code: 'invalidtitle', info: `Bad title "${testCase.title}".` } },
+        query: () => Response.json(testCase.query),
+      });
+      const { error } = await settled(() =>
+        testCase.run(getWikipediaService(), testCase.title, 'en'),
+      );
+
+      expect(error).toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        message: `"${testCase.title}" is not a valid Wikipedia page name. Bad title "${testCase.title}".`,
+        data: { reason: 'invalid_title' },
+      });
+    },
+  );
+
+  it('refuses a summary title without a REST request, from one action=query for the title as written', async () => {
+    const http = serve({
+      query: () => Response.json(NO_PAGE_TITLES[1]!.query),
+      rest: restError(500),
+    });
+    const { error } = await settled(() =>
+      getWikipediaService().getSummary('Media:Example.jpg', 'en', createMockContext()),
+    );
+
+    expect(error).toMatchObject({ data: { reason: 'invalid_title' } });
+    expect(http.calls).toHaveLength(1);
+    const url = new URL(http.calls[0]!.request.url);
+    expect(url.origin).toBe('https://en.wikipedia.org');
+    expect(Object.fromEntries(url.searchParams)).toEqual({
+      format: 'json',
+      formatversion: '2',
+      action: 'query',
+      titles: 'Media:Example.jpg',
+    });
+  });
+
+  it('refuses a summary title the pre-check finds invalid, with its reason', async () => {
+    const http = serve({
+      query: () =>
+        Response.json({
+          batchcomplete: true,
+          query: {
+            pages: [
+              {
+                title: 'Talk:',
+                invalidreason:
+                  'The requested page title is empty or contains only a namespace prefix.',
+                invalid: true,
+              },
+            ],
+          },
+        }),
+      rest: restError(404),
+    });
+    const { error } = await settled(() =>
+      getWikipediaService().getSummary('Talk:', 'en', createMockContext()),
+    );
+
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      message:
+        '"Talk:" is not a valid Wikipedia page name. The requested page title is empty or contains only a namespace prefix.',
+      data: { reason: 'invalid_title' },
+    });
+    expect(endpoints(http)).toEqual(['action=query']);
+  });
+
+  /** REST's summary of the redirect target, trimmed from a live capture (2026-11-11). */
+  const STAR_WARS_REST = {
+    type: 'standard',
+    title: 'Star Wars (film)',
+    pageid: 52549,
+    wikibase_item: 'Q17738',
+    description: '1977 film by George Lucas',
+    extract:
+      'Star Wars is a 1977 American epic space opera film written and directed by George Lucas.',
+    extract_html:
+      '<p><i><b>Star Wars</b></i> is a 1977 American epic space opera film written and directed by George Lucas.</p>',
+    content_urls: { desktop: { page: 'https://en.wikipedia.org/wiki/Star_Wars_(film)' } },
+    revision: '1384642098',
+    timestamp: '2026-11-09T08:14:40Z',
+  };
+
+  /** REST's summary of File:Example.jpg, trimmed from a live capture (2026-11-11). */
+  const FILE_EXAMPLE_REST = {
+    type: 'no-extract',
+    title: 'File:Example.jpg',
+    namespace: { id: 6, text: 'File' },
+    pageid: 586539,
+    thumbnail: {
+      source:
+        'https://upload.wikimedia.org/wikipedia/en/a/a9/Example.jpg?utm_source=en.wikipedia.org&utm_campaign=api&utm_content=thumbnail_unscaled',
+      width: 300,
+      height: 300,
+    },
+    revision: '1373614348',
+    timestamp: '2026-09-06T22:34:38Z',
+    content_urls: { desktop: { page: 'https://en.wikipedia.org/wiki/File%3AExample.jpg' } },
+    extract: '',
+    extract_html: '',
+  };
+
+  /** The summary of FILE_EXAMPLE_REST, as getSummary returned it before the pre-check existed. */
+  const FILE_EXAMPLE_SUMMARY = {
+    title: 'File:Example.jpg',
+    pageType: 'no-extract',
+    pageid: 586539,
+    wikidataQid: undefined,
+    description: undefined,
+    extract: '',
+    thumbnailUrl:
+      'https://upload.wikimedia.org/wikipedia/en/a/a9/Example.jpg?utm_source=en.wikipedia.org&utm_campaign=api&utm_content=thumbnail_unscaled',
+    latitude: undefined,
+    longitude: undefined,
+    url: 'https://en.wikipedia.org/wiki/File:Example.jpg',
+    revisionId: '1373614348',
+    lastModified: '2026-09-06T22:34:38Z',
+    redirect: { kind: 'none' },
+  };
+
+  /** `action=query` entries (no prop, no redirects) for colon titles that name a page, captured live. */
+  const pageEntry = (entry: Record<string, unknown>) => () =>
+    Response.json({ batchcomplete: true, query: { pages: [entry] } });
+
+  it('still resolves Star Wars: Episode IV – A New Hope to Star Wars (film) (characterization)', async () => {
+    serve({
+      query: pageEntry({ pageid: 50756790, ns: 0, title: 'Star Wars: Episode IV – A New Hope' }),
+      rest: () => Response.json(STAR_WARS_REST),
+      parse: {
+        parse: {
+          title: 'Star Wars (film)',
+          pageid: 52549,
+          redirects: [{ from: 'Star Wars: Episode IV – A New Hope', to: 'Star Wars (film)' }],
+        },
+      },
+    });
+    const result = await getWikipediaService().getSummary(
+      'Star Wars: Episode IV – A New Hope',
+      'en',
+      createMockContext(),
+    );
+    expect(result).toMatchObject({
+      title: 'Star Wars (film)',
+      pageid: 52549,
+      wikidataQid: 'Q17738',
+      extract:
+        'Star Wars is a 1977 American epic space opera film written and directed by George Lucas.',
+      url: 'https://en.wikipedia.org/wiki/Star_Wars_(film)',
+      redirect: {
+        kind: 'followed',
+        info: { redirected_from: 'Star Wars: Episode IV – A New Hope' },
+      },
+    });
+  });
+
+  it('still reads Star Wars: Episode IV – A New Hope in full as Star Wars (film) (characterization)', async () => {
+    const svc = getWikipediaService();
+    vi.spyOn(svc, 'actionGet').mockResolvedValue({
+      batchcomplete: true,
+      query: {
+        redirects: [{ from: 'Star Wars: Episode IV – A New Hope', to: 'Star Wars (film)' }],
+        pages: [
+          {
+            pageid: 52549,
+            ns: 0,
+            title: 'Star Wars (film)',
+            extract: STAR_WARS_REST.extract_html,
+            fullurl: 'https://en.wikipedia.org/wiki/Star_Wars_(film)',
+            revisions: [{ revid: 1384642098, timestamp: '2026-11-09T08:14:40Z' }],
+          },
+        ],
+      },
+    });
+    const result = await svc.getArticleFull(
+      'Star Wars: Episode IV – A New Hope',
+      'en',
+      createMockContext(),
+    );
+    expect(result).toMatchObject({
+      title: 'Star Wars (film)',
+      pageid: 52549,
+      redirect: { redirected_from: 'Star Wars: Episode IV – A New Hope' },
+    });
+  });
+
+  it('still summarizes File:Example.jpg as no-extract (characterization)', async () => {
+    serve({
+      query: pageEntry({ pageid: 586539, ns: 6, title: 'File:Example.jpg' }),
+      rest: () => Response.json(FILE_EXAMPLE_REST),
+    });
+    const result = await getWikipediaService().getSummary(
+      'File:Example.jpg',
+      'en',
+      createMockContext(),
+    );
+    expect(result).toEqual(FILE_EXAMPLE_SUMMARY);
+  });
+
+  it.each([
+    {
+      title: 'Star Wars: Episode IV – A New Hope',
+      entry: { pageid: 50756790, ns: 0, title: 'Star Wars: Episode IV – A New Hope' },
+      rest: STAR_WARS_REST,
+      sent: ['action=query', 'rest', 'action=parse'],
+    },
+    {
+      title: 'File:Example.jpg',
+      entry: { pageid: 586539, ns: 6, title: 'File:Example.jpg' },
+      rest: FILE_EXAMPLE_REST,
+      sent: ['action=query', 'rest'],
+    },
+    {
+      title: 'Wikipedia:About',
+      entry: { pageid: 63948, ns: 4, title: 'Wikipedia:About' },
+      rest: { type: 'standard', title: 'Wikipedia:About', pageid: 63948, extract: 'About.' },
+      sent: ['action=query', 'rest'],
+    },
+    {
+      title: 'Talk:Cat',
+      entry: { pageid: 17673008, ns: 1, title: 'Talk:Cat' },
+      rest: { type: 'standard', title: 'Talk:Cat', pageid: 17673008, extract: 'Talk.' },
+      sent: ['action=query', 'rest'],
+    },
+  ])(
+    'checks $title before REST and summarizes it from REST',
+    async ({ title, entry, rest, sent }) => {
+      const http = serve({
+        query: pageEntry(entry),
+        rest: () => Response.json(rest),
+        parse: {
+          parse: {
+            title: rest.title,
+            pageid: rest.pageid,
+            redirects: [{ from: title, to: rest.title }],
+          },
+        },
+      });
+      const result = await getWikipediaService().getSummary(title, 'en', createMockContext());
+      expect(result.title).toBe(rest.title);
+      expect(result.pageid).toBe(rest.pageid);
+      expect(endpoints(http)).toEqual(sent);
+    },
+  );
+
+  it.each(['Special relativity', 'Media studies'])(
+    'summarizes %s, a title with no colon, from the one REST request (characterization)',
+    async (title) => {
+      const http = serve({
+        query: pageEntry({ ns: -1, title, special: true }),
+        rest: () => Response.json({ type: 'standard', title, pageid: 1, extract: 'Text.' }),
+      });
+      const result = await getWikipediaService().getSummary(title, 'en', createMockContext());
+      expect(result.title).toBe(title);
+      expect(endpoints(http)).toEqual(['rest']);
+    },
+  );
+
+  it('leaves a colon title the pre-check finds missing to REST, which reports it as before', async () => {
+    const title = 'Zzqx nonexistent: article title';
+    const http = serve({
+      query: pageEntry({ ns: 0, title, missing: true }),
+      rest: restError(404),
+    });
+    const { error } = await settled(() =>
+      getWikipediaService().getSummary(title, 'en', createMockContext()),
+    );
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      message: `No Wikipedia article found for "${title}" in language "en". Use wikipedia_search_articles to find the correct title.`,
+    });
+    expect(endpoints(http)).toEqual(['action=query', 'rest']);
+  });
+
+  /**
+   * Every way the pre-check can fail. Each leaves the title to REST exactly as before the pre-check
+   * existed — the same summary, from one more request — and never fails the call on its own.
+   */
+  const PRECHECK_FAILURES: Array<{ name: string; respond: () => Response | Promise<Response> }> = [
+    { name: 'HTTP 404', respond: () => new Response('Not Found', { status: 404 }) },
+    { name: 'HTTP 403', respond: () => new Response('Forbidden', { status: 403 }) },
+    {
+      name: 'HTTP 429 with a long Retry-After',
+      respond: () =>
+        new Response('Too Many Requests', { status: 429, headers: { 'retry-after': '120' } }),
+    },
+    { name: 'HTTP 400', respond: () => new Response('Bad Request', { status: 400 }) },
+    { name: 'HTTP 410', respond: () => new Response('Gone', { status: 410 }) },
+    { name: 'HTTP 500', respond: () => new Response('Internal Server Error', { status: 500 }) },
+    { name: 'HTTP 503', respond: () => new Response('Service Unavailable', { status: 503 }) },
+    { name: 'HTTP 504', respond: () => new Response('Gateway Timeout', { status: 504 }) },
+    { name: 'a network failure', respond: () => Promise.reject(new TypeError('fetch failed')) },
+    {
+      name: 'an HTML error page',
+      respond: () =>
+        new Response('<!DOCTYPE html><html><body>Wikimedia Error</body></html>', {
+          headers: { 'content-type': 'text/html' },
+        }),
+    },
+    {
+      name: 'a body that is not JSON',
+      respond: () =>
+        new Response('upstream hiccup', { headers: { 'content-type': 'application/json' } }),
+    },
+    { name: 'a JSON null body', respond: () => Response.json(null) },
+    { name: 'a JSON array body', respond: () => Response.json([]) },
+    { name: 'a body without query', respond: () => Response.json({ batchcomplete: true }) },
+    { name: 'a query that is a string', respond: () => Response.json({ query: 'pages' }) },
+    { name: 'pages that are a string', respond: () => Response.json({ query: { pages: 'none' } }) },
+    {
+      name: 'interwiki that is a string',
+      respond: () => Response.json({ query: { interwiki: 'wikt' } }),
+    },
+    {
+      name: 'a special flag that is a string',
+      respond: () =>
+        Response.json({ query: { pages: [{ ns: 6, title: 'File:Example.jpg', special: 'yes' }] } }),
+    },
+    {
+      name: 'a ratelimited envelope',
+      respond: () => Response.json({ error: { code: 'ratelimited', info: 'Too fast.' } }),
+    },
+    {
+      name: 'an unrecognized envelope',
+      respond: () =>
+        Response.json({
+          error: { code: 'internal_api_error_DBQueryError', info: 'A database query error.' },
+        }),
+    },
+  ];
+
+  it.each(PRECHECK_FAILURES)(
+    'summarizes the title from REST as before when the pre-check fails on $name',
+    async ({ respond }) => {
+      const warnings = captureWarnings();
+      const http = serve({ query: respond, rest: () => Response.json(FILE_EXAMPLE_REST) });
+      const result = await getWikipediaService().getSummary(
+        'File:Example.jpg',
+        'en',
+        createMockContext(),
+      );
+      expect(result).toEqual(FILE_EXAMPLE_SUMMARY);
+      // One attempt: the pre-check is never retried.
+      expect(endpoints(http)).toEqual(['action=query', 'rest']);
+      expect(warnings).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('answers Special:Random as before — REST not_found — when the pre-check fails', async () => {
+    captureWarnings();
+    const http = serve({
+      query: () => new Response('Service Unavailable', { status: 503 }),
+      rest: restError(404),
+    });
+    const { error } = await settled(() =>
+      getWikipediaService().getSummary('Special:Random', 'en', createMockContext()),
+    );
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      message:
+        'No Wikipedia article found for "Special:Random" in language "en". Use wikipedia_search_articles to find the correct title.',
+    });
+    expect(endpoints(http)).toEqual(['action=query', 'rest']);
+  });
+
+  it('gives up on a stalled pre-check at its own 5 s attempt and summarizes from REST', async () => {
+    captureWarnings();
+    let precheckAbortReason: unknown;
+    const http = serve({
+      query: (request) =>
+        new Promise<Response>((_resolve, reject) => {
+          request.signal.addEventListener(
+            'abort',
+            () => {
+              precheckAbortReason = request.signal.reason;
+              reject(request.signal.reason);
+            },
+            { once: true },
+          );
+        }),
+      rest: () => Response.json(FILE_EXAMPLE_REST),
+    });
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    const startedAt = Date.now();
+    const outcome = getWikipediaService()
+      .getSummary('File:Example.jpg', 'en', createMockContext())
+      .then(
+        (value) => ({ value, error: undefined }),
+        (error: unknown) => ({ value: undefined, error }),
+      );
+    await vi.runAllTimersAsync();
+    const { value, error } = await outcome;
+
+    expect(error).toBeUndefined();
+    expect(value).toEqual(FILE_EXAMPLE_SUMMARY);
+    expect(Date.now() - startedAt).toBe(5_000);
+    // The pre-check's own attempt timeout ended it, not the 30 s request deadline or a caller signal.
+    expect(precheckAbortReason).toMatchObject({
+      name: 'TimeoutError',
+      message: expect.stringContaining('timed out after 5000ms'),
+    });
+    expect(endpoints(http)).toEqual(['action=query', 'rest']);
+  });
+
+  it('propagates a caller cancellation from inside the pre-check as RequestCancelled, never reaching REST', async () => {
+    const warnings = captureWarnings();
+    const caller = new AbortController();
+    const http = serve({
+      query: () => {
+        caller.abort();
+        return Promise.reject(new DOMException('The operation was aborted.', 'AbortError'));
+      },
+      rest: () => Response.json(FILE_EXAMPLE_REST),
+    });
+    const { value, error } = await settled(() =>
+      getWikipediaService().getSummary(
+        'File:Example.jpg',
+        'en',
+        createMockContext({ signal: caller.signal }),
+      ),
+    );
+
+    expect(value).toBeUndefined();
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.RequestCancelled,
+      message: 'fetch GET https://en.wikipedia.org/…?… was aborted.',
+    });
+    expect(endpoints(http)).toEqual(['action=query']);
+    expect(warnings).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Issues #51 / #52 — spelling suggestion, and description + QID per search/nearby result
 // ---------------------------------------------------------------------------
 
@@ -3430,7 +5201,7 @@ describe('WikipediaService.search — description and QID follow-up (issue #52)'
     // Existing fields are untouched by the merge.
     expect(result.totalResults).toBe(4);
     expect(result.nextOffset).toBe(4);
-    expect(result.descriptionsUnavailable).toBe(false);
+    expect(result.metaUnavailableCount).toBe(0);
 
     const [lookup] = followUpCalls(http);
     const params = lookup ? enActionParams(lookup.request) : undefined;
@@ -3450,7 +5221,7 @@ describe('WikipediaService.search — description and QID follow-up (issue #52)'
     expect(result.results).toHaveLength(0);
     expect(http.calls).toHaveLength(1);
     expect(followUpCalls(http)).toHaveLength(0);
-    expect(result.descriptionsUnavailable).toBe(false);
+    expect(result.metaUnavailableCount).toBe(0);
   });
 
   it('returns the results without the fields, once and without retrying, when the lookup fails', async () => {
@@ -3470,7 +5241,7 @@ describe('WikipediaService.search — description and QID follow-up (issue #52)'
       expect(r).not.toHaveProperty('wikibase_item');
     }
     expect(result.totalResults).toBe(4);
-    expect(result.descriptionsUnavailable).toBe(true);
+    expect(result.metaUnavailableCount).toBe(4);
     expect(warnings).toHaveBeenCalled();
   });
 
@@ -3485,7 +5256,7 @@ describe('WikipediaService.search — description and QID follow-up (issue #52)'
 
     expect(followUpCalls(http)).toHaveLength(1);
     expect(result.results).toHaveLength(4);
-    expect(result.descriptionsUnavailable).toBe(true);
+    expect(result.metaUnavailableCount).toBe(4);
   });
 
   it('treats a malformed JSON body on the lookup as a failed lookup', async () => {
@@ -3500,7 +5271,7 @@ describe('WikipediaService.search — description and QID follow-up (issue #52)'
 
     expect(followUpCalls(http)).toHaveLength(1);
     expect(result.results.map((r) => r.pageid)).toEqual([300, 23862, 3673376, 77]);
-    expect(result.descriptionsUnavailable).toBe(true);
+    expect(result.metaUnavailableCount).toBe(4);
   });
 
   it('propagates a caller cancellation during the lookup instead of degrading', async () => {
@@ -3528,6 +5299,402 @@ describe('WikipediaService.search — description and QID follow-up (issue #52)'
     await expect(svc.search('python', 4, 'en', createMockContext())).rejects.toMatchObject({
       code: JsonRpcErrorCode.ServiceUnavailable,
     });
+  });
+});
+
+describe('WikipediaService.search — 500-result pages and the chunked lookup (issue #84)', () => {
+  beforeEach(() => {
+    initService();
+    useFakeClock();
+  });
+
+  /** The abort reason the lookup budget fires with — what tells it apart from a request timeout. */
+  const BUDGET_MESSAGE = 'Search description lookup ran past its 5000 ms budget.';
+
+  /** Pageids `from` through `to`, inclusive. */
+  const ids = (from: number, to: number) =>
+    Array.from({ length: to - from + 1 }, (_, i) => from + i);
+
+  /** `n` ranked search hits whose pageids run up from `first`. */
+  const hits = (n: number, first: number) =>
+    ids(first, first + n - 1).map((pageid) => ({
+      title: `Page ${pageid}`,
+      pageid,
+      snippet: 'S',
+      wordcount: 10,
+    }));
+
+  /** The pageids one lookup request names, in request order. */
+  const lookupIds = (request: Request) =>
+    (enActionParams(request)?.get('pageids') ?? '').split('|').map(Number);
+
+  /** A lookup reply carrying a description and QID for every pageid the request names. */
+  const metaFor = (request: Request) =>
+    Response.json({
+      query: {
+        pages: lookupIds(request).map((pageid) => ({
+          pageid,
+          title: `Page ${pageid}`,
+          description: `About ${pageid}`,
+          pageprops: { wikibase_item: `Q${pageid}` },
+        })),
+      },
+    });
+
+  type Row = { pageid: number; description?: string; wikibase_item?: string };
+
+  /** Results carrying exactly the metadata {@link metaFor} serves for them. */
+  const withMeta = (results: Row[]) =>
+    results.filter(
+      (r) => r.description === `About ${r.pageid}` && r.wikibase_item === `Q${r.pageid}`,
+    );
+
+  /** Pageids of the results that carry neither field. */
+  const bare = (results: Row[]) =>
+    results.filter((r) => !('description' in r) && !('wikibase_item' in r)).map((r) => r.pageid);
+
+  /**
+   * Answer `request` with `reply` after `delayMs` — never, when it is omitted — or, as `fetch` does,
+   * reject with the abort reason when the request's signal fires first, recording it in `aborts`.
+   */
+  function answer(
+    request: Request,
+    aborts: unknown[],
+    delayMs?: number,
+    reply: () => Response = () => metaFor(request),
+  ): Promise<Response> {
+    return new Promise((resolve, reject) => {
+      let answered = false;
+      const timer =
+        delayMs === undefined
+          ? undefined
+          : setTimeout(() => {
+              answered = true;
+              resolve(reply());
+            }, delayMs);
+      request.signal.addEventListener(
+        'abort',
+        () => {
+          if (answered) return;
+          clearTimeout(timer);
+          aborts.push(request.signal.reason);
+          reject(request.signal.reason);
+        },
+        { once: true },
+      );
+    });
+  }
+
+  /**
+   * Install a fetch fake whose search serves `srlimit` hits from `sroffset`, cut at `totalhits` and
+   * at the 10,000-result window the way CirrusSearch cuts a page, and whose lookups `lookup` answers.
+   * Counts the lookups in flight at once across every search a test runs.
+   */
+  function stubChunkedSearch(
+    lookup: (request: Request) => Response | Promise<Response>,
+    totalhits = 5_000,
+  ) {
+    const lookups: Request[] = [];
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const isSearch = (request: Request) => enActionParams(request)?.get('list') === 'search';
+    const http = createFetchMock([
+      {
+        match: isSearch,
+        respond: (request) => {
+          const params = enActionParams(request);
+          const offset = Number(params?.get('sroffset'));
+          const reachable = Math.min(totalhits, SEARCH_RESULT_WINDOW);
+          const end = Math.min(offset + Number(params?.get('srlimit')), reachable);
+          return Response.json({
+            query: {
+              searchinfo: { totalhits },
+              search: hits(Math.max(0, end - offset), offset + 1),
+            },
+            ...(end < reachable && { continue: { sroffset: end } }),
+          });
+        },
+      },
+      {
+        match: (request) => enActionParams(request)?.has('pageids') === true,
+        respond: async (request) => {
+          lookups.push(request);
+          maxInFlight = Math.max(maxInFlight, ++inFlight);
+          try {
+            return await lookup(request);
+          } finally {
+            inFlight--;
+          }
+        },
+      },
+    ]);
+    http.install();
+    onTestFinished(() => {
+      http.restore();
+    });
+    return {
+      lookups,
+      srlimits: () =>
+        http.calls
+          .filter((call) => isSearch(call.request))
+          .map((call) => enActionParams(call.request)?.get('srlimit')),
+      maxInFlight: () => maxInFlight,
+      resetMaxInFlight: () => {
+        maxInFlight = inFlight;
+      },
+    };
+  }
+
+  /** Settle `promise` on the fake clock, also reporting how much fake time passed before it did. */
+  async function settleTimed<T>(promise: Promise<T>) {
+    let settledAt = Number.NaN;
+    const startedAt = Date.now();
+    const outcome = await settle(
+      promise.finally(() => {
+        settledAt = Date.now();
+      }),
+    );
+    return { ...outcome, elapsedMs: settledAt - startedAt };
+  }
+
+  it('sends srlimit 500 for a 500-result page, and clamps a larger request to it', async () => {
+    const svc = getWikipediaService();
+    const http = stubChunkedSearch(metaFor);
+
+    await settle(svc.search('incategory:"Rivers of France"', 500, 'en', createMockContext()));
+    await settle(svc.search('incategory:"Rivers of France"', 999, 'en', createMockContext()));
+
+    expect(http.srlimits()).toEqual(['500', '500']);
+  });
+
+  it('makes exactly one lookup for a page of 50 or fewer (characterization)', async () => {
+    const svc = getWikipediaService();
+    const http = stubChunkedSearch(metaFor);
+
+    const fifty = await settle(svc.search('q', 50, 'en', createMockContext()));
+    const seven = await settle(svc.search('q', 7, 'en', createMockContext(), 100));
+
+    expect(http.lookups.map(lookupIds)).toEqual([ids(1, 50), ids(101, 107)]);
+    expect(withMeta(fifty.value?.results ?? [])).toHaveLength(50);
+    expect(withMeta(seven.value?.results ?? [])).toHaveLength(7);
+  });
+
+  it('loads description and QID for 500 results from ten 50-id lookups, at most four in flight', async () => {
+    const svc = getWikipediaService();
+    const http = stubChunkedSearch((request) => answer(request, [], 100));
+
+    const { value } = await settle(
+      svc.search('incategory:"Rivers of France"', 500, 'en', createMockContext()),
+    );
+
+    expect(value?.results.map((r) => r.pageid)).toEqual(ids(1, 500));
+    expect(withMeta(value?.results ?? [])).toHaveLength(500);
+    expect(value?.metaUnavailableCount).toBe(0);
+    // Ten chunks in ranking order, each at the 50-id anonymous ceiling, four at a time.
+    expect(http.lookups.map(lookupIds)).toEqual(
+      Array.from({ length: 10 }, (_, i) => ids(i * 50 + 1, i * 50 + 50)),
+    );
+    expect(http.maxInFlight()).toBe(4);
+  });
+
+  it('keeps every other chunk metadata when chunks fail, counting only the failed results', async () => {
+    const svc = getWikipediaService();
+    const warnings = captureWarnings();
+    // Three failure shapes past the first chunk: HTTP 503, an error envelope on 200, a cut body.
+    const failures = new Map<number, () => Response>([
+      [101, () => new Response('upstream overloaded', { status: 503 })],
+      [
+        251,
+        () =>
+          Response.json({
+            error: { code: 'internal_api_error_DBQueryError', info: 'Database query error.' },
+          }),
+      ],
+      [401, () => new Response('{"query":{"pages":[', { status: 200 })],
+    ]);
+    const http = stubChunkedSearch((request) =>
+      (failures.get(lookupIds(request)[0] ?? 0) ?? (() => metaFor(request)))(),
+    );
+
+    const { value } = await settle(svc.search('q', 500, 'en', createMockContext()));
+
+    expect(value?.results).toHaveLength(500);
+    expect(bare(value?.results ?? [])).toEqual([
+      ...ids(101, 150),
+      ...ids(251, 300),
+      ...ids(401, 450),
+    ]);
+    expect(withMeta(value?.results ?? [])).toHaveLength(350);
+    expect(value?.metaUnavailableCount).toBe(150);
+    // No retries: each chunk, failed or not, was requested once.
+    expect(http.lookups).toHaveLength(10);
+    expect(warnings).toHaveBeenCalled();
+  });
+
+  it('counts every result when every chunk fails', async () => {
+    const svc = getWikipediaService();
+    captureWarnings();
+    stubChunkedSearch(() => new Response('upstream overloaded', { status: 503 }));
+
+    const { value } = await settle(svc.search('q', 500, 'en', createMockContext()));
+
+    expect(bare(value?.results ?? [])).toEqual(ids(1, 500));
+    expect(value?.metaUnavailableCount).toBe(500);
+  });
+
+  it('ends the lookup phase at one 5 s budget, queue wait included, failing only unsettled chunks', async () => {
+    const svc = getWikipediaService();
+    captureWarnings();
+    const aborts: unknown[] = [];
+    // Each lookup takes 2 s: four start at once, four more at 2 s, the last two at 4 s — due at 6 s.
+    const http = stubChunkedSearch((request) => answer(request, aborts, 2_000));
+
+    const { value, elapsedMs } = await settleTimed(svc.search('q', 500, 'en', createMockContext()));
+
+    expect(elapsedMs).toBe(5_000);
+    expect(http.lookups).toHaveLength(10);
+    expect(withMeta(value?.results ?? []).map((r) => r.pageid)).toEqual(ids(1, 400));
+    expect(bare(value?.results ?? [])).toEqual(ids(401, 500));
+    expect(value?.metaUnavailableCount).toBe(100);
+    // The budget's own signal ended them, not a per-request timeout.
+    expect(aborts).toEqual([
+      expect.objectContaining({ name: 'TimeoutError', message: BUDGET_MESSAGE }),
+      expect.objectContaining({ name: 'TimeoutError', message: BUDGET_MESSAGE }),
+    ]);
+  });
+
+  it('fails a chunk still queued at the budget without requesting it, then frees every slot', async () => {
+    const svc = getWikipediaService();
+    captureWarnings();
+    const aborts: unknown[] = [];
+    let stalling = true;
+    // Upstream never answers; only the budget can end the four lookups it holds.
+    const http = stubChunkedSearch((request) =>
+      answer(request, aborts, stalling ? undefined : 100),
+    );
+
+    const stalled = await settleTimed(svc.search('q', 500, 'en', createMockContext()));
+
+    expect(stalled.elapsedMs).toBe(5_000);
+    expect(bare(stalled.value?.results ?? [])).toEqual(ids(1, 500));
+    expect(stalled.value?.metaUnavailableCount).toBe(500);
+    // The six chunks queued behind the four stalled lookups never reached upstream.
+    expect(http.lookups).toHaveLength(4);
+    expect(aborts).toHaveLength(4);
+    for (const reason of aborts) {
+      expect(reason).toMatchObject({ name: 'TimeoutError', message: BUDGET_MESSAGE });
+    }
+
+    stalling = false;
+    http.resetMaxInFlight();
+    const next = await settle(svc.search('q', 500, 'en', createMockContext()));
+
+    expect(withMeta(next.value?.results ?? [])).toHaveLength(500);
+    expect(http.lookups).toHaveLength(14);
+    expect(http.maxInFlight()).toBe(4);
+  });
+
+  it('holds overlapping searches to the same four lookup slots between them', async () => {
+    const svc = getWikipediaService();
+    const http = stubChunkedSearch((request) => answer(request, [], 100));
+
+    const { value } = await settle(
+      Promise.all(
+        [0, 1000, 2000].map((offset) => svc.search('q', 500, 'en', createMockContext(), offset)),
+      ),
+    );
+
+    expect(http.lookups).toHaveLength(30);
+    expect(http.maxInFlight()).toBe(4);
+    expect(value).toHaveLength(3);
+    for (const result of value ?? []) {
+      expect(withMeta(result.results)).toHaveLength(500);
+      expect(result.metaUnavailableCount).toBe(0);
+    }
+  });
+
+  it('frees every slot after failed chunks, so the next search again runs four lookups at once', async () => {
+    const svc = getWikipediaService();
+    captureWarnings();
+    let failing = true;
+    const http = stubChunkedSearch((request) =>
+      failing ? new Response('upstream overloaded', { status: 503 }) : answer(request, [], 100),
+    );
+
+    const failed = await settle(svc.search('q', 500, 'en', createMockContext()));
+    expect(failed.value?.metaUnavailableCount).toBe(500);
+
+    failing = false;
+    http.resetMaxInFlight();
+    const next = await settle(svc.search('q', 500, 'en', createMockContext()));
+
+    expect(withMeta(next.value?.results ?? [])).toHaveLength(500);
+    expect(next.value?.metaUnavailableCount).toBe(0);
+    expect(http.lookups).toHaveLength(20);
+    expect(http.maxInFlight()).toBe(4);
+  });
+
+  it('propagates a caller cancellation that lands while chunks are in flight and queued', async () => {
+    const svc = getWikipediaService();
+    const warnings = captureWarnings();
+    const controller = new AbortController();
+    const aborts: unknown[] = [];
+    const http = stubChunkedSearch((request) => {
+      const pending = answer(request, aborts);
+      // The caller leaves once the fourth lookup is in flight, with six more queued behind it.
+      if (http.lookups.length === 4) controller.abort();
+      return pending;
+    });
+
+    const { value, error } = await settle(
+      svc.search('q', 500, 'en', createMockContext({ signal: controller.signal })),
+    );
+
+    expect(value).toBeUndefined();
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.RequestCancelled,
+      message: 'fetch GET https://en.wikipedia.org/…?… was aborted.',
+    });
+    expect(http.lookups).toHaveLength(4);
+    expect(aborts).toHaveLength(4);
+    expect(warnings).not.toHaveBeenCalled();
+  });
+
+  it("drops a cancelled search's queued lookups unrequested, leaving the search ahead of it whole", async () => {
+    const svc = getWikipediaService();
+    const warnings = captureWarnings();
+    const callerB = new AbortController();
+    const reasonB = new DOMException('Caller B went away.', 'AbortError');
+    let answered = 0;
+    // A's lookups hold every slot for 1 s; B's caller leaves as A's first lookup answers.
+    const http = stubChunkedSearch((request) =>
+      answer(request, [], 1_000, () => {
+        if (++answered === 1) callerB.abort(reasonB);
+        return metaFor(request);
+      }),
+    );
+
+    const a = capture(svc.search('a', 500, 'en', createMockContext()));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(http.lookups).toHaveLength(4);
+    const b = capture(
+      svc.search('b', 500, 'en', createMockContext({ signal: callerB.signal }), 1000),
+    );
+    await vi.advanceTimersByTimeAsync(0);
+    // B's ten chunks wait behind A's six.
+    expect(http.lookups).toHaveLength(4);
+
+    await vi.runAllTimersAsync();
+    const [outcomeA, outcomeB] = await Promise.all([a, b]);
+
+    expect(outcomeB.error).toBe(reasonB);
+    expect(withMeta(outcomeA.value?.results ?? [])).toHaveLength(500);
+    // Only A's ten lookups ever reached upstream.
+    expect(http.lookups.map((request) => lookupIds(request)[0])).toEqual(
+      Array.from({ length: 10 }, (_, i) => i * 50 + 1),
+    );
+    expect(http.maxInFlight()).toBe(4);
+    expect(warnings).not.toHaveBeenCalled();
   });
 });
 
@@ -3720,8 +5887,8 @@ const HTML_EXTRACT_TEXT = [
   '    x *= 2',
   '```',
   '',
-  'First',
-  'Second',
+  '- First',
+  '- Second',
 ].join('\n');
 
 /** A full-read response for the alias `NYC`, carrying the redirect target's revision and URL. */
@@ -3771,9 +5938,10 @@ describe('WikipediaService.getArticleFull — HTML-mode extract (issue #48)', ()
       {
         action: 'query',
         titles: 'NYC',
-        prop: 'extracts|info|revisions',
+        prop: 'extracts|info|revisions|pageprops',
         inprop: 'url',
         rvprop: 'ids|timestamp',
+        ppprop: 'disambiguation',
         redirects: 'true',
       },
       ctx,
@@ -3857,6 +6025,7 @@ describe('WikipediaService.getArticleFull — citation fields (issue #53)', () =
       // The revision's own timestamp, never `touched`, which moves without an edit.
       lastModified: '2026-09-21T23:42:01Z',
       url: 'https://en.wikipedia.org/wiki/New_York_City',
+      disambiguation: false,
     });
   });
 
@@ -4052,20 +6221,13 @@ describe('WikipediaService.getSummary — extract_html (issue #48)', () => {
     expect(result.lastModified).toBe('2026-06-22T16:08:35Z');
   });
 
-  it('keeps a disambiguation list one entry per line, apart from the sentence that introduces it', async () => {
+  it('keeps a disambiguation list one bulleted entry per line, apart from the sentence that introduces it (#81)', async () => {
     const svc = getWikipediaService();
-    vi.spyOn(svc, 'restGet').mockResolvedValue({
-      type: 'disambiguation',
-      title: 'Mercury',
-      extract:
-        'Mercury most commonly refers to:Mercury (planet), the closest planet to the Sun\nMercury (element), a chemical element',
-      extract_html:
-        '<p><b>Mercury</b> most commonly refers to:</p><ul><li>Mercury (planet), the closest planet to the Sun</li>\n<li>Mercury (element), a chemical element</li></ul>',
-    });
+    vi.spyOn(svc, 'restGet').mockResolvedValue(mercurySummary());
 
     const result = await svc.getSummary('Mercury', 'en', createMockContext());
     expect(result.extract).toBe(
-      'Mercury most commonly refers to:\n\nMercury (planet), the closest planet to the Sun\nMercury (element), a chemical element',
+      'Mercury most commonly refers to:\n\n- Mercury (planet), the closest planet to the Sun\n- Mercury (element), a chemical element\n- Mercury (mythology), a Roman deity',
     );
   });
 
@@ -4090,6 +6252,352 @@ describe('WikipediaService.getSummary — extract_html (issue #48)', () => {
     await expect(svc.getSummary('Main Page', 'en', createMockContext())).resolves.toMatchObject({
       extract: 'Welcome to Wikipedia, the free encyclopedia.',
     });
+  });
+});
+
+describe('resolvesWithoutRedirect — the summary redirect gate (issue #86)', () => {
+  it.each([
+    { input: 'Eiffel Tower', resolved: 'Eiffel Tower', skips: true },
+    { input: 'seine', resolved: 'Seine', skips: true },
+    { input: 'Seine#Course', resolved: 'Seine', skips: true },
+    { input: 'seine#Course#x', resolved: 'Seine', skips: true },
+    { input: 'New  York   City', resolved: 'New York City', skips: true },
+    { input: 'New_York__City', resolved: 'New York City', skips: true },
+    // MediaWiki folds its whole title-whitespace set, runs mixed with underscores included.
+    { input: 'New _\u00A0York\u3000City', resolved: 'New York City', skips: true },
+    { input: '  Seine_ ', resolved: 'Seine', skips: true },
+    { input: 'Cafe\u0301', resolved: 'Café', skips: true },
+    { input: 'école', resolved: 'École', skips: true },
+    { input: '\u{10428}x', resolved: '\u{10400}x', skips: true },
+    // MediaWiki keeps ß and Georgian letters as written; their JS uppercase is never trusted.
+    { input: 'ßtest', resolved: 'ßtest', skips: true },
+    { input: 'ßtest', resolved: 'SStest', skips: false },
+    { input: 'საქართველო', resolved: 'საქართველო', skips: true },
+    // MediaWiki titlecases these (ǆ → ǅ, ﬀ → Ff), which uppercasing does not produce: one lookup.
+    { input: 'ǆungla', resolved: 'ǅungla', skips: false },
+    { input: 'ﬀoo', resolved: 'Ffoo', skips: false },
+    // An edition that does not capitalize first letters resolves the title as written.
+    { input: 'seine', resolved: 'seine', skips: true },
+    { input: 'SEINE', resolved: 'Seine', skips: false },
+    // A BOM is not title whitespace, so this names a different page.
+    { input: 'Seine\uFEFF', resolved: 'Seine', skips: false },
+    { input: 'category:physics', resolved: 'Category:Physics', skips: false },
+    { input: '2018 Paris flood', resolved: 'Seine', skips: false },
+    { input: 'NYC', resolved: 'New York City', skips: false },
+  ])('$input → $resolved needs no lookup: $skips', ({ input, resolved, skips }) => {
+    expect(resolvesWithoutRedirect(input, resolved)).toBe(skips);
+  });
+});
+
+describe('WikipediaService.getSummary — redirect lookup and canonical URL (issue #86)', () => {
+  beforeEach(() => {
+    initService();
+  });
+
+  const SEINE_SUMMARY = {
+    type: 'standard',
+    title: 'Seine',
+    pageid: 54006,
+    extract: 'The Seine is a river in northern France.',
+    content_urls: { desktop: { page: 'https://en.wikipedia.org/wiki/Seine' } },
+    revision: '1384649318',
+    timestamp: '2026-11-09T09:42:16Z',
+  };
+
+  /** The lookup's answer for `2018 Paris flood`, trimmed from a live `prop=tocdata` capture. */
+  const PARIS_FLOOD_TOC = {
+    parse: {
+      title: 'Seine',
+      pageid: 54006,
+      redirects: [{ from: '2018 Paris flood', to: 'Seine', tofragment: '2018 Paris flood' }],
+      tocdata: {
+        sections: [
+          { tocLevel: 1, hLevel: 2, line: 'Course', number: '2', index: '2', anchor: 'Course' },
+          {
+            tocLevel: 2,
+            hLevel: 3,
+            line: 'Flooding',
+            number: '4.1',
+            index: '6',
+            anchor: 'Flooding',
+          },
+          {
+            tocLevel: 2,
+            hLevel: 3,
+            line: '2018 Paris flood',
+            number: '4.2',
+            index: '7',
+            anchor: '2018_Paris_flood',
+          },
+        ],
+      },
+    },
+  };
+
+  const isRestSummary = (url: URL) => url.pathname.startsWith('/api/rest_v1/page/summary/');
+  const isLookup = (url: URL) =>
+    url.pathname === '/w/api.php' && url.searchParams.get('action') === 'parse';
+
+  /** Answer the REST summary with `rest` and the redirect lookup with `lookup`, at the fetch seam. */
+  function stubSummary(
+    rest: unknown,
+    lookup: (request: Request) => Response | Promise<Response> = () =>
+      Response.json(PARIS_FLOOD_TOC),
+  ) {
+    const http = createFetchMock([
+      {
+        match: (request) => isRestSummary(new URL(request.url)),
+        respond: () => Response.json(rest),
+      },
+      { match: (request) => isLookup(new URL(request.url)), respond: lookup },
+    ]);
+    http.install();
+    onTestFinished(() => {
+      http.restore();
+    });
+    return http;
+  }
+
+  it('makes the one REST request when the input already names the article (characterization)', async () => {
+    const http = stubSummary(SEINE_SUMMARY);
+    const result = await getWikipediaService().getSummary('Seine', 'en', createMockContext());
+    expect(http.calls).toHaveLength(1);
+    expect(new URL(http.calls[0]!.request.url).pathname).toBe('/api/rest_v1/page/summary/Seine');
+    expect(result).toMatchObject({
+      title: 'Seine',
+      pageType: 'standard',
+      extract: 'The Seine is a river in northern France.',
+      url: 'https://en.wikipedia.org/wiki/Seine',
+    });
+  });
+
+  it('reports no redirect without a lookup for an input that only folds to the title', async () => {
+    const http = stubSummary(SEINE_SUMMARY);
+    const result = await getWikipediaService().getSummary(
+      'seine#Course',
+      'en',
+      createMockContext(),
+    );
+    expect(result.redirect).toEqual({ kind: 'none' });
+    expect(http.calls).toHaveLength(1);
+  });
+
+  it('reads a section redirect and its verified index from one lookup request', async () => {
+    const http = stubSummary(SEINE_SUMMARY);
+    const result = await getWikipediaService().getSummary(
+      '2018 Paris flood',
+      'en',
+      createMockContext(),
+    );
+    expect(result.title).toBe('Seine');
+    expect(result.redirect).toEqual({
+      kind: 'followed',
+      info: {
+        redirected_from: '2018 Paris flood',
+        redirect_section: '2018 Paris flood',
+        redirect_section_index: 7,
+      },
+    });
+    expect(http.calls).toHaveLength(2);
+    expect(Object.fromEntries(new URL(http.calls[1]!.request.url).searchParams)).toEqual({
+      format: 'json',
+      formatversion: '2',
+      action: 'parse',
+      page: '2018 Paris flood',
+      prop: 'tocdata',
+      redirects: 'true',
+    });
+  });
+
+  it('reads a plain redirect with no section', async () => {
+    stubSummary({ ...SEINE_SUMMARY, title: 'New York City' }, () =>
+      Response.json({
+        parse: { title: 'New York City', redirects: [{ from: 'NYC', to: 'New York City' }] },
+      }),
+    );
+    const result = await getWikipediaService().getSummary('NYC', 'en', createMockContext());
+    expect(result.redirect).toEqual({ kind: 'followed', info: { redirected_from: 'NYC' } });
+  });
+
+  it('names the first alias of a redirect chain and the fragment its last hop carries', async () => {
+    stubSummary(SEINE_SUMMARY, () =>
+      Response.json({
+        parse: {
+          ...PARIS_FLOOD_TOC.parse,
+          redirects: [
+            { from: 'Paris floods', to: '2018 Paris flood' },
+            { from: '2018 Paris flood', to: 'Seine', tofragment: 'Flooding' },
+          ],
+        },
+      }),
+    );
+    const result = await getWikipediaService().getSummary(
+      'Paris floods',
+      'en',
+      createMockContext(),
+    );
+    expect(result.redirect).toEqual({
+      kind: 'followed',
+      info: {
+        redirected_from: 'Paris floods',
+        redirect_section: 'Flooding',
+        redirect_section_index: 6,
+      },
+    });
+  });
+
+  it.each([
+    { name: 'no anchor', sections: PARIS_FLOOD_TOC.parse.tocdata.sections.slice(0, 2) },
+    {
+      name: 'two anchors',
+      sections: [
+        ...PARIS_FLOOD_TOC.parse.tocdata.sections,
+        { line: '2018 Paris flood', index: '9', anchor: '2018_Paris_flood' },
+      ],
+    },
+  ])('keeps the raw fragment and no index when $name match it', async ({ sections }) => {
+    stubSummary(SEINE_SUMMARY, () =>
+      Response.json({ parse: { ...PARIS_FLOOD_TOC.parse, tocdata: { sections } } }),
+    );
+    const result = await getWikipediaService().getSummary(
+      '2018 Paris flood',
+      'en',
+      createMockContext(),
+    );
+    expect(result.redirect).toEqual({
+      kind: 'followed',
+      info: { redirected_from: '2018 Paris flood', redirect_section: '2018 Paris flood' },
+    });
+  });
+
+  it('reports no redirect when the lookup finds none for a title the gate does not fold', async () => {
+    const http = stubSummary(
+      { ...SEINE_SUMMARY, type: 'no-extract', title: 'Category:Physics', extract: '' },
+      () => Response.json({ parse: { title: 'Category:Physics', pageid: 44 } }),
+    );
+    // A colon title is checked for a namespace that holds no pages before REST (issue #87).
+    http.route({
+      match: (request) => new URL(request.url).searchParams.get('action') === 'query',
+      respond: () =>
+        Response.json({ query: { pages: [{ pageid: 44, ns: 14, title: 'Category:Physics' }] } }),
+    });
+    const result = await getWikipediaService().getSummary(
+      'category:physics',
+      'en',
+      createMockContext(),
+    );
+    expect(result.redirect).toEqual({ kind: 'none' });
+    expect(http.calls.map((call) => endpointOf(call.request))).toEqual([
+      'action=query',
+      'rest',
+      'action=parse',
+    ]);
+  });
+
+  it('gives up on a stalled lookup at its own 5 s attempt, leaving the summary answered', async () => {
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    let lookupAbortReason: unknown;
+    stubSummary(
+      SEINE_SUMMARY,
+      (request) =>
+        new Promise<Response>((_resolve, reject) => {
+          request.signal.addEventListener(
+            'abort',
+            () => {
+              lookupAbortReason = request.signal.reason;
+              reject(request.signal.reason);
+            },
+            { once: true },
+          );
+        }),
+    );
+    const startedAt = Date.now();
+    const outcome = getWikipediaService()
+      .getSummary('2018 Paris flood', 'en', createMockContext())
+      .then(
+        (value) => ({ value, error: undefined }),
+        (error: unknown) => ({ value: undefined, error }),
+      );
+    await vi.runAllTimersAsync();
+    const { value, error } = await outcome;
+
+    expect(error).toBeUndefined();
+    expect(value).toMatchObject({ title: 'Seine', redirect: { kind: 'unchecked' } });
+    expect(Date.now() - startedAt).toBe(5_000);
+    // The lookup's own attempt timeout ended it, not the 30 s request deadline or a caller signal.
+    expect(lookupAbortReason).toMatchObject({
+      name: 'TimeoutError',
+      message: expect.stringContaining('timed out after 5000ms'),
+    });
+  });
+
+  /**
+   * The REST summary's `content_urls` page beside the `fullurl` MediaWiki reports
+   * (`prop=info&inprop=url`, captured live) for the same title. REST encodes the title with
+   * `encodeURIComponent`, so the two differ wherever `/ , : @ '` appear.
+   */
+  const SUMMARY_URLS = [
+    ['en', 'AC/DC', 'https://en.wikipedia.org/wiki/AC%2FDC', 'https://en.wikipedia.org/wiki/AC/DC'],
+    [
+      'en',
+      'Washington, D.C.',
+      'https://en.wikipedia.org/wiki/Washington%2C_D.C.',
+      'https://en.wikipedia.org/wiki/Washington,_D.C.',
+    ],
+    [
+      'en',
+      "Ender's Game",
+      "https://en.wikipedia.org/wiki/Ender's_Game",
+      'https://en.wikipedia.org/wiki/Ender%27s_Game',
+    ],
+    ['en', 'C++', 'https://en.wikipedia.org/wiki/C%2B%2B', 'https://en.wikipedia.org/wiki/C%2B%2B'],
+    ['en', '100%', 'https://en.wikipedia.org/wiki/100%25', 'https://en.wikipedia.org/wiki/100%25'],
+    ['en', 'AT&T', 'https://en.wikipedia.org/wiki/AT%26T', 'https://en.wikipedia.org/wiki/AT%26T'],
+    [
+      'en',
+      '"Weird Al" Yankovic',
+      'https://en.wikipedia.org/wiki/%22Weird_Al%22_Yankovic',
+      'https://en.wikipedia.org/wiki/%22Weird_Al%22_Yankovic',
+    ],
+    [
+      'en',
+      'São Paulo',
+      'https://en.wikipedia.org/wiki/S%C3%A3o_Paulo',
+      'https://en.wikipedia.org/wiki/S%C3%A3o_Paulo',
+    ],
+    [
+      'fr',
+      "L'Étranger",
+      "https://fr.wikipedia.org/wiki/L'%C3%89tranger",
+      'https://fr.wikipedia.org/wiki/L%27%C3%89tranger',
+    ],
+  ] as const;
+
+  it.each(SUMMARY_URLS)('cites %s %s at its fullurl', async (language, title, restUrl, fullurl) => {
+    const svc = getWikipediaService();
+    vi.spyOn(svc, 'restGet').mockResolvedValue({
+      type: 'standard',
+      title,
+      extract: 'Text.',
+      content_urls: { desktop: { page: restUrl } },
+    });
+    const result = await svc.getSummary(title, language, createMockContext());
+    expect(result.url).toBe(fullurl);
+  });
+
+  it('keeps the upstream URL under a single-instance override', async () => {
+    const svc = initService('https://mirror.example.org/');
+    vi.spyOn(svc, 'restGet').mockResolvedValue({
+      type: 'standard',
+      title: 'AC/DC',
+      extract: 'Text.',
+      content_urls: { desktop: { page: 'https://mirror.example.org/wiki/AC%2FDC' } },
+    });
+    const result = await svc.getSummary('AC/DC', 'en', createMockContext());
+    expect(result.url).toBe('https://mirror.example.org/wiki/AC%2FDC');
   });
 });
 
@@ -4204,7 +6712,11 @@ describe('WikipediaService — contract envelopes stay single-request (issue #55
 
   it('missingtitle: one request, NotFound', async () => {
     const svc = getWikipediaService();
-    const { calls } = stubUpstream(anyActionRequest, envelope('missingtitle'));
+    // The parse alone: its page-property lookup is a separate request with its own failure mode.
+    const { calls } = stubUpstream(
+      (url) => url.searchParams.get('action') === 'parse',
+      envelope('missingtitle'),
+    );
 
     const { error } = await settle(
       svc.getArticleSection('Nonexistent', 1, 'en', createMockContext()),
@@ -4219,7 +6731,10 @@ describe('WikipediaService — contract envelopes stay single-request (issue #55
 
   it('nosuchsection: one request, ValidationError naming the index', async () => {
     const svc = getWikipediaService();
-    const { calls } = stubUpstream(anyActionRequest, envelope('nosuchsection'));
+    const { calls } = stubUpstream(
+      (url) => url.searchParams.get('action') === 'parse',
+      envelope('nosuchsection'),
+    );
 
     const { error } = await settle(svc.getArticleSection('Python', 99, 'en', createMockContext()));
 
@@ -4330,7 +6845,7 @@ describe('WikipediaService — contract envelopes stay single-request (issue #55
 
     expect(http.calls.filter((call) => lookupRequest(new URL(call.request.url)))).toHaveLength(1);
     expect(value?.results.map((r) => r.pageid)).toEqual([24]);
-    expect(value?.descriptionsUnavailable).toBe(true);
+    expect(value?.metaUnavailableCount).toBe(1);
   });
 });
 
@@ -4402,7 +6917,7 @@ describe('WikipediaService — transient envelopes are retried (issue #55)', () 
     const { value } = await settle(svc.search('xyzzy', 10, 'en', createMockContext()));
 
     expect(calls()).toBe(2);
-    expect(value).toMatchObject({ results: [], totalResults: 0, descriptionsUnavailable: false });
+    expect(value).toMatchObject({ results: [], totalResults: 0, metaUnavailableCount: 0 });
   });
 
   const callers: Array<{
@@ -4410,6 +6925,8 @@ describe('WikipediaService — transient envelopes are retried (issue #55)', () 
     success: unknown;
     run: (svc: WikipediaService) => Promise<unknown>;
     expected: Record<string, unknown>;
+    /** The request under test, when the caller sends a side request beside it. */
+    request?: (url: URL) => boolean;
   }> = [
     {
       name: 'getArticleFull',
@@ -4433,6 +6950,7 @@ describe('WikipediaService — transient envelopes are retried (issue #55)', () 
       success: { parse: { title: 'Python', pageid: 23862, revid: 5, text: '<p>Body.</p>' } },
       run: (svc) => svc.getArticleSection('Python', 0, 'en', createMockContext()),
       expected: { title: 'Python', content: 'Body.' },
+      request: (url) => url.searchParams.get('action') === 'parse',
     },
     {
       name: 'getSections',
@@ -4476,9 +6994,13 @@ describe('WikipediaService — transient envelopes are retried (issue #55)', () 
     },
   ];
 
-  it.each(callers)('$name picks up the retry', async ({ success, run, expected }) => {
+  it.each(callers)('$name picks up the retry', async ({ success, run, expected, request }) => {
     const svc = getWikipediaService();
-    const { calls } = stubUpstream(anyActionRequest, envelope('ratelimited'), okReply(success));
+    const { calls } = stubUpstream(
+      request ?? anyActionRequest,
+      envelope('ratelimited'),
+      okReply(success),
+    );
 
     const { value, error } = await settle(run(svc));
 
@@ -4511,7 +7033,7 @@ describe('WikipediaService — transient envelopes are retried (issue #55)', () 
   it('retries the nested full-article read behind the section-list fallback', async () => {
     const svc = getWikipediaService();
     const extractsRequest = (url: URL) =>
-      url.searchParams.get('prop') === 'extracts|info|revisions';
+      url.searchParams.get('prop') === 'extracts|info|revisions|pageprops';
     let extractsCalls = 0;
     const http = createFetchMock([
       {
@@ -4884,9 +7406,9 @@ describe('extractReferences — footnote shapes (#72)', () => {
   // A reference list nested in a footnote is not a footnote list of its own: the renderer drops it
   // with every other `ol.references`, and its entries are not listed twice.
   it('treats a list inside a footnote as its text, not as more footnotes', () => {
-    const html = `<ol class="references">${footnote('cite_note-1', 'Two sources:<ul><li>One.</li><li>Two.</li></ul>')}<li id="cite_note-2"><span class="reference-text">Next.<ol class="references"><li id="cite_note-inner">Nested.</li></ol></span></li></ol>`;
+    const html = `<ol class="references">${footnote('cite_note-1', 'Two sources:<ul><li>One.<ol><li>Page 2.</li></ol></li><li>Two.</li></ul>')}<li id="cite_note-2"><span class="reference-text">Next.<ol class="references"><li id="cite_note-inner">Nested.</li></ol></span></li></ol>`;
     expect(extractReferences(html).references.map((entry) => [entry.id, entry.text])).toEqual([
-      ['cite_note-1', 'Two sources:\n\nOne.\nTwo.'],
+      ['cite_note-1', 'Two sources:\n\n- One.\n  1. Page 2.\n- Two.'],
       ['cite_note-2', 'Next.'],
     ]);
   });

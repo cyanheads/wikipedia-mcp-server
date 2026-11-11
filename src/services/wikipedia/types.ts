@@ -17,14 +17,29 @@ export type ActionApiErrorRaw = { code?: string; info?: string };
 export type ActionRedirectRaw = { from?: string; to?: string; tofragment?: string };
 
 /**
- * An `action=query` page entry for a title MediaWiki cannot name a page with (`Foo[bar]`, `A<B`).
- * The entry carries `invalid` with no `missing` key, so a `missing !== undefined` test alone reads
- * it as an existing page and reports it as empty rather than as unnameable.
+ * The flags an `action=query` page entry carries for a title that can name no page. A
+ * `missing !== undefined` test alone reads either kind as an existing, empty page.
  */
-export type InvalidPageRaw = {
+export type UnnameablePageRaw = {
+  /**
+   * A title MediaWiki cannot name a page with (`Foo[bar]`, `A<B`, `Talk:`), with `invalidreason`
+   * saying why. The entry carries no `missing` key.
+   */
   invalid?: boolean;
   invalidreason?: string;
+  /**
+   * A title in a namespace that holds no pages: Special: (ns −1) or Media: (ns −2), under any of
+   * the edition's names for them. `missing` rides beside it when the special page or file does
+   * not exist.
+   */
+  special?: boolean;
 };
+
+/**
+ * One `query.interwiki` entry: a title whose prefix links to another wiki (`wikt:cat`, `fr:Chat`).
+ * The API lists such a title here instead of returning a page entry for it.
+ */
+export type ActionInterwikiRaw = { title?: string; iw?: string };
 
 /** REST API summary response shape (partial — only fields we use). */
 export type RestSummaryRaw = {
@@ -88,7 +103,8 @@ export type ActionSearchRaw = {
 };
 
 /**
- * Action API full-read response: `prop=extracts|info|revisions&inprop=url&rvprop=ids|timestamp`.
+ * Action API full-read response:
+ * `prop=extracts|info|revisions|pageprops&inprop=url&rvprop=ids|timestamp&ppprop=disambiguation`.
  *
  * Without `explaintext`, `extract` is TextExtracts' HTML mode — bare `<hN>` headings, inline
  * formatting and `<sup>`/`<sub>` kept, tables and infoboxes already stripped upstream — which the
@@ -97,9 +113,10 @@ export type ActionSearchRaw = {
 export type ActionExtractsRaw = {
   query?: {
     redirects?: ActionRedirectRaw[];
+    interwiki?: ActionInterwikiRaw[];
     pages?: Record<
       string,
-      InvalidPageRaw & {
+      UnnameablePageRaw & {
         pageid?: number;
         title?: string;
         extract?: string;
@@ -112,6 +129,12 @@ export type ActionExtractsRaw = {
          * cache-invalidation time and moves without an edit.
          */
         revisions?: Array<{ revid?: number; timestamp?: string }>;
+        /**
+         * `prop=pageprops&ppprop=disambiguation`: present, as `{ disambiguation: "" }`, only on a
+         * page carrying the `disambiguation` page property — the one the REST summary's `type`
+         * reads. Every other page has no `pageprops` key at all.
+         */
+        pageprops?: { disambiguation?: string };
       }
     >;
   };
@@ -119,7 +142,8 @@ export type ActionExtractsRaw = {
 };
 
 /**
- * Action API parse response for the table of contents (`prop=tocdata`).
+ * Action API parse response for the table of contents (`prop=tocdata`), with the page's
+ * categories and page properties when the request adds `categories|properties`.
  *
  * Replaces the deprecated `prop=sections`, whose entries lived at `parse.sections[]`. `tocdata`
  * nests them under `parse.tocdata.sections[]` and renames several fields: `toclevel`→`tocLevel`,
@@ -131,6 +155,17 @@ export type ActionSectionsRaw = {
     redirects?: ActionRedirectRaw[];
     title?: string;
     pageid?: number;
+    /**
+     * `prop=categories`, hidden maintenance categories included. `category` is the database key —
+     * no namespace prefix, underscores for spaces (`1648_treaties`); `hidden: true` appears only on
+     * a hidden category, and a visible one carries no `hidden` key.
+     */
+    categories?: Array<{ sortkey?: string; category?: string; hidden?: boolean }>;
+    /**
+     * `prop=properties` (formatversion=2: an object). `disambiguation` is present, as `""`, only on
+     * a page MediaWiki marks as a disambiguation page.
+     */
+    properties?: { disambiguation?: string };
     tocdata?: {
       sections?: Array<{
         tocLevel?: number;
@@ -174,9 +209,10 @@ export type ActionParseTextRaw = {
  */
 export type ActionLangLinksRaw = {
   query?: {
+    interwiki?: ActionInterwikiRaw[];
     pages?: Record<
       string,
-      InvalidPageRaw & {
+      UnnameablePageRaw & {
         pageid?: number;
         /** Resolved article title — the redirect target when the request followed one. */
         title?: string;

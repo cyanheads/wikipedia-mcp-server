@@ -11,6 +11,7 @@ import {
   escapeMarkdown,
   escapeMarkdownOutsideBlocks,
   formatTablePage,
+  quotedNotice,
   urlLink,
 } from '@/mcp-server/tools/utils/escape-markdown.js';
 import {
@@ -25,16 +26,20 @@ import {
   tocLineToPlainText,
 } from '@/services/wikipedia/wikipedia-service.js';
 
+/** The notice every read of a disambiguation page carries, full or section. */
+const DISAMBIGUATION_NOTICE =
+  'This is a disambiguation page: it lists the articles the title can refer to rather than covering one topic. Use wikipedia_search_articles to find the intended article, or pass a candidate title the page lists to wikipedia_get_article.';
+
 export const wikipediaGetArticle = tool('wikipedia_get_article', {
   title: 'Get Wikipedia Article',
   description:
-    'Fetch article content as clean plain text. Without section_index: returns the full article with == Section == markers preserved for structure — or, when the article exceeds the size budget, a compact section outline (truncated: true) that points to wikipedia_get_sections plus a section_index read instead of the full text. With section_index (from wikipedia_get_sections): returns that section and every subsection nested under it, each heading above its own body. section_index 0 is the lead section, the text above the first heading, which is the full prose wikipedia_get_summary returns only a truncated fragment of. Section-targeted reads are faster and smaller when only part of the article is needed. Both paths keep superscripts and subscripts apart from the text beside them (10²³, H₂O), render formulas as their TeX, and render code samples as fenced blocks with their indentation intact. A section read also renders data tables as pipe-delimited rows (header row first) and infoboxes as "label: value" lines; a table too large to include leaves a "[table omitted: N rows (table T)]" marker. Pass table_index: T with section_index to read only that table in complete row pages whose table text fits within 40,000 UTF-8 bytes on both surfaces. Follow next_cursor as cursor with the same inputs to continue at the pinned revision; caption/header/delimiter appear once. An indivisible oversized row or first-page caption/header is returned alone with oversized_row: true. The full-article path carries no data tables or infoboxes, so read the section for those. Phylogenetic clade trees render as fenced, indented branches, with unnamed forks preserved; unparseable trees leave "[table omitted: unparseable clade]". Clade trees have no table_index. In a section read, tables used only for layout, such as multi-column lists, keep their content as ordinary text; the full-article path drops them, so read the section for those lists. Page furniture is omitted as well — maintenance banners, sister-project and library-resource boxes, portal bars, and spoken-article notices — while a hatnote naming a related article is kept. Every read returns the canonical article URL and the ID of the revision it was read from, for citation; a full read also returns that revision\'s timestamp. Redirect pages are followed automatically, and the citation fields name the target article.',
+    'Fetch article content as clean plain text. Without section_index: returns the full article with == Section == markers preserved for structure — or, when the article exceeds the size budget, a compact section outline (truncated: true) that points to wikipedia_get_sections plus a section_index read instead of the full text. With section_index (from wikipedia_get_sections): returns that section and every subsection nested under it, each heading above its own body. section_index 0 is the lead section, the text above the first heading, which is the full prose wikipedia_get_summary returns only a truncated fragment of. Section-targeted reads are faster and smaller when only part of the article is needed. Both paths keep superscripts and subscripts apart from the text beside them (10²³, H₂O), render formulas as their TeX, render code samples as fenced blocks with their indentation intact, and render list items as "- " or numbered "N." lines indented two spaces per nesting level, the indent capped at 16 levels. A section read also renders data tables as pipe-delimited rows (header row first) and infoboxes as "label: value" lines; a table too large to include leaves a "[table omitted: N rows (table T)]" marker. Pass table_index: T with section_index to read only that table in complete row pages whose table text fits within 40,000 UTF-8 bytes on both surfaces. Follow next_cursor as cursor with the same inputs to continue at the pinned revision; caption/header/delimiter appear once. An indivisible oversized row or first-page caption/header is returned alone with oversized_row: true. The full-article path carries no data tables or infoboxes, so read the section for those. Phylogenetic clade trees render as fenced, indented branches, with unnamed forks preserved; unparseable trees leave "[table omitted: unparseable clade]". Clade trees have no table_index. In a section read, tables used only for layout, such as multi-column lists, keep their content as ordinary text; the full-article path drops them, so read the section for those lists. Page furniture is omitted as well — maintenance banners, sister-project and library-resource boxes, portal bars, and spoken-article notices — while a hatnote naming a related article is kept. Every read returns the canonical article URL and the ID of the revision it was read from, for citation; a full read also returns that revision\'s timestamp. Redirect pages are followed automatically, and the citation fields name the target article.',
   annotations: { readOnlyHint: true, openWorldHint: true },
   input: z.object({
     title: z
       .string()
       .describe(
-        'Article title (e.g. "Python (programming language)"). A trailing #fragment is accepted and ignored; the characters < > [ ] { } and | cannot appear in a Wikipedia page name.',
+        'Article title (e.g. "Python (programming language)"). A trailing #fragment is accepted and ignored; the characters < > [ ] { } and | cannot appear in a Wikipedia page name. Special: and Media: titles, and interwiki links such as "wikt:cat", name no page.',
       ),
     section_index: z
       .number()
@@ -106,7 +111,7 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
     content: z
       .string()
       .describe(
-        'Plain-text article content. Both full articles and section reads carry == Section == markers above the text each one heads, code samples as ``` fenced blocks, and superscripts and subscripts as Unicode characters (10²³, H₂O), or as ^x / ^(…) and _x / _(…) where a character has none. Section reads also carry data tables as | cell | cell | rows with a | --- | row under the header. When truncated is true, this instead carries a section outline (heading names and byte sizes) plus a pointer to the targeted-read path.',
+        'Plain-text article content. Both full articles and section reads carry == Section == markers above the text each one heads, code samples as ``` fenced blocks, list items as "- " or "N." lines indented two spaces per nesting level, and superscripts and subscripts as Unicode characters (10²³, H₂O), or as ^x / ^(…) and _x / _(…) where a character has none. Section reads also carry data tables as | cell | cell | rows with a | --- | row under the header. When truncated is true, this instead carries a section outline (heading names and byte sizes) plus a pointer to the targeted-read path.',
       ),
     section_title: z
       .string()
@@ -115,6 +120,12 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
         'Section title when section_index was provided — "Introduction" for the lead, which has no heading of its own. Absent for full-article reads.',
       ),
     content_type: z.string().describe('Content type: "full_article" or "section".'),
+    page_type: z
+      .literal('disambiguation')
+      .optional()
+      .describe(
+        'Present only on a disambiguation page — one that lists the articles a title can refer to — and then "disambiguation", the value wikipedia_get_summary reports for it.',
+      ),
     truncated: z
       .boolean()
       .describe(
@@ -157,7 +168,13 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
     notice: z
       .string()
       .optional()
-      .describe('Redirect guidance or disclosure that optional TOC verification was unavailable.'),
+      .describe(
+        'Disambiguation-page guidance, redirect guidance, or disclosure that an optional lookup (TOC verification, the disambiguation check) was unavailable.',
+      ),
+  },
+  enrichmentTrailer: {
+    // The redirect guidance quotes the upstream section an alias targets.
+    notice: { render: quotedNotice },
   },
 
   errors: [
@@ -194,7 +211,7 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
     {
       reason: 'invalid_title',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The title contains characters MediaWiki cannot name a page with.',
+      when: 'The title can name no page: it contains characters MediaWiki forbids in a page name, is a Special: or Media: title in any edition\'s spelling, or is an interwiki link such as "wikt:cat".',
       recovery:
         'Use wikipedia_search_articles to find the exact article title and pass it verbatim.',
     },
@@ -298,6 +315,11 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
         sectionTitle: result.sectionTitle,
         contentLength: result.content.length,
       });
+      if (result.disambiguation) ctx.enrich.notice(DISAMBIGUATION_NOTICE);
+      else if (result.disambiguation === undefined)
+        ctx.enrich.notice(
+          'Whether this page is a disambiguation page could not be checked because the optional page-property lookup was unavailable. Call wikipedia_get_summary to check its page_type.',
+        );
       return {
         title: result.title,
         pageid: result.pageid,
@@ -305,6 +327,7 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
         ...result.tablePage,
         section_title: result.sectionTitle,
         content_type: 'section',
+        ...(result.disambiguation && { page_type: 'disambiguation' as const }),
         truncated: false,
         ...(result.redirect && {
           redirected_from: result.redirect.redirected_from,
@@ -367,6 +390,7 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
     const toc = needsToc ? await svc.getArticleToc(result.title, language, ctx) : undefined;
     const redirect = result.redirects ? redirectInfo(result.redirects, toc) : result.redirect;
     const notices: string[] = [];
+    if (result.disambiguation) notices.push(DISAMBIGUATION_NOTICE);
     if (needsToc && !toc)
       notices.push(
         'Section indices could not be verified because the optional table of contents lookup was unavailable. Call wikipedia_get_sections to retry.',
@@ -396,6 +420,7 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
       revision_id: result.revisionId,
       last_modified: result.lastModified,
     };
+    const pageType = result.disambiguation ? { page_type: 'disambiguation' as const } : {};
 
     if (overflow.kind === 'outline') {
       const indices = new Map<string, number>();
@@ -442,6 +467,7 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
         pageid: result.pageid,
         content,
         content_type: 'full_article',
+        ...pageType,
         truncated: true,
         original_length: originalLength,
         sections_suggested: true,
@@ -455,6 +481,7 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
       pageid: result.pageid,
       content: result.content,
       content_type: 'full_article',
+      ...pageType,
       truncated: false,
       ...citation,
       language,
@@ -469,6 +496,7 @@ export const wikipediaGetArticle = tool('wikipedia_get_article', {
       `**Type:** ${result.content_type} | **Language:** ${result.language}` +
         (result.pageid != null ? ` | **Page ID:** ${result.pageid}` : ''),
     );
+    if (result.page_type) lines.push(`**Page type:** ${result.page_type}`);
     if (result.section_title) lines.push(`**Section:** ${escapeMarkdown(result.section_title)}`);
     if (result.redirected_from)
       lines.push(`**Redirected from:** ${escapeMarkdown(result.redirected_from)}`);

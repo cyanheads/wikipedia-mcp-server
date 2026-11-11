@@ -5,7 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { escapeMarkdown } from '@/mcp-server/tools/utils/escape-markdown.js';
+import { escapeMarkdown, quotedNotice } from '@/mcp-server/tools/utils/escape-markdown.js';
 import {
   getWikipediaService,
   isMalformedLanguage,
@@ -26,7 +26,7 @@ export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
     query: z
       .string()
       .describe(
-        'Search query. CirrusSearch operators include incategory:"1648 treaties", morelike:Peace of Westphalia, intitle:Python, hastemplate:Infobox, and insource:Python; support depends on the selected installation. Must not be empty.',
+        'Search query. CirrusSearch operators include incategory:"1648 treaties", morelike:Peace of Westphalia, intitle:Python, hastemplate:Infobox, and insource:Python; support depends on the selected installation. wikipedia_get_sections returns an article\'s category names for incategory:. Must not be empty.',
       ),
     sort: z
       .enum(SEARCH_SORTS)
@@ -72,13 +72,13 @@ export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
               .string()
               .optional()
               .describe(
-                'Short description of the article subject (e.g. "General-purpose programming language"). Absent when the article has none, or when descriptions could not be loaded for the page (see notice).',
+                'Short description of the article subject (e.g. "General-purpose programming language"). Absent when the article has none, or when it could not be loaded for this result (see notice).',
               ),
             wikibase_item: z
               .string()
               .optional()
               .describe(
-                'Wikidata QID (e.g. "Q28865") for chaining into wikidata-mcp-server. Absent when the article has no Wikidata item, or when it could not be loaded for the page (see notice).',
+                'Wikidata QID (e.g. "Q28865") for chaining into wikidata-mcp-server. Absent when the article has no Wikidata item, or when it could not be loaded for this result (see notice).',
               ),
           })
           .describe('A single search result entry.'),
@@ -138,11 +138,13 @@ export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
       .string()
       .optional()
       .describe(
-        'Guidance when no results matched (naming the spelling suggestion when there is one), when the end of results was reached while paging, when the page was cut at the search window, or when descriptions and Wikidata QIDs could not be loaded for the page. Absent on ordinary result pages.',
+        'Guidance when no results matched (naming the spelling suggestion when there is one), when the end of results was reached while paging, when the page was cut at the search window, when limit was clamped, or when descriptions and Wikidata QIDs could not be loaded for some or all results on the page (naming how many). Absent on ordinary result pages.',
       ),
   },
   enrichmentTrailer: {
     suggestion: { label: 'Did you mean' },
+    // The zero-hit and end-of-results guidance quotes the caller's query and upstream's suggestion.
+    notice: { render: quotedNotice },
   },
 
   errors: [
@@ -226,7 +228,7 @@ export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
       language,
     });
 
-    const { results, totalResults, nextOffset, suggestion, descriptionsUnavailable } =
+    const { results, totalResults, nextOffset, suggestion, metaUnavailableCount } =
       await svc.search(input.query, limit, language, ctx, input.offset, input.sort);
 
     ctx.enrich.echo(input.query);
@@ -254,9 +256,11 @@ export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
           : `No Wikipedia articles found for "${input.query}" in language "${language}". Try different keywords or a broader query.${suggestion ? ` Did you mean "${suggestion}"? Re-run with that query.` : ''}`,
       );
     }
-    if (descriptionsUnavailable) {
+    if (metaUnavailableCount > 0) {
       notices.push(
-        'Descriptions and Wikidata QIDs could not be loaded for this page, so results carry neither. wikipedia_get_summary returns both for any one title, or re-run the search to retry.',
+        metaUnavailableCount === results.length
+          ? 'Descriptions and Wikidata QIDs could not be loaded for this page, so results carry neither. wikipedia_get_summary returns both for any one title, or re-run the search to retry.'
+          : `Descriptions and Wikidata QIDs could not be loaded for ${metaUnavailableCount} of ${results.length} results on this page, so those results carry neither. wikipedia_get_summary returns both for any one title, or re-run the search to retry.`,
       );
     }
 
@@ -283,7 +287,7 @@ export const wikipediaSearchArticles = tool('wikipedia_search_articles', {
       offset: input.offset,
       nextOffset,
       language,
-      descriptionsUnavailable,
+      metaUnavailableCount,
     });
 
     return { results, language };

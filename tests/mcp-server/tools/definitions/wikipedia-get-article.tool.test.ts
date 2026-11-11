@@ -4,17 +4,24 @@
  */
 
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  createFetchMock,
+  createMockContext,
+  runToolContract,
+} from '@cyanheads/mcp-ts-core/testing';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { wikipediaGetArticle } from '@/mcp-server/tools/definitions/wikipedia-get-article.tool.js';
 import { wikipediaGetSections } from '@/mcp-server/tools/definitions/wikipedia-get-sections.tool.js';
+import { quotedNotice } from '@/mcp-server/tools/utils/escape-markdown.js';
 import {
   getWikipediaService,
   initWikipediaService,
   redirectInfo,
 } from '@/services/wikipedia/wikipedia-service.js';
-import { parseTargets } from '../../../helpers/commonmark.js';
+import { parseTargets, readBackText } from '../../../helpers/commonmark.js';
+import { listFixture } from '../../../helpers/list-fixtures.js';
 import { mockWikipediaService } from '../../../helpers/wikipedia-service-mock.js';
 
 describe('wikipediaGetArticle', () => {
@@ -749,6 +756,72 @@ describe('wikipediaGetArticle', () => {
   });
 });
 
+describe('wikipediaGetArticle — lists through the real renderer (#81)', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    initWikipediaService({} as AppConfig, fakeStorage(), 'test', 'https://en.wikipedia.org');
+  });
+
+  const contentText = (result: { content: Array<{ type: string; text?: string }> }) =>
+    result.content.map((block) => block.text ?? '').join('\n');
+  const actionIs = (action: string) => (request: Request) =>
+    new URL(request.url).searchParams.get('action') === action;
+
+  /** A section read whose parse answers `text`, with an ordinary page behind the page-props lookup. */
+  async function readSection(text: string) {
+    const http = createFetchMock([
+      {
+        match: actionIs('parse'),
+        respond: Response.json({
+          parse: { title: 'Tree traversal', pageid: 597584, revid: 1379688139, text },
+        }),
+      },
+      {
+        match: actionIs('query'),
+        respond: Response.json({ query: { pages: [{ pageid: 597584, title: 'Tree traversal' }] } }),
+      },
+    ]);
+    http.install();
+    try {
+      const result = await runToolContract(wikipediaGetArticle, {
+        title: 'Tree traversal',
+        section_index: 10,
+      });
+      return {
+        content: (result.structuredContent as { content: string }).content,
+        text: contentText(result),
+      };
+    } finally {
+      http.restore();
+    }
+  }
+
+  it('fences a nested list in content[], so it reads back as the structuredContent text', async () => {
+    const { content, text } = await readSection(listFixture('tree-traversal-s10'));
+    const list = [
+      '1. If the current node is empty then return.',
+      '2. Visit the current node for pre-order traversal.',
+      "3. For each i from 1 to the current node's number of subtrees − 1, or from the latter to the former for reverse traversal, do:",
+      "  1. Recursively traverse the current node's i-th subtree.",
+      '  2. Visit the current node for in-order traversal.',
+      "4. Recursively traverse the current node's last subtree.",
+      '5. Visit the current node for post-order traversal.',
+    ].join('\n');
+    expect(content).toContain(`\n\n${list}\n\n`);
+    expect(text).toContain(`\n\n\`\`\`\n${list}\n\`\`\`\n\n`);
+    expect(readBackText(text.slice(text.indexOf('==== Arbitrary trees ====')))).toBe(content);
+  });
+
+  it('escapes a flat list in content[] like other line-leading text', async () => {
+    const { content, text } = await readSection(
+      '<p>Steps:</p><ol start="9"><li>Nine <i>a</i>_b</li><li>Ten</li></ol>',
+    );
+    expect(content).toBe('Steps:\n\n9. Nine a_b\n10. Ten');
+    expect(text).toContain('\nSteps:\n\n9\\. Nine a\\_b\n10\\. Ten');
+    expect(readBackText(text.slice(text.indexOf('Steps:')))).toBe(content);
+  });
+});
+
 describe('wikipediaGetArticle — abbreviations, nested scripts, group rows, and infobox chrome (issues #48, #50)', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -922,6 +995,299 @@ describe('wikipediaGetArticle — full read end to end through the real renderer
   });
 });
 
+describe('wikipediaGetArticle — the optional TOC lookup on a full read', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    initWikipediaService({} as AppConfig, fakeStorage(), 'test', 'https://en.wikipedia.org');
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  type Result = { content: Array<{ type: string; text?: string }> };
+  const contentText = (result: Result) =>
+    result.content.map((block) => block.text ?? '').join('\n');
+  /** The enrichment trailer: the last content block, which carries the notice. */
+  const trailer = (result: Result) => result.content.at(-1)?.text ?? '';
+  const actionIs = (action: string) => (request: Request) =>
+    new URL(request.url).searchParams.get('action') === action;
+  const actions = (calls: readonly { request: Request }[]) =>
+    calls.map((call) => new URL(call.request.url).searchParams.get('action'));
+
+  const TOC_UNAVAILABLE =
+    'Section indices could not be verified because the optional table of contents lookup was unavailable. Call wikipedia_get_sections to retry.';
+  const unverifiedTarget = (section: string) =>
+    `The alias targets "${section}". This remains a full-article read. Open the canonical URL or call wikipedia_get_sections to locate the target.`;
+  const NOT_JSON =
+    'Wikipedia Action API returned a response that is not a JSON object — likely rate-limited or under maintenance.';
+
+  /** A full read whose `action=query` answers `query` and whose TOC lookup answers `toc`. */
+  function fullReadUpstream(
+    query: unknown,
+    toc: (request: Request) => Response | Promise<Response>,
+  ) {
+    return createFetchMock([
+      { match: actionIs('query'), respond: () => Response.json(query) },
+      { match: actionIs('parse'), respond: toc },
+    ]);
+  }
+
+  /** The two full reads that consult the TOC: an article over the size budget, and an alias into a section. */
+  const READS = [
+    {
+      read: 'an outlined article',
+      input: { title: 'Target' },
+      query: {
+        query: {
+          pages: [
+            {
+              pageid: 7,
+              title: 'Target',
+              extract: `<p>${'Lead '.repeat(20000)}</p><h2>Parent</h2><p>Body.</p>`,
+            },
+          ],
+        },
+      },
+      expected: {
+        title: 'Target',
+        truncated: true,
+        sections_suggested: true,
+        notice: TOC_UNAVAILABLE,
+      },
+      // Unverified: only the lead keeps an index.
+      content: /^- Parent — \d+ bytes$/m,
+    },
+    {
+      read: 'an alias into a section',
+      input: { title: 'Alias' },
+      query: {
+        query: {
+          redirects: [{ from: 'Alias', to: 'Target', tofragment: 'Parent' }],
+          pages: [
+            { pageid: 7, title: 'Target', extract: '<p>Lead.</p><h2>Parent</h2><p>Body.</p>' },
+          ],
+        },
+      },
+      expected: {
+        title: 'Target',
+        truncated: false,
+        redirected_from: 'Alias',
+        redirect_section: 'Parent',
+        notice: `${TOC_UNAVAILABLE} ${unverifiedTarget('Parent')}`,
+      },
+      content: /^Lead\.\n\n== Parent ==\n\nBody\.$/,
+    },
+  ];
+
+  /** Every way the lookup can fail upstream. Each leaves the read as an unavailable lookup does. */
+  const TOC_FAILURES: Array<{ failure: string; respond: () => Response | Promise<Response> }> = [
+    { failure: 'HTTP 400', respond: () => new Response('Bad Request', { status: 400 }) },
+    { failure: 'HTTP 403', respond: () => new Response('Forbidden', { status: 403 }) },
+    { failure: 'HTTP 404', respond: () => new Response('Not Found', { status: 404 }) },
+    { failure: 'HTTP 410', respond: () => new Response('Gone', { status: 410 }) },
+    {
+      failure: 'HTTP 422',
+      respond: () => new Response('Unprocessable Content', { status: 422 }),
+    },
+    {
+      failure: 'HTTP 429 with a long Retry-After',
+      respond: () =>
+        new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '120' } }),
+    },
+    { failure: 'HTTP 500', respond: () => new Response('Server Error', { status: 500 }) },
+    { failure: 'HTTP 503', respond: () => new Response('Unavailable', { status: 503 }) },
+    { failure: 'a network failure', respond: () => Promise.reject(new TypeError('fetch failed')) },
+    {
+      failure: 'an HTML error page',
+      respond: () =>
+        new Response('<!DOCTYPE html><html><body>Wikimedia Error</body></html>', {
+          headers: { 'Content-Type': 'text/html' },
+        }),
+    },
+    {
+      failure: 'an XML body',
+      respond: () =>
+        new Response('<?xml version="1.0"?><api><error code="maxlag"/></api>', {
+          headers: { 'Content-Type': 'text/xml' },
+        }),
+    },
+    { failure: 'a body that is not JSON', respond: () => new Response('upstream hiccup') },
+    { failure: 'a JSON null body', respond: () => Response.json(null) },
+    { failure: 'a JSON array body', respond: () => Response.json([]) },
+    { failure: 'a body with no parse', respond: () => Response.json({ batchcomplete: true }) },
+    { failure: 'a parse that is a string', respond: () => Response.json({ parse: 'Target' }) },
+    {
+      failure: 'TOC sections that are a string',
+      respond: () => Response.json({ parse: { title: 'Target', tocdata: { sections: 'none' } } }),
+    },
+    {
+      failure: 'a numeric section index',
+      respond: () =>
+        Response.json({
+          parse: {
+            title: 'Target',
+            tocdata: { sections: [{ line: 'Parent', anchor: 'Parent', index: 7 }] },
+          },
+        }),
+    },
+    {
+      failure: 'a numeric anchor',
+      respond: () =>
+        Response.json({
+          parse: {
+            title: 'Target',
+            tocdata: { sections: [{ line: 'Parent', anchor: 7, index: '7' }] },
+          },
+        }),
+    },
+    {
+      failure: 'an invalidtitle envelope',
+      respond: () =>
+        Response.json({ error: { code: 'invalidtitle', info: 'Bad title "Target".' } }),
+    },
+    {
+      failure: 'a missingtitle envelope',
+      respond: () =>
+        Response.json({
+          error: { code: 'missingtitle', info: "The page you specified doesn't exist." },
+        }),
+    },
+    {
+      failure: 'a ratelimited envelope',
+      respond: () => Response.json({ error: { code: 'ratelimited', info: 'Slow down.' } }),
+    },
+    {
+      failure: 'an unrecognized envelope',
+      respond: () =>
+        Response.json({
+          error: { code: 'internal_api_error_DBQueryError', info: 'Database error' },
+        }),
+    },
+  ];
+
+  describe.each(READS)('on $read', ({ input, query, expected, content }) => {
+    it.each(TOC_FAILURES)(
+      'answers as an unavailable lookup on $failure, after one attempt',
+      async ({ respond }) => {
+        vi.useFakeTimers();
+        const startedAt = Date.now();
+        const http = fullReadUpstream(query, respond);
+        http.install();
+        try {
+          const pending = runToolContract(wikipediaGetArticle, input);
+          await vi.runAllTimersAsync();
+          const result = await pending;
+          expect(result.isError).toBeFalsy();
+          expect(result.structuredContent).toMatchObject(expected);
+          expect(wikipediaGetArticle.output.parse(result.structuredContent).content).toMatch(
+            content,
+          );
+          expect(trailer(result)).toBe(`\n\n> ${expected.notice}`);
+          // One attempt, no retry, and no wait: the read settles when the lookup does.
+          expect(actions(http.calls)).toEqual(['query', 'parse']);
+          expect(Date.now() - startedAt).toBe(0);
+        } finally {
+          http.restore();
+        }
+      },
+    );
+  });
+
+  it('propagates a caller cancellation from inside the lookup as RequestCancelled', async () => {
+    const caller = new AbortController();
+    const http = fullReadUpstream(READS[0]!.query, () => {
+      caller.abort();
+      return Promise.reject(new DOMException('The operation was aborted.', 'AbortError'));
+    });
+    http.install();
+    try {
+      const result = await runToolContract(
+        wikipediaGetArticle,
+        { title: 'Target' },
+        { context: { signal: caller.signal } },
+      );
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.RequestCancelled,
+          message: expect.stringContaining('was aborted'),
+        },
+      });
+      expect(contentText(result)).toContain('was aborted');
+      expect(contentText(result)).not.toContain(TOC_UNAVAILABLE);
+      expect(actions(http.calls)).toEqual(['query', 'parse']);
+    } finally {
+      http.restore();
+    }
+  });
+
+  it('reports a read answered with a non-JSON 200 body as a fixed ServiceUnavailable carrying none of it', async () => {
+    vi.useFakeTimers();
+    const body =
+      '<?xml version="1.0" encoding="utf-8"?><api servedby="mw-api-ext"><error code="maxlag" info="Waiting for db1234"/></api>';
+    const http = createFetchMock([
+      {
+        match: actionIs('query'),
+        respond: () => new Response(body, { headers: { 'Content-Type': 'text/xml' } }),
+      },
+    ]);
+    http.install();
+    try {
+      const pending = runToolContract(wikipediaGetArticle, { title: 'Target' });
+      await vi.runAllTimersAsync();
+      const result = await pending;
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ServiceUnavailable,
+          message: `${NOT_JSON} (failed after 4 attempts)`,
+        },
+      });
+      expect(contentText(result)).toContain(NOT_JSON);
+      const surfaces = JSON.stringify(result);
+      for (const fragment of ['<?xml', 'version=', 'servedby', 'maxlag', 'db1234'])
+        expect(surfaces).not.toContain(fragment);
+      expect(http.calls).toHaveLength(4);
+    } finally {
+      http.restore();
+    }
+  });
+
+  it('reads the section an alias targets back from content[] as structuredContent carries it', async () => {
+    const section = '*Seine* _flood_ [1](x) `code` <b>\n# Aftermath';
+    const http = fullReadUpstream(
+      {
+        query: {
+          redirects: [{ from: 'Alias', to: 'Target', tofragment: section }],
+          pages: [
+            { pageid: 7, title: 'Target', extract: '<p>Lead.</p><h2>Parent</h2><p>Body.</p>' },
+          ],
+        },
+      },
+      () =>
+        Response.json({
+          parse: {
+            title: 'Target',
+            tocdata: { sections: [{ line: 'Parent', anchor: 'Parent', index: '1' }] },
+          },
+        }),
+    );
+    http.install();
+    try {
+      const result = await runToolContract(wikipediaGetArticle, { title: 'Alias' });
+      const notice = unverifiedTarget(section);
+      expect(result.structuredContent).toMatchObject({ redirect_section: section, notice });
+      expect(readBackText(trailer(result))).toBe(notice);
+    } finally {
+      http.restore();
+    }
+  });
+
+  it('renders the notice through the shared quoted-notice renderer', () => {
+    expect(wikipediaGetArticle.enrichmentTrailer?.notice?.render).toBe(quotedNotice);
+  });
+});
+
 /** A TextExtracts HTML-mode extract with a heading tree, scripts, an escaped tag, and a code sample. */
 const FULL_EXTRACT_HTML = `<p class="mw-empty-elt">
 </p>
@@ -1025,7 +1391,7 @@ describe('scientific rendering through real tool handlers (#68, #71)', () => {
       },
     };
     vi.spyOn(svc, 'actionGet').mockImplementation(async (_language, params) =>
-      params.prop === 'tocdata'
+      params.prop?.startsWith('tocdata')
         ? { parse: toc }
         : {
             parse: {
@@ -1125,4 +1491,468 @@ describe('scientific rendering through real tool handlers (#68, #71)', () => {
     expect(text).toContain('section\\_index: 19');
     expect(text).toContain('1375796469');
   });
+});
+
+describe('wikipediaGetArticle — disambiguation flag (issue #77)', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    initWikipediaService({} as AppConfig, fakeStorage(), 'test', 'https://en.wikipedia.org');
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const contentText = (result: { content: Array<{ type: string; text?: string }> }) =>
+    result.content.map((block) => block.text ?? '').join('\n');
+  const actionIs = (action: string) => (request: Request) =>
+    new URL(request.url).searchParams.get('action') === action;
+  const actions = (calls: readonly { request: Request }[]) =>
+    calls.map((call) => new URL(call.request.url).searchParams.get('action'));
+
+  const SECTION_PARSE = {
+    parse: { title: 'Mercury', pageid: 19007, revid: 1376000001, text: '<p>Lead text.</p>' },
+  };
+  /** The section read HEAD returns for {@link SECTION_PARSE}: what every lookup outcome keeps. */
+  const SECTION_READ = {
+    title: 'Mercury',
+    pageid: 19007,
+    content: 'Lead text.',
+    section_title: 'Introduction',
+    content_type: 'section',
+    truncated: false,
+    revision_id: '1376000001',
+    language: 'en',
+  };
+  const LOOKUP_UNAVAILABLE =
+    'Whether this page is a disambiguation page could not be checked because the optional page-property lookup was unavailable. Call wikipedia_get_summary to check its page_type.';
+  const FLAGGED = {
+    query: { pages: [{ pageid: 19007, title: 'Mercury', pageprops: { disambiguation: '' } }] },
+  };
+  const UNFLAGGED = { query: { pages: [{ pageid: 19007, title: 'Mercury' }] } };
+
+  /** A section read whose parse answers {@link SECTION_PARSE} and whose lookup answers `lookup`. */
+  function sectionUpstream(
+    lookup: Response | ((request: Request) => Response | Promise<Response>),
+  ) {
+    return createFetchMock([
+      { match: actionIs('parse'), respond: Response.json(SECTION_PARSE) },
+      { match: actionIs('query'), respond: lookup },
+    ]);
+  }
+
+  it('characterizes the section read that a lookup outcome other than a flag leaves unchanged', async () => {
+    const http = sectionUpstream(Response.json(UNFLAGGED));
+    http.install();
+    try {
+      const result = await runToolContract(wikipediaGetArticle, {
+        title: 'Mercury',
+        section_index: 0,
+      });
+      expect(result.structuredContent).toEqual(SECTION_READ);
+      expect(contentText(result)).not.toContain('disambiguation');
+      expect(contentText(result)).not.toContain('Page type');
+    } finally {
+      http.restore();
+    }
+  });
+
+  it('flags a section_index 0 read of a disambiguation page on both surfaces with one added request', async () => {
+    const http = sectionUpstream(Response.json(FLAGGED));
+    http.install();
+    try {
+      const result = await runToolContract(wikipediaGetArticle, {
+        title: 'Mercury',
+        section_index: 0,
+      });
+      const structured = result.structuredContent as Record<string, unknown>;
+      expect(structured).toMatchObject({ ...SECTION_READ, page_type: 'disambiguation' });
+      const notice = String(structured.notice);
+      expect(notice).toContain('disambiguation page');
+      expect(notice).toContain('wikipedia_search_articles');
+      const rendered = contentText(result);
+      expect(rendered).toContain('**Page type:** disambiguation');
+      expect(rendered).toContain(`> ${notice}`);
+      expect(actions(http.calls)).toEqual(['parse', 'query']);
+      expect(Object.fromEntries(new URL(http.calls[1]!.request.url).searchParams)).toMatchObject({
+        titles: 'Mercury',
+        prop: 'pageprops',
+        ppprop: 'disambiguation',
+      });
+    } finally {
+      http.restore();
+    }
+  });
+
+  it('flags a table read through the same lookup', async () => {
+    const http = createFetchMock([
+      {
+        match: actionIs('parse'),
+        respond: Response.json({
+          parse: {
+            title: 'Mercury',
+            revid: 42,
+            text: '<table class="wikitable"><tr><th>Name</th></tr><tr><td>Planet</td></tr></table>',
+          },
+        }),
+      },
+      { match: actionIs('query'), respond: Response.json(FLAGGED) },
+    ]);
+    http.install();
+    try {
+      const result = await runToolContract(wikipediaGetArticle, {
+        title: 'Mercury',
+        section_index: 1,
+        table_index: 1,
+      });
+      expect(result.structuredContent).toMatchObject({
+        table_index: 1,
+        content: '| Name |\n| --- |\n| Planet |',
+        page_type: 'disambiguation',
+      });
+      expect(actions(http.calls)).toEqual(['parse', 'query']);
+    } finally {
+      http.restore();
+    }
+  });
+
+  it('flags a full read from page props on its one request, and leaves an ordinary one unflagged', async () => {
+    for (const [pageprops, flagged] of [
+      [{ disambiguation: '' }, true],
+      [undefined, false],
+    ] as const) {
+      const http = createFetchMock([
+        {
+          match: actionIs('query'),
+          respond: Response.json({
+            query: {
+              pages: [
+                {
+                  pageid: 19007,
+                  title: 'Mercury',
+                  extract: '<p>Mercury most commonly refers to:</p>',
+                  ...(pageprops && { pageprops }),
+                },
+              ],
+            },
+          }),
+        },
+      ]);
+      http.install();
+      try {
+        const result = await runToolContract(wikipediaGetArticle, { title: 'Mercury' });
+        expect(http.calls).toHaveLength(1);
+        const params = new URL(http.calls[0]!.request.url).searchParams;
+        expect(params.get('prop')).toBe('extracts|info|revisions|pageprops');
+        expect(params.get('ppprop')).toBe('disambiguation');
+        const rendered = contentText(result);
+        if (flagged) {
+          expect(result.structuredContent).toMatchObject({
+            content_type: 'full_article',
+            page_type: 'disambiguation',
+            notice: expect.stringContaining('disambiguation page'),
+          });
+          expect(rendered).toContain('**Page type:** disambiguation');
+          expect(rendered).toContain('wikipedia_search_articles');
+        } else {
+          expect(result.structuredContent).not.toHaveProperty('page_type');
+          expect(result.structuredContent).not.toHaveProperty('notice');
+          expect(rendered).not.toContain('disambiguation');
+        }
+      } finally {
+        http.restore();
+      }
+    }
+  });
+
+  it('joins the disambiguation notice with the TOC-unavailable notice on an outlined read', async () => {
+    vi.useFakeTimers();
+    const http = createFetchMock([
+      {
+        match: actionIs('query'),
+        respond: Response.json({
+          query: {
+            pages: [
+              {
+                title: 'Mercury',
+                pageprops: { disambiguation: '' },
+                extract: `<p>${'Lead '.repeat(20000)}</p><h2>Places</h2><p>Body.</p>`,
+              },
+            ],
+          },
+        }),
+      },
+      {
+        match: actionIs('parse'),
+        respond: Response.json({ error: { code: 'ratelimited', info: 'Temporarily unavailable' } }),
+      },
+    ]);
+    http.install();
+    try {
+      const pending = runToolContract(wikipediaGetArticle, { title: 'Mercury' });
+      await vi.runAllTimersAsync();
+      const result = await pending;
+      expect(result.structuredContent).toMatchObject({
+        truncated: true,
+        page_type: 'disambiguation',
+      });
+      const notice = String((result.structuredContent as Record<string, unknown>).notice);
+      expect(notice).toContain('disambiguation page');
+      expect(notice).toContain('optional table of contents lookup was unavailable');
+      expect(contentText(result)).toContain(`> ${notice}`);
+    } finally {
+      http.restore();
+    }
+  });
+
+  it.each([
+    { failure: 'a 404', respond: () => new Response('Not Found', { status: 404 }) },
+    { failure: 'a 403', respond: () => new Response('Forbidden', { status: 403 }) },
+    {
+      failure: 'a 429 with Retry-After',
+      respond: () =>
+        new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60' } }),
+    },
+    { failure: 'a 400', respond: () => new Response('Bad Request', { status: 400 }) },
+    { failure: 'a 500', respond: () => new Response('Server Error', { status: 500 }) },
+    { failure: 'a 503', respond: () => new Response('Unavailable', { status: 503 }) },
+    {
+      failure: 'an HTML body',
+      respond: () =>
+        new Response('<!DOCTYPE html><html><body>Wikimedia Error</body></html>', {
+          headers: { 'Content-Type': 'text/html' },
+        }),
+    },
+    { failure: 'a non-JSON body', respond: () => new Response('not json') },
+    { failure: 'a JSON null', respond: () => Response.json(null) },
+    { failure: 'a body with no pages', respond: () => Response.json({ batchcomplete: true }) },
+    {
+      failure: 'pages of the wrong type',
+      respond: () => Response.json({ query: { pages: 'Mercury' } }),
+    },
+    {
+      failure: 'page props of the wrong type',
+      respond: () =>
+        Response.json({ query: { pages: [{ title: 'Mercury', pageprops: 'disambiguation' }] } }),
+    },
+    {
+      failure: 'an error envelope',
+      respond: () =>
+        Response.json({
+          error: { code: 'internal_api_error_DBQueryError', info: 'Database error' },
+        }),
+    },
+    {
+      failure: 'a transient envelope',
+      respond: () => Response.json({ error: { code: 'ratelimited', info: 'Slow down' } }),
+    },
+    {
+      failure: 'a missing page',
+      respond: () => Response.json({ query: { pages: [{ title: 'Mercury', missing: true }] } }),
+    },
+    {
+      failure: 'a network failure',
+      respond: (): Response => {
+        throw new TypeError('fetch failed');
+      },
+    },
+  ])(
+    'returns the section read unflagged with the unavailability notice on $failure',
+    async ({ respond }) => {
+      vi.useFakeTimers();
+      const startedAt = Date.now();
+      const http = sectionUpstream(respond);
+      http.install();
+      try {
+        const pending = runToolContract(wikipediaGetArticle, {
+          title: 'Mercury',
+          section_index: 0,
+        });
+        await vi.runAllTimersAsync();
+        const result = await pending;
+        expect(result.isError).toBeFalsy();
+        expect(result.structuredContent).toEqual({ ...SECTION_READ, notice: LOOKUP_UNAVAILABLE });
+        const rendered = contentText(result);
+        expect(rendered).toContain(`> ${LOOKUP_UNAVAILABLE}`);
+        expect(rendered).not.toContain('Page type');
+        // One attempt, no retry, and no wait: the read settles when the parse does.
+        expect(actions(http.calls)).toEqual(['parse', 'query']);
+        expect(Date.now() - startedAt).toBe(0);
+      } finally {
+        http.restore();
+      }
+    },
+  );
+
+  it('gives up on a stalled lookup at its own 5 s budget and returns the read unflagged', async () => {
+    vi.useFakeTimers();
+    const startedAt = Date.now();
+    let lookupSignal: AbortSignal | undefined;
+    const http = sectionUpstream(
+      (request) =>
+        new Promise<Response>((_, reject) => {
+          lookupSignal = request.signal;
+          request.signal.addEventListener('abort', () => reject(request.signal.reason), {
+            once: true,
+          });
+        }),
+    );
+    http.install();
+    try {
+      const pending = runToolContract(wikipediaGetArticle, { title: 'Mercury', section_index: 0 });
+      await vi.runAllTimersAsync();
+      const result = await pending;
+      expect(result.structuredContent).toEqual({ ...SECTION_READ, notice: LOOKUP_UNAVAILABLE });
+      // The parse answered at once; the read waited exactly the lookup's budget, well inside the
+      // 15 s per-request timeout and the 30 s request deadline the parse runs under.
+      expect(Date.now() - startedAt).toBe(5_000);
+      expect(lookupSignal?.aborted).toBe(true);
+      expect(actions(http.calls)).toEqual(['parse', 'query']);
+    } finally {
+      http.restore();
+    }
+  });
+
+  it('propagates a caller cancellation that lands while the lookup is in flight', async () => {
+    const caller = new AbortController();
+    const http = createFetchMock([
+      {
+        match: actionIs('parse'),
+        respond: (request) =>
+          new Promise<Response>((_, reject) => {
+            request.signal.addEventListener('abort', () => reject(request.signal.reason), {
+              once: true,
+            });
+          }),
+      },
+      {
+        match: actionIs('query'),
+        respond: () => {
+          caller.abort();
+          throw new DOMException('Stop the lookup', 'AbortError');
+        },
+      },
+    ]);
+    http.install();
+    try {
+      const result = await runToolContract(
+        wikipediaGetArticle,
+        { title: 'Mercury', section_index: 0 },
+        { context: { signal: caller.signal } },
+      );
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.RequestCancelled,
+          message: expect.stringContaining('was aborted'),
+        },
+      });
+      expect(contentText(result)).toContain('was aborted');
+      expect(contentText(result)).not.toContain(LOOKUP_UNAVAILABLE);
+      expect(actions(http.calls).sort()).toEqual(['parse', 'query']);
+    } finally {
+      http.restore();
+    }
+  });
+
+  it('propagates a caller cancellation that lands in the parse while the lookup stalls', async () => {
+    const caller = new AbortController();
+    const http = createFetchMock([
+      {
+        match: actionIs('parse'),
+        respond: () => {
+          caller.abort();
+          throw new DOMException('Stop the parse', 'AbortError');
+        },
+      },
+      {
+        match: actionIs('query'),
+        respond: (request) =>
+          new Promise<Response>((_, reject) => {
+            request.signal.addEventListener('abort', () => reject(request.signal.reason), {
+              once: true,
+            });
+          }),
+      },
+    ]);
+    http.install();
+    try {
+      const result = await runToolContract(
+        wikipediaGetArticle,
+        { title: 'Mercury', section_index: 0 },
+        { context: { signal: caller.signal } },
+      );
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.RequestCancelled,
+          message: expect.stringContaining('was aborted'),
+        },
+      });
+      expect(contentText(result)).toContain('was aborted');
+      expect(actions(http.calls).filter((action) => action === 'parse')).toHaveLength(1);
+    } finally {
+      http.restore();
+    }
+  });
+});
+
+describe('wikipediaGetArticle — titles that name no page through the real service (issue #87)', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    initWikipediaService({} as AppConfig, fakeStorage(), 'test', 'https://en.wikipedia.org');
+  });
+
+  const MESSAGE =
+    '"Special:Random" is not a valid Wikipedia page name. Special: and Media: titles, in any edition\'s spelling, name no page; a file\'s description page is in the File: namespace.';
+  const RECOVERY =
+    'Use wikipedia_search_articles to find the exact article title and pass it verbatim.';
+  const text = (result: { content: Array<{ type: string; text?: string }> }) =>
+    result.content.map((block) => block.text ?? '').join('');
+
+  it.each([
+    { read: 'a full read', input: { title: 'Special:Random' } },
+    { read: 'a section read', input: { title: 'Special:Random', section_index: 1 } },
+  ])(
+    'refuses Special:Random on $read as invalid_title with the declared recovery',
+    async ({ input }) => {
+      // The live answers: `action=parse` refuses the namespace, `action=query` marks the entry special.
+      const http = createFetchMock([
+        {
+          match: (request) => new URL(request.url).searchParams.get('action') === 'parse',
+          respond: () =>
+            Response.json({
+              error: { code: 'pagecannotexist', info: "Namespace doesn't allow actual pages." },
+            }),
+        },
+        {
+          match: (request) => new URL(request.url).searchParams.get('action') === 'query',
+          respond: () =>
+            Response.json({
+              query: { pages: [{ ns: -1, title: 'Special:Random', special: true }] },
+            }),
+        },
+      ]);
+      http.install();
+      try {
+        const result = await runToolContract(wikipediaGetArticle, input);
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toEqual({
+          error: {
+            code: JsonRpcErrorCode.ValidationError,
+            message: MESSAGE,
+            data: {
+              title: 'Special:Random',
+              reason: 'invalid_title',
+              recovery: { hint: RECOVERY },
+            },
+          },
+        });
+        expect(text(result)).toBe(
+          `Error: ${MESSAGE}\n\nRecovery: ${RECOVERY}\n\n(reason invalid_title)`,
+        );
+      } finally {
+        http.restore();
+      }
+    },
+  );
 });

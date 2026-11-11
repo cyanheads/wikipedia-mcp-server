@@ -90,6 +90,12 @@ const OutputSchema = z.object({
     .string()
     .optional()
     .describe('Original alias followed to the resolved article.'),
+  redirect_section: z
+    .string()
+    .optional()
+    .describe(
+      "Section the alias points into, as the redirect's raw fragment names it. The footnotes listed are still the whole article's.",
+    ),
   total_references: z
     .number()
     .describe('Footnotes in the article across every reference list, on all pages.'),
@@ -120,7 +126,7 @@ export const wikipediaGetReferences = tool('wikipedia_get_references', {
     title: z
       .string()
       .describe(
-        'Article title (e.g. "Seine"). A trailing #fragment is accepted and ignored; the characters < > [ ] { } and | cannot appear in a Wikipedia page name.',
+        'Article title (e.g. "Seine"). A trailing #fragment is accepted and ignored; the characters < > [ ] { } and | cannot appear in a Wikipedia page name. Special: and Media: titles, and interwiki links such as "wikt:cat", name no page.',
       ),
     cursor: z
       .string()
@@ -153,7 +159,7 @@ export const wikipediaGetReferences = tool('wikipedia_get_references', {
     {
       reason: 'invalid_title',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The title contains characters MediaWiki cannot name a page with.',
+      when: 'The title can name no page: it contains characters MediaWiki forbids in a page name, is a Special: or Media: title in any edition\'s spelling, or is an interwiki link such as "wikt:cat".',
       recovery:
         'Use wikipedia_search_articles to find the exact article title and pass it verbatim.',
     },
@@ -252,6 +258,9 @@ export const wikipediaGetReferences = tool('wikipedia_get_references', {
         ...(result.redirect?.redirected_from && {
           redirected_from: result.redirect.redirected_from,
         }),
+        ...(result.redirect?.redirect_section && {
+          redirect_section: result.redirect.redirect_section,
+        }),
         total_references: total,
         references,
         works: [...workIds].flatMap((id) => result.works.get(id) ?? []),
@@ -347,6 +356,8 @@ function formatReferences(result: ReferencesOutput): string {
   if (result.url) lines.push(`**URL:** ${urlLink(result.url)}`);
   if (result.redirected_from)
     lines.push(`**Redirected from:** ${escapeMarkdown(result.redirected_from)}`);
+  if (result.redirect_section)
+    lines.push(`**Redirect section:** ${escapeMarkdown(result.redirect_section)}`);
   lines.push(
     `**Total references:** ${result.total_references} (${result.references.length} on this page)`,
   );

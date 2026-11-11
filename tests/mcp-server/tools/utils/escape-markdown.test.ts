@@ -8,10 +8,12 @@ import {
   escapeMarkdown,
   escapeMarkdownOutsideBlocks,
   formatTablePage,
+  quotedNotice,
   urlLink,
 } from '@/mcp-server/tools/utils/escape-markdown.js';
 import { htmlSectionToPlainText } from '@/services/wikipedia/wikipedia-service.js';
-import { parseInlineText, parseTargets } from '../../../helpers/commonmark.js';
+import { parseInlineText, parseTargets, readBackText } from '../../../helpers/commonmark.js';
+import { expectLinearGrowth } from '../../../helpers/cpu-growth.js';
 
 describe('escapeMarkdown', () => {
   it('backslash-escapes every inline markdown-active character', () => {
@@ -130,6 +132,92 @@ describe('escapeMarkdownOutsideBlocks (issues #49, #50)', () => {
     expect(escapeMarkdownOutsideBlocks(plain)).toBe(
       'Intro \\<b\\>\n\n````\n```\n| <i> |\n```\n````\n\n| \\`\\`\\` | a \\| b |\n| --- | --- |\n| \\<script\\> | \\| --- \\| |',
     );
+  });
+});
+
+describe('escapeMarkdownOutsideBlocks — list blocks (#81)', () => {
+  it('fences a list holding an indented line and escapes nothing inside the fence', () => {
+    expect(escapeMarkdownOutsideBlocks('Intro <b>:\n\n- a *b*\n  1. c_d\n\nAfter _e_.')).toBe(
+      'Intro \\<b\\>:\n\n```\n- a *b*\n  1. c_d\n```\n\nAfter \\_e\\_.',
+    );
+  });
+
+  it('escapes a flat list like any other line-leading text', () => {
+    expect(escapeMarkdownOutsideBlocks('- Mercury (planet)\n10. Ten\n0. Zero\n-1. Past zero')).toBe(
+      '\\- Mercury (planet)\n10\\. Ten\n0\\. Zero\n\\-1. Past zero',
+    );
+  });
+
+  it('opens the fence longer than any backtick run in the list, a fenced sample included', () => {
+    const list = '- Run:\n  ````\n  code ```\n  ````\n- `inline`';
+    expect(escapeMarkdownOutsideBlocks(list)).toBe(`\`\`\`\`\`\n${list}\n\`\`\`\`\``);
+  });
+
+  const FIVE_LEVELS = '- One\n  1. Two\n    - Three\n      3. Four\n        - Five\n- Back';
+  it.each([
+    ['a flat bulleted list', 'Mercury may refer to:\n\n- Mercury (planet)\n- Mercury (element)'],
+    ['a flat numbered list past nine', '9. Nine\n10. Ten\n11. Eleven'],
+    ['a reversed list counting past zero', '1. One\n0. Zero\n-1. Past zero'],
+    ['a list five levels deep', `Intro:\n\n${FIVE_LEVELS}\n\nAfter.`],
+    ['continuation lines', '1. Lead\n  Paragraph two\n  N: node\n2. Next'],
+    ['a code sample inside an item', '- Run:\n  ````\n  x = 1\n    y ```\n  ````\n  then'],
+    [
+      'a table inside an item',
+      '- Results:\n  | A | B |\n  | --- | --- |\n  | 1 | x \\| y |\n- Next',
+    ],
+    ['markup characters inside an item', '- *a* _b_ <c> & [d](e) `f` \\g\n  # not a heading'],
+    ['a list at each edge of the text', `${FIVE_LEVELS}\n\nMiddle.\n\n${FIVE_LEVELS}`],
+    ['a line of spaces alone', 'a\n   \nb'],
+  ])('reads %s back exactly under CommonMark', (_name, text) => {
+    expect(readBackText(escapeMarkdownOutsideBlocks(text))).toBe(text);
+  });
+
+  it('reads back a list rendered from article HTML holding a code sample and backtick runs', () => {
+    const plain = htmlSectionToPlainText(
+      '<ul><li>Run <code>```</code>:<pre>````\nx</pre></li><li>Next<ul><li>`deep`</li></ul></li></ul>',
+    );
+    expect(plain).toBe('- Run ```:\n  `````\n  ````\n  x\n  `````\n- Next\n  - `deep`');
+    expect(escapeMarkdownOutsideBlocks(plain)).toBe(`\`\`\`\`\`\`\n${plain}\n\`\`\`\`\`\``);
+    expect(readBackText(escapeMarkdownOutsideBlocks(plain))).toBe(plain);
+  });
+
+  // Every shape reaches a regex scan, so each starts at 1,250 characters and its 64× span ends at
+  // 80,000, below the size where Bun's regex engine changes mode.
+  const fill = (unit: string, size: number) => unit.repeat(Math.ceil(size / unit.length));
+  it.each([
+    ['one long line ending in a break', (n: number) => `${fill('§1 x', n)}\ny`],
+    ['breaks throughout', (n: number) => fill('  \r\n', n)],
+    ['one indented list', (n: number) => fill('- a\n  b\n', n)],
+    ['many short lists', (n: number) => fill('- a\n  b\n\n', n)],
+    ['a list of backtick runs', (n: number) => `- a\n${fill('  `', n)}`],
+    ['a flat list', (n: number) => fill('- a *b*\n', n)],
+  ])('stays linear on %s', (_name, shape) => {
+    expectLinearGrowth(escapeMarkdownOutsideBlocks, shape, 1_250);
+  });
+});
+
+describe('quotedNotice', () => {
+  it('quotes each line and reads back as the notice it was given', () => {
+    const notice = 'Section *Seine* _flood_ [1](x) `code` <b>\n# Aftermath';
+    expect(quotedNotice('*a*')).toBe('> \\*a\\*');
+    expect(
+      quotedNotice(notice)
+        .split('\n')
+        .every((line) => line.startsWith('> ')),
+    ).toBe(true);
+    expect(readBackText(quotedNotice(notice))).toBe(notice);
+  });
+
+  // A notice can quote a caller's query or an upstream heading of any length.
+  const fill = (unit: string, size: number) => unit.repeat(Math.ceil(size / unit.length));
+  it.each([
+    ['one long line ending in a break', (n: number) => `${fill('§1 x', n)}\ny`],
+    ['breaks throughout', (n: number) => fill('  \r\n', n)],
+    ['tag text', (n: number) => fill('<a', n)],
+    ['emphasis and code text', (n: number) => fill('`[*_', n)],
+    ['heading text', (n: number) => `x ${fill('#', n)}\ny`],
+  ])('stays linear on %s', (_name, shape) => {
+    expectLinearGrowth(quotedNotice, shape, 1_250);
   });
 });
 

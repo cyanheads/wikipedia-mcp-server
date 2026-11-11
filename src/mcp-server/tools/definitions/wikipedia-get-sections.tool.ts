@@ -38,7 +38,7 @@ export const wikipediaGetSections = tool('wikipedia_get_sections', {
     title: z
       .string()
       .describe(
-        'Article title (e.g. "Python (programming language)"). A trailing #fragment is accepted and ignored; the characters < > [ ] { } and | cannot appear in a Wikipedia page name.',
+        'Article title (e.g. "Python (programming language)"). A trailing #fragment is accepted and ignored; the characters < > [ ] { } and | cannot appear in a Wikipedia page name. Special: and Media: titles, and interwiki links such as "wikt:cat", name no page.',
       ),
     language: z
       .string()
@@ -89,8 +89,26 @@ export const wikipediaGetSections = tool('wikipedia_get_sections', {
     total_sections: z
       .number()
       .describe('Number of entries returned, counting the index-0 lead section.'),
+    page_type: z
+      .literal('disambiguation')
+      .optional()
+      .describe(
+        'Present only on a disambiguation page — one that lists the articles a title can refer to — and then "disambiguation", the value wikipedia_get_summary reports for it.',
+      ),
+    categories: z
+      .array(z.string())
+      .describe(
+        'Visible categories the article belongs to, without the namespace prefix and with spaces for underscores. Pass one to wikipedia_search_articles as incategory:"<name>", writing any double quote in the name as \\".',
+      ),
     language: z.string().describe('Language edition queried.'),
   }),
+
+  enrichment: {
+    notice: z
+      .string()
+      .optional()
+      .describe('Guidance for a disambiguation page, whose sections group candidate articles.'),
+  },
 
   errors: [
     {
@@ -103,15 +121,16 @@ export const wikipediaGetSections = tool('wikipedia_get_sections', {
     {
       reason: 'invalid_title',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The title contains characters MediaWiki cannot name a page with.',
+      when: 'The title can name no page: it contains characters MediaWiki forbids in a page name, is a Special: or Media: title in any edition\'s spelling, or is an interwiki link such as "wikt:cat".',
       recovery:
         'Use wikipedia_search_articles to find the exact article title and pass it verbatim.',
     },
     {
       reason: 'no_sections',
       code: JsonRpcErrorCode.NotFound,
-      when: 'Article exists but has no sections (stub or very short article).',
-      recovery: 'Use wikipedia_get_article without section_index to read the full short article.',
+      when: 'The page exists but has no sections: a stub, a very short article, or a disambiguation page with no headings.',
+      recovery:
+        'Use wikipedia_get_article without section_index to read the full page; for a disambiguation page, use wikipedia_search_articles to find the intended article.',
     },
     {
       reason: 'invalid_language',
@@ -186,17 +205,27 @@ export const wikipediaGetSections = tool('wikipedia_get_sections', {
     if (result.sections.length === 0) {
       throw ctx.fail(
         'no_sections',
-        `Article "${input.title}" exists but has no sections. It may be a stub.`,
+        result.disambiguation
+          ? `"${input.title}" is a disambiguation page with no sections: it lists the articles the title can refer to.`
+          : `Article "${input.title}" exists but has no sections. It may be a stub.`,
         {
           title: input.title,
           recovery: {
-            hint: 'Use wikipedia_get_article without section_index to read the full article content.',
+            hint: result.disambiguation
+              ? 'Use wikipedia_search_articles to find the intended article, or wikipedia_get_article without section_index to read the candidate list.'
+              : 'Use wikipedia_get_article without section_index to read the full article content.',
           },
         },
       );
     }
 
     ctx.log.info('Sections fetched', { title: input.title, count: result.sections.length });
+
+    if (result.disambiguation) {
+      ctx.enrich.notice(
+        'This is a disambiguation page: its sections group the articles the title can refer to rather than covering one topic. Use wikipedia_search_articles to find the intended article, or pass a candidate title the page lists to wikipedia_get_article.',
+      );
+    }
 
     // The lead is prepended here rather than in the service so `no_sections` keeps meaning "this
     // article has no headed sections" — upstream's own table of contents is what that judges.
@@ -209,6 +238,8 @@ export const wikipediaGetSections = tool('wikipedia_get_sections', {
       ...result.redirect,
       sections,
       total_sections: sections.length,
+      ...(result.disambiguation && { page_type: 'disambiguation' as const }),
+      categories: result.categories,
       language,
     };
   },
@@ -221,6 +252,7 @@ export const wikipediaGetSections = tool('wikipedia_get_sections', {
         (result.pageid != null ? ` | Page ID: ${result.pageid}` : ''),
       '',
     ];
+    if (result.page_type) lines.push(`**Page type:** ${result.page_type}`);
     if (result.redirected_from)
       lines.push(`**Redirected from:** ${escapeMarkdown(result.redirected_from)}`);
     if (result.redirect_section)
@@ -232,6 +264,13 @@ export const wikipediaGetSections = tool('wikipedia_get_sections', {
       lines.push(
         `${indent}${s.number}. **${escapeMarkdown(s.title)}** (index: ${s.index}, level: ${s.level})`,
       );
+    }
+    // One bullet per name: a name can hold a comma or any other separator a joined line would use.
+    lines.push('');
+    if (result.categories.length === 0) lines.push('**Categories:** none');
+    else {
+      lines.push(`**Categories (${result.categories.length}):**`);
+      for (const name of result.categories) lines.push(`- ${escapeMarkdown(name)}`);
     }
     return [{ type: 'text', text: lines.join('\n') }];
   },

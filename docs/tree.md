@@ -1,6 +1,6 @@
 # wikipedia-mcp-server - Directory Structure
 
-Generated on: 2026-10-29 19:45:03
+Generated on: 2026-11-11 15:59:49
 
 ```text
 wikipedia-mcp-server/
@@ -169,6 +169,17 @@ wikipedia-mcp-server/
 │   └── index.ts
 ├── tests/
 │   ├── fixtures/
+│   │   ├── lists/
+│   │   │   ├── late-show-top-ten-list-s2.json
+│   │   │   ├── mercury-summary.json
+│   │   │   ├── messiah-handel-s14.json
+│   │   │   ├── multiple-sclerosis-s22.json
+│   │   │   ├── outline-of-geography-extract.json
+│   │   │   ├── outline-of-geography-s8.json
+│   │   │   ├── tree-traversal-s10.json
+│   │   │   ├── tree-traversal-s3.json
+│   │   │   ├── twelve-step-program-s3.json
+│   │   │   └── world-heritage-site-s6.json
 │   │   └── references/
 │   │       ├── anne-hathaway.json
 │   │       ├── augustus.json
@@ -179,6 +190,8 @@ wikipedia-mcp-server/
 │   │       └── simple-seine.json
 │   ├── helpers/
 │   │   ├── commonmark.ts
+│   │   ├── cpu-growth.ts
+│   │   ├── list-fixtures.ts
 │   │   └── wikipedia-service-mock.ts
 │   ├── mcp-server/
 │   │   └── tools/

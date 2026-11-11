@@ -4,7 +4,12 @@
  */
 
 import { escapeMarkdownInline, markdownLink } from '@cyanheads/mcp-ts-core/utils';
-import { parseTableRow, splitTextBlocks, tableRow } from '@/services/wikipedia/text-blocks.js';
+import {
+  fenceCodeBlock,
+  parseTableRow,
+  splitTextBlocks,
+  tableRow,
+} from '@/services/wikipedia/text-blocks.js';
 
 /**
  * A URL field as a Markdown link labelled with its host: `[example.org](<https://example.org/a_-_b>)`.
@@ -72,15 +77,18 @@ export function escapeMarkdown(text: string): string {
 }
 
 /**
- * {@link escapeMarkdown} for rendered article text, leaving intact the two constructs whose syntax
+ * {@link escapeMarkdown} for rendered article text, leaving intact the three constructs whose syntax
  * the article renderer wrote on purpose (see `text-blocks.ts`).
  *
  * A fenced code block passes through raw: inside a fence CommonMark reads nothing as markup, and a
  * backslash there would reach the reader as part of the code. A table row keeps its ` | ` delimiters
  * and escapes each cell inline — which also writes a cell's own `|` as the `\|` GFM reads as a
  * literal pipe — but not for line-leading markers, since a cell never starts a line and `49.80%`
- * must not come out as `49\.80%`. A delimiter row, dashes only, passes through. Everything else is
- * prose and escaped as usual.
+ * must not come out as `49\.80%`. A delimiter row, dashes only, passes through. A list block — one
+ * holding an indented line — is fenced whole: CommonMark strips a paragraph line's leading spaces and
+ * reads a line indented four after a blank line as code, while inside a fence every line reads back
+ * as written; the fence outruns any backtick run in the list, a fenced sample in an item included.
+ * Everything else is prose and escaped as usual, a flat list among it (`\-`, `1\.`).
  */
 export function escapeMarkdownOutsideBlocks(text: string): string {
   return splitTextBlocks(text)
@@ -90,10 +98,24 @@ export function escapeMarkdownOutsideBlocks(text: string): string {
           return escapeMarkdown(block.text);
         case 'row':
           return tableRow(block.cells, escapeInline);
+        case 'list':
+          return fenceCodeBlock(block.text);
         default:
           return block.text;
       }
     })
+    .join('\n');
+}
+
+/**
+ * A tool's notice for `content[]`, when it quotes caller or upstream text: escaped with
+ * {@link escapeMarkdownInline}, which reads back exactly inside a block quote, then quoted line by
+ * line. `structuredContent` keeps the notice raw.
+ */
+export function quotedNotice(notice: unknown): string {
+  return escapeMarkdownInline(String(notice))
+    .split('\n')
+    .map((line) => `> ${line}`)
     .join('\n');
 }
 

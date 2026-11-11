@@ -501,6 +501,139 @@ describe('wikipediaSearchNearby — cap notice at the 500 ceiling (issue #54)', 
   });
 });
 
+describe('wikipediaSearchNearby — the radius clamp and the ceiling (issue #82)', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    mockWikipediaService();
+  });
+
+  const RADIUS_CLAMP =
+    'Requested radius_meters 50000 was clamped to 10000, the geosearch maximum. Search from adjacent points to cover a wider area.';
+  const EMPTY_AT_CEILING =
+    'No geotagged Wikipedia articles found within 10000m of (-40, -130), the widest radius geosearch allows. Verify the coordinates, search from another point, or set language to the local-language edition, where geotag coverage is often denser.';
+
+  it('discloses a radius above 10000 on both surfaces, beside the applied radius', async () => {
+    const nearbyFn = vi.fn().mockResolvedValue({ truncated: false, results: places(3) });
+    mockWikipediaService({ searchNearby: nearbyFn });
+
+    const result = await runToolContract(wikipediaSearchNearby, {
+      latitude: 47.6,
+      longitude: -122.3,
+      radius_meters: 50_000,
+    });
+
+    expect(nearbyFn.mock.calls[0]?.[2]).toBe(10_000);
+    expect(result.structuredContent).toMatchObject({
+      radiusMetersUsed: 10_000,
+      requestedRadiusMeters: 50_000,
+      notice: RADIUS_CLAMP,
+    });
+    const text = contentText(result);
+    expect(text).toContain('**radiusMetersUsed:** 10000\n**requestedRadiusMeters:** 50000\n');
+    expect(text).toContain(`> ${RADIUS_CLAMP}`);
+  });
+
+  it.each([10_000, 9_999, 500])(
+    'adds neither the field nor the segment at radius_meters %s',
+    async (radius) => {
+      mockWikipediaService({
+        searchNearby: vi.fn().mockResolvedValue({ truncated: false, results: places(3) }),
+      });
+
+      const result = await runToolContract(wikipediaSearchNearby, {
+        latitude: 47.6,
+        longitude: -122.3,
+        radius_meters: radius,
+      });
+
+      expect(result.structuredContent).toMatchObject({ radiusMetersUsed: radius });
+      expect(result.structuredContent).not.toHaveProperty('requestedRadiusMeters');
+      expect(result.structuredContent).not.toHaveProperty('notice');
+      expect(contentText(result)).not.toContain('requestedRadiusMeters');
+    },
+  );
+
+  it('drops the raise-the-radius advice from an empty result requested at the ceiling', async () => {
+    mockWikipediaService({
+      searchNearby: vi.fn().mockResolvedValue({ truncated: false, results: [] }),
+    });
+
+    const result = await runToolContract(wikipediaSearchNearby, {
+      latitude: -40,
+      longitude: -130,
+      radius_meters: 10_000,
+    });
+
+    expect(result.structuredContent).toMatchObject({ shown: 0, notice: EMPTY_AT_CEILING });
+    expect(result.structuredContent).not.toHaveProperty('requestedRadiusMeters');
+    expect(contentText(result)).toContain(`> ${EMPTY_AT_CEILING}`);
+    expect(contentText(result)).not.toMatch(/increas/i);
+  });
+
+  it('leads a clamped empty result with the clamp, then the ceiling wording (the #82 repro)', async () => {
+    mockWikipediaService({
+      searchNearby: vi.fn().mockResolvedValue({ truncated: false, results: [] }),
+    });
+
+    const result = await runToolContract(wikipediaSearchNearby, {
+      latitude: -40,
+      longitude: -130,
+      radius_meters: 50_000,
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      radiusMetersUsed: 10_000,
+      requestedRadiusMeters: 50_000,
+      shown: 0,
+      notice: `${RADIUS_CLAMP} ${EMPTY_AT_CEILING}`,
+    });
+    expect(contentText(result)).toContain(`> ${RADIUS_CLAMP} ${EMPTY_AT_CEILING}`);
+    expect(contentText(result)).not.toMatch(/increas/i);
+  });
+
+  it('keeps the existing empty-result wording below the ceiling (characterization)', async () => {
+    mockWikipediaService({
+      searchNearby: vi.fn().mockResolvedValue({ truncated: false, results: [] }),
+    });
+
+    const result = await runToolContract(wikipediaSearchNearby, {
+      latitude: -40,
+      longitude: -130,
+      radius_meters: 9_999,
+    });
+
+    expect((result.structuredContent as Record<string, unknown>).notice).toBe(
+      'No geotagged Wikipedia articles found within 9999m of (-40, -130). Try increasing radius_meters or verify the coordinates are correct.',
+    );
+  });
+
+  it('carries both clamp segments ahead of the truncation guidance on a truncated page', async () => {
+    mockWikipediaService({
+      searchNearby: vi.fn().mockResolvedValue({ truncated: true, results: places(500) }),
+    });
+
+    const result = await runToolContract(wikipediaSearchNearby, {
+      latitude: 47.6,
+      longitude: -122.3,
+      radius_meters: 50_000,
+      limit: 600,
+    });
+
+    const notice = `${RADIUS_CLAMP} Requested limit 600 was clamped to 500. Reduce radius_meters for coverage beyond the ceiling. Results were capped at Wikipedia's 500-result ceiling; more matches may exist. Reduce radius_meters and sweep adjacent sub-areas for exhaustive coverage — geosearch offers no pagination past the limit.`;
+    expect(result.structuredContent).toMatchObject({
+      requestedRadiusMeters: 50_000,
+      radiusMetersUsed: 10_000,
+      requestedLimit: 600,
+      appliedLimit: 500,
+      truncated: true,
+      shown: 500,
+      cap: 500,
+      notice,
+    });
+    expect(contentText(result)).toContain(`> ${notice}`);
+  });
+});
+
 describe('wikipediaSearchNearby — description and Wikidata QID (issue #52)', () => {
   beforeEach(() => {
     vi.restoreAllMocks();

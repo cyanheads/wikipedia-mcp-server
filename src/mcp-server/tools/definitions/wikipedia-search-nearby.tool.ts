@@ -49,7 +49,7 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
       .min(GEOSEARCH_MIN_RADIUS_METERS)
       .default(1000)
       .describe(
-        `Search radius in meters (default 1000, min ${GEOSEARCH_MIN_RADIUS_METERS}, max ${GEOSEARCH_MAX_RADIUS_METERS} — the MediaWiki geosearch bounds). Must be an integer; a value above the maximum is clamped to it.`,
+        `Search radius in meters (default 1000, min ${GEOSEARCH_MIN_RADIUS_METERS}, max ${GEOSEARCH_MAX_RADIUS_METERS} — the MediaWiki geosearch bounds). Must be an integer; a value above the maximum is clamped to it with a notice.`,
       ),
     limit: z
       .number()
@@ -101,8 +101,8 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
     language: z.string().describe('Language edition queried.'),
   }),
 
-  // Agent-facing context — echoes the search parameters, truncation disclosure, plus
-  // an optional notice when nothing matched. Reaches both structuredContent and content[].
+  // Agent-facing context — echoes the search parameters, clamp and truncation disclosure, plus
+  // an optional notice. Reaches both structuredContent and content[].
   enrichment: {
     requestedLimit: z
       .number()
@@ -117,6 +117,13 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
     queryLatitude: z.number().describe('Latitude used for the search.'),
     queryLongitude: z.number().describe('Longitude used for the search.'),
     radiusMetersUsed: z.number().describe('Radius in meters used for the search.'),
+    requestedRadiusMeters: z
+      .number()
+      .int()
+      .optional()
+      .describe(
+        'Requested radius in meters, present only when clamped; radiusMetersUsed carries the applied value.',
+      ),
     truncated: z
       .boolean()
       .describe(
@@ -128,7 +135,7 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
       .string()
       .optional()
       .describe(
-        'Guidance when results were capped (raise limit, or — at the 500 ceiling — sweep narrower radii) or when no geotagged articles were found (increase radius). Absent when neither applies.',
+        `Guidance when radius_meters or limit was clamped, when results were capped (raise limit, or — at the ${GEOSEARCH_MAX_LIMIT} ceiling — sweep narrower radii), or when no geotagged articles were found (increase radius_meters, or — at the ${GEOSEARCH_MAX_RADIUS_METERS} m ceiling — search from another point or the local-language edition). Absent when none applies.`,
       ),
   },
 
@@ -183,33 +190,39 @@ export const wikipediaSearchNearby = tool('wikipedia_search_nearby', {
       ctx,
     );
 
+    const radiusClamped = input.radius_meters > radiusMeters;
     ctx.enrich({
       ...(input.limit > limit && { requestedLimit: input.limit, appliedLimit: limit }),
       queryLatitude: input.latitude,
       queryLongitude: input.longitude,
       radiusMetersUsed: radiusMeters,
+      ...(radiusClamped && { requestedRadiusMeters: input.radius_meters }),
+      truncated,
+      shown: results.length,
+      cap: limit,
     });
+
+    // `notice` is last-wins, so every condition that has something to say contributes a segment and
+    // the page carries them as one notice: the clamps in input order, then the truncation guidance
+    // or the empty-result advice.
     const notices: string[] = [];
+    if (radiusClamped)
+      notices.push(
+        `Requested radius_meters ${input.radius_meters} was clamped to ${radiusMeters}, the geosearch maximum. Search from adjacent points to cover a wider area.`,
+      );
     if (input.limit > limit)
       notices.push(
         `Requested limit ${input.limit} was clamped to ${limit}. Reduce radius_meters for coverage beyond the ceiling.`,
       );
-    if (truncated) {
-      ctx.enrich.truncated({
-        shown: results.length,
-        cap: limit,
-        guidance: [...notices, truncationGuidance(limit)].join(' '),
-      });
-    } else {
-      ctx.enrich({ shown: results.length, cap: limit, truncated: false });
-    }
-
+    if (truncated) notices.push(truncationGuidance(limit));
     if (results.length === 0) {
       notices.push(
-        `No geotagged Wikipedia articles found within ${radiusMeters}m of (${input.latitude}, ${input.longitude}). Try increasing radius_meters or verify the coordinates are correct.`,
+        radiusMeters === GEOSEARCH_MAX_RADIUS_METERS
+          ? `No geotagged Wikipedia articles found within ${radiusMeters}m of (${input.latitude}, ${input.longitude}), the widest radius geosearch allows. Verify the coordinates, search from another point, or set language to the local-language edition, where geotag coverage is often denser.`
+          : `No geotagged Wikipedia articles found within ${radiusMeters}m of (${input.latitude}, ${input.longitude}). Try increasing radius_meters or verify the coordinates are correct.`,
       );
     }
-    if (!truncated && notices.length) ctx.enrich.notice(notices.join(' '));
+    if (notices.length > 0) ctx.enrich.notice(notices.join(' '));
 
     ctx.log.info('Geo search complete', { count: results.length, language });
 
