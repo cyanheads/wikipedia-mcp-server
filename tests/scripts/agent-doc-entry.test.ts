@@ -2,40 +2,18 @@
  * @fileoverview Regression tests for the bundle agent-doc selector shared by
  * `scripts/clean-mcpb.ts` (the strip step) and `scripts/lint-packaging.ts`
  * (check 8). The MCP SDK ships runtime modules under `dist/ext/skills/`, which
- * the skills extension imports at boot; only a package's own root
- * `skills/`, `framework-skills/`, `.claude/`, `.agents/` trees and stray
- * `SKILL.md` files are agent docs.
+ * the skills extension imports at boot; only `skills/`, `framework-skills/`,
+ * `.claude/`, `.agents/` trees and `AGENTS.md`/`CLAUDE.md` files at a package's
+ * own root, and stray `SKILL.md` files, are agent docs.
  * @module tests/scripts/agent-doc-entry.test
  */
 
 import { describe, expect, it } from 'vitest';
 import { AGENT_DOC_ENTRY, filterAgentDocEntries } from '../../scripts/clean-mcpb.js';
-
-interface LintPackagingModule {
-  AGENT_DOC_ENTRY: RegExp;
-  checkBundleEntries: (entries: string[], bundleLabel: string) => string[];
-}
-
-/**
- * `lint-packaging.ts` ends with a repo-only fallback import that `tsc` cannot
- * resolve in a server, so the test loads it by URL at run time rather than
- * through a static import `tsc` would follow.
- */
-async function loadLintPackaging(): Promise<LintPackagingModule> {
-  const mod: Record<string, unknown> = await import(
-    new URL('../../scripts/lint-packaging.ts', import.meta.url).href
-  );
-  const { AGENT_DOC_ENTRY: entry, checkBundleEntries } = mod;
-  if (!(entry instanceof RegExp) || typeof checkBundleEntries !== 'function') {
-    throw new Error(
-      'scripts/lint-packaging.ts no longer exports AGENT_DOC_ENTRY and checkBundleEntries',
-    );
-  }
-  return {
-    AGENT_DOC_ENTRY: entry,
-    checkBundleEntries: checkBundleEntries as LintPackagingModule['checkBundleEntries'],
-  };
-}
+import {
+  checkBundleEntries,
+  AGENT_DOC_ENTRY as LINT_AGENT_DOC_ENTRY,
+} from '../../scripts/lint-packaging.js';
 
 /** Runtime entries a cleaned bundle must keep. */
 const RUNTIME_ENTRIES = [
@@ -51,6 +29,9 @@ const RUNTIME_ENTRIES = [
   // A deeper `.claude/` or `framework-skills/` inside a package's own source is not its root.
   'node_modules/some-pkg/lib/.claude/loader.js',
   'node_modules/some-pkg/dist/framework-skills/index.js',
+  // An `AGENTS.md` or `CLAUDE.md` below a package's root is not its root agent doc.
+  'node_modules/some-pkg/docs/AGENTS.md',
+  'node_modules/@scope/pkg/lib/CLAUDE.md',
   // The server's own published tree at the bundle root.
   'skills/wikipedia-guide/SKILL.md',
   'dist/index.js',
@@ -68,6 +49,10 @@ const AGENT_DOC_ENTRIES = [
   // Package roots below nested node_modules, scoped and unscoped.
   'node_modules/a/node_modules/@b/c/skills/x/README.md',
   'node_modules/a/node_modules/b/node_modules/c/.claude/settings.json',
+  // Root agent-protocol files, scoped, unscoped, and nested.
+  'node_modules/thread-stream/AGENTS.md',
+  'node_modules/@cyanheads/mcp-ts-core/CLAUDE.md',
+  'node_modules/a/node_modules/@b/c/AGENTS.md',
   // A stray SKILL.md anywhere under node_modules, including a package root.
   'node_modules/some-pkg/SKILL.md',
   'node_modules/some-pkg/docs/agent/SKILL.md',
@@ -89,20 +74,17 @@ describe('scripts/clean-mcpb.ts agent-doc selector', () => {
 });
 
 describe('scripts/lint-packaging.ts check 8 agent-doc selector', () => {
-  it('matches the clean-mcpb.ts literal', async () => {
-    const lint = await loadLintPackaging();
-    expect(lint.AGENT_DOC_ENTRY.source).toBe(AGENT_DOC_ENTRY.source);
-    expect(lint.AGENT_DOC_ENTRY.flags).toBe(AGENT_DOC_ENTRY.flags);
+  it('matches the clean-mcpb.ts literal', () => {
+    expect(LINT_AGENT_DOC_ENTRY.source).toBe(AGENT_DOC_ENTRY.source);
+    expect(LINT_AGENT_DOC_ENTRY.flags).toBe(AGENT_DOC_ENTRY.flags);
   });
 
-  it('passes a cleaned bundle that keeps the SDK skills runtime', async () => {
-    const lint = await loadLintPackaging();
-    expect(lint.checkBundleEntries(RUNTIME_ENTRIES, 'dist/wikipedia-mcp-server.mcpb')).toEqual([]);
+  it('passes a cleaned bundle that keeps the SDK skills runtime', () => {
+    expect(checkBundleEntries(RUNTIME_ENTRIES, 'dist/wikipedia-mcp-server.mcpb')).toEqual([]);
   });
 
-  it('flags a bundle that still holds dependency agent docs', async () => {
-    const lint = await loadLintPackaging();
-    const errors = lint.checkBundleEntries(
+  it('flags a bundle that still holds dependency agent docs', () => {
+    const errors = checkBundleEntries(
       [...RUNTIME_ENTRIES, ...AGENT_DOC_ENTRIES],
       'dist/wikipedia-mcp-server.mcpb',
     );
