@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.1](changelog/0.3.x/0.3.1.md) — 2026-11-11
+
+Lists keep their markers and nesting, get_languages classifies the editions you ask for, disambiguation pages are flagged on every read, and search_articles returns up to 500 results per page.
+
 ## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-10-29
 
 Adds wikipedia_get_references for an article's footnotes and publishes the wikipedia-guide agent skill; URLs in content[] render as CommonMark links.
